@@ -52,7 +52,7 @@ worker=("$@")
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-if [[ -n "$(git status --porcelain)" ]]; then
+if [[ -n "$(git status --porcelain -- . ':(exclude)results')" ]]; then
     if [[ "${ALLOW_DIRTY:-0}" != "1" ]]; then
         echo "working tree is dirty; commit first or set ALLOW_DIRTY=1" >&2
         exit 1
