@@ -1,0 +1,26 @@
+{
+  "model": "gpt2",
+  "max_new_tokens": 128,
+  "prompts": [
+    {
+      "id": "p016",
+      "text": "When I wrote the following pages, or rather the bulk of them, I lived"
+    },
+    {
+      "id": "p032",
+      "text": "A spectre is haunting Europe\u2014the spectre of Communism. All the Powers of old Europe have entered into a holy alliance to exorcise this spectre:"
+    },
+    {
+      "id": "p064",
+      "text": "When I wrote the following pages, or rather the bulk of them, I lived alone, in the woods, a mile from any neighbor, in a house which I had built myself, on the shore of Walden Pond, in Concord, Massachusetts, and earned my living by the labor of my hands only. I lived"
+    },
+    {
+      "id": "p128",
+      "text": "AFTER an unequivocal experience of the inefficacy of the subsisting federal government, you are called upon to deliberate on a new Constitution for the United States of America. The subject speaks its own importance; comprehending in its consequences nothing less than the existence of the UNION, the safety and welfare of the parts of which it is composed, the fate of an empire in many respects the most interesting in the world. It has been frequently remarked that it seems to have been reserved to the people of this country, by their conduct and example, to decide the important question, whether societies of men are really capable or not of establishing good"
+    },
+    {
+      "id": "p256",
+      "text": "It is a truth universally acknowledged, that a single man in possession of a good fortune must be in want of a wife. However little known the feelings or views of such a man may be on his first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding families, that he is considered as the rightful property of some one or other of their daughters. \u201cMy dear Mr. Bennet,\u201d said his lady to him one day, \u201chave you heard that Netherfield Park is let at last?\u201d Mr. Bennet replied that he had not. \u201cBut it is,\u201d returned she; \u201cfor Mrs. Long has just been here, and she told me all about it.\u201d Mr. Bennet made no answer. \u201cDo not you want to know who has taken it?\u201d cried his wife, impatiently. \u201cYou want to tell me, and I have no objection to hearing it.\u201d This was invitation enough. \u201cWhy, my dear, you must know, Mrs. Long says that Netherfield is taken by a young man of large fortune from the north of England; that he came down on Monday in a chaise and four to see the"
+    }
+  ]
+}

@@ -1,0 +1,246 @@
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::Error;
+
+pub struct Tokenizer {
+    vocab: HashMap<String, u32>,
+    id_to_token: Vec<String>,
+    ranks: HashMap<String, HashMap<String, usize>>,
+    byte_encoder: [char; 256],
+    byte_decoder: HashMap<char, u8>,
+}
+
+impl Tokenizer {
+    pub fn load(model_dir: &Path) -> Result<Tokenizer, Error> {
+        let vocab: HashMap<String, u32> =
+            serde_json::from_str(&std::fs::read_to_string(model_dir.join("vocab.json"))?)?;
+        let merges = std::fs::read_to_string(model_dir.join("merges.txt"))?;
+
+        let max_id = vocab
+            .values()
+            .copied()
+            .max()
+            .ok_or_else(|| Error::new("vocab.json is empty"))? as usize;
+        let mut id_to_token = vec![String::new(); max_id + 1];
+        for (token, &id) in &vocab {
+            id_to_token[id as usize] = token.clone();
+        }
+
+        let mut ranks: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        for (rank, line) in merges.lines().enumerate() {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() || line.starts_with("#version") {
+                continue;
+            }
+            let (first, second) = line
+                .split_once(' ')
+                .ok_or_else(|| Error::new(format!("merges.txt: malformed line `{line}`")))?;
+            ranks
+                .entry(first.to_string())
+                .or_default()
+                .insert(second.to_string(), rank);
+        }
+
+        let encoder = bytes_to_unicode();
+        let mut byte_decoder = HashMap::new();
+        for (byte, &ch) in encoder.iter().enumerate() {
+            byte_decoder.insert(ch, byte as u8);
+        }
+
+        Ok(Tokenizer {
+            vocab,
+            id_to_token,
+            ranks,
+            byte_encoder: encoder,
+            byte_decoder,
+        })
+    }
+
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for piece in pre_tokenize(text) {
+            let mut word: Vec<String> = piece
+                .as_bytes()
+                .iter()
+                .map(|&byte| self.byte_encoder[byte as usize].to_string())
+                .collect();
+
+            while word.len() > 1 {
+                let mut best: Option<(usize, usize)> = None;
+                for i in 0..word.len() - 1 {
+                    if let Some(rank) = self.rank(&word[i], &word[i + 1]) {
+                        if best.is_none_or(|(best_rank, _)| rank < best_rank) {
+                            best = Some((rank, i));
+                        }
+                    }
+                }
+                let Some((_, index)) = best else { break };
+
+                let first = word[index].clone();
+                let second = word[index + 1].clone();
+                let mut merged = Vec::with_capacity(word.len());
+                let mut i = 0;
+                while i < word.len() {
+                    if i + 1 < word.len() && word[i] == first && word[i + 1] == second {
+                        merged.push(format!("{first}{second}"));
+                        i += 2;
+                    } else {
+                        merged.push(word[i].clone());
+                        i += 1;
+                    }
+                }
+                word = merged;
+            }
+
+            for token in word {
+                let id = self
+                    .vocab
+                    .get(&token)
+                    .unwrap_or_else(|| panic!("token `{token}` is not in vocab.json"));
+                ids.push(*id);
+            }
+        }
+        ids
+    }
+
+    pub fn decode(&self, ids: &[u32]) -> String {
+        let mut bytes = Vec::new();
+        for &id in ids {
+            let Some(token) = self.id_to_token.get(id as usize) else {
+                continue;
+            };
+            for ch in token.chars() {
+                if let Some(&byte) = self.byte_decoder.get(&ch) {
+                    bytes.push(byte);
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn rank(&self, first: &str, second: &str) -> Option<usize> {
+        self.ranks.get(first)?.get(second).copied()
+    }
+}
+
+fn pre_tokenize(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut pieces = Vec::new();
+    let mut start = 0;
+
+    while start < chars.len() {
+        let current = chars[start];
+
+        if current == '\'' {
+            let mut matched = None;
+            for suffix in ["s", "t", "re", "ve", "m", "ll", "d"] {
+                if starts_with(&chars, start + 1, suffix) {
+                    matched = Some(start + 1 + suffix.len());
+                    break;
+                }
+            }
+            if let Some(end) = matched {
+                pieces.push(chars[start..end].iter().collect());
+                start = end;
+                continue;
+            }
+        }
+
+        if is_letter(current) {
+            let end = run_end(&chars, start, is_letter);
+            pieces.push(chars[start..end].iter().collect());
+            start = end;
+        } else if is_number(current) {
+            let end = run_end(&chars, start, is_number);
+            pieces.push(chars[start..end].iter().collect());
+            start = end;
+        } else if is_space(current) {
+            let next = chars.get(start + 1).copied();
+            if current == ' ' {
+                if next.is_some_and(is_letter) {
+                    let end = run_end(&chars, start + 1, is_letter);
+                    pieces.push(chars[start..end].iter().collect());
+                    start = end;
+                    continue;
+                }
+                if next.is_some_and(is_number) {
+                    let end = run_end(&chars, start + 1, is_number);
+                    pieces.push(chars[start..end].iter().collect());
+                    start = end;
+                    continue;
+                }
+                if next.is_some_and(|c| !is_space(c) && !is_letter(c) && !is_number(c)) {
+                    let end = run_end(&chars, start + 1, |c| {
+                        !is_space(c) && !is_letter(c) && !is_number(c)
+                    });
+                    pieces.push(chars[start..end].iter().collect());
+                    start = end;
+                    continue;
+                }
+            }
+            let end = run_end(&chars, start, is_space);
+            let end = if end < chars.len() && end - start > 1 {
+                end - 1
+            } else {
+                end
+            };
+            pieces.push(chars[start..end].iter().collect());
+            start = end;
+        } else {
+            let end = run_end(&chars, start, |c| {
+                !is_space(c) && !is_letter(c) && !is_number(c)
+            });
+            pieces.push(chars[start..end].iter().collect());
+            start = end;
+        }
+    }
+
+    pieces
+}
+
+fn starts_with(chars: &[char], start: usize, suffix: &str) -> bool {
+    suffix
+        .chars()
+        .enumerate()
+        .all(|(i, ch)| chars.get(start + i) == Some(&ch))
+}
+
+fn run_end(chars: &[char], start: usize, predicate: impl Fn(char) -> bool) -> usize {
+    let mut end = start;
+    while end < chars.len() && predicate(chars[end]) {
+        end += 1;
+    }
+    end
+}
+
+fn is_letter(c: char) -> bool {
+    c.is_alphabetic()
+}
+
+fn is_number(c: char) -> bool {
+    c.is_numeric()
+}
+
+fn is_space(c: char) -> bool {
+    c.is_whitespace()
+}
+
+fn bytes_to_unicode() -> [char; 256] {
+    let mut chars = ['\0'; 256];
+    let mut next = 256u32;
+    for byte in 0u16..=255 {
+        let byte = byte as u8;
+        let visible = (b'!'..=b'~').contains(&byte)
+            || (0xa1..=0xac).contains(&byte)
+            || (0xae..=0xff).contains(&byte);
+        chars[byte as usize] = if visible {
+            byte as char
+        } else {
+            let ch = char::from_u32(next).expect("valid byte-level character");
+            next += 1;
+            ch
+        };
+    }
+    chars
+}

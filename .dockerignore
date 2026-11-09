@@ -1,0 +1,6 @@
+.git/
+models/
+openspec/
+results/runs/
+target/
+web/node_modules/
