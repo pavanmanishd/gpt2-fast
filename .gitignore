@@ -1,0 +1,9 @@
+/target/
+/models/
+*.safetensors
+*.gguf
+__pycache__/
+.venv/
+node_modules/
+web/dist/
+.DS_Store
