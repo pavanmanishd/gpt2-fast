@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::path::Path;
 
 use crate::parallel::Threads;
+use crate::quantize::GROUP_SIZE;
 use crate::safetensors::SafeTensors;
 use crate::simd::{
     dot, int8_dot, int8_linear_columns, int8_linear_rows, linear_columns, linear_rows,
@@ -44,7 +45,15 @@ impl Matrix {
         let start = row * len;
         match self {
             Matrix::F32(data) => dot(x, &data[start..start + len]),
-            Matrix::Int8 { data, scale } => int8_dot(x, &data[start..start + len]) * scale[row],
+            Matrix::Int8 { data, scale } => {
+                let groups = len.div_ceil(GROUP_SIZE);
+                int8_dot(
+                    x,
+                    &data[start..start + len],
+                    &scale[row * groups..(row + 1) * groups],
+                    GROUP_SIZE,
+                )
+            }
         }
     }
 
@@ -57,9 +66,10 @@ impl Matrix {
                 }
             }
             Matrix::Int8 { data, scale } => {
-                let scale = scale[row];
+                let groups = len.div_ceil(GROUP_SIZE);
+                let scale = &scale[row * groups..(row + 1) * groups];
                 for (d, value) in out.iter_mut().enumerate() {
-                    *value = data[start + d] as f32 * scale + addend[d];
+                    *value = data[start + d] as f32 * scale[d / GROUP_SIZE] + addend[d];
                 }
             }
         }
@@ -493,6 +503,7 @@ fn linear_int8(
                 start..start + part.len(),
                 part,
                 epilogue,
+                GROUP_SIZE,
             );
         });
     } else {
@@ -509,6 +520,7 @@ fn linear_int8(
                 n_out,
                 part,
                 epilogue,
+                GROUP_SIZE,
             );
         });
     }

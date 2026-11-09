@@ -1,18 +1,29 @@
+pub(crate) const GROUP_SIZE: usize = 64;
+
 pub(crate) struct Columns {
+    group: usize,
+    n_out: usize,
     scale: Vec<f32>,
     data: Vec<i8>,
 }
 
 impl Columns {
-    pub(crate) fn new(n_out: usize, capacity: usize) -> Columns {
+    pub(crate) fn new(n_in: usize, n_out: usize, group: usize) -> Columns {
+        let groups = n_in.div_ceil(group);
         Columns {
-            scale: vec![0.0; n_out],
-            data: Vec::with_capacity(capacity),
+            group,
+            n_out,
+            scale: vec![0.0; groups * n_out],
+            data: Vec::with_capacity(n_in * n_out),
         }
     }
 
-    pub(crate) fn observe(&mut self, row: &[f32]) {
-        for (scale, &value) in self.scale.iter_mut().zip(row) {
+    pub(crate) fn observe(&mut self, row: usize, values: &[f32]) {
+        let offset = row / self.group * self.n_out;
+        for (scale, &value) in self.scale[offset..offset + self.n_out]
+            .iter_mut()
+            .zip(values)
+        {
             *scale = scale.max(value.abs());
         }
     }
@@ -23,10 +34,12 @@ impl Columns {
         }
     }
 
-    pub(crate) fn push(&mut self, row: &[f32]) {
+    pub(crate) fn push(&mut self, row: usize, values: &[f32]) {
+        let offset = row / self.group * self.n_out;
         self.data.extend(
-            row.iter()
-                .zip(&self.scale)
+            values
+                .iter()
+                .zip(&self.scale[offset..offset + self.n_out])
                 .map(|(&value, &scale)| round(value, scale)),
         );
     }
@@ -37,24 +50,31 @@ impl Columns {
 }
 
 pub(crate) struct Rows {
+    group: usize,
     scale: Vec<f32>,
     data: Vec<i8>,
 }
 
 impl Rows {
-    pub(crate) fn with_capacity(rows: usize, capacity: usize) -> Rows {
+    pub(crate) fn new(rows: usize, row_len: usize, group: usize) -> Rows {
+        let groups = row_len.div_ceil(group);
         Rows {
-            scale: Vec::with_capacity(rows),
-            data: Vec::with_capacity(capacity),
+            group,
+            scale: Vec::with_capacity(rows * groups),
+            data: Vec::with_capacity(rows * row_len),
         }
     }
 
     pub(crate) fn push(&mut self, row: &[f32]) {
-        let max = row.iter().fold(0.0f32, |max, value| max.max(value.abs()));
-        let scale = max / 127.0;
-        self.data
-            .extend(row.iter().map(|&value| round(value, scale)));
-        self.scale.push(scale);
+        for values in row.chunks(self.group) {
+            let max = values
+                .iter()
+                .fold(0.0f32, |max, value| max.max(value.abs()));
+            let scale = max / 127.0;
+            self.scale.push(scale);
+            self.data
+                .extend(values.iter().map(|&value| round(value, scale)));
+        }
     }
 
     pub(crate) fn into_parts(self) -> (Vec<i8>, Vec<f32>) {
@@ -93,47 +113,57 @@ mod tests {
     }
 
     #[test]
-    fn columns_keep_one_scale_per_output_channel_within_half_a_scale() {
-        let (rows, cols) = (9, 7);
+    fn columns_keep_one_scale_per_group_and_output_channel_within_half_a_scale() {
+        let (rows, cols, group) = (9, 7, 4);
         let values: Vec<f32> = (0..rows * cols)
             .map(|i| ((i * 37 + 11) % 101) as f32 / 23.0 - 2.0)
             .collect();
-        let mut quantizer = Columns::new(cols, rows * cols);
-        for row in values.chunks(cols) {
-            quantizer.observe(row);
+        let mut quantizer = Columns::new(rows, cols, group);
+        for (row, values) in values.chunks(cols).enumerate() {
+            quantizer.observe(row, values);
         }
         quantizer.finish();
-        for row in values.chunks(cols) {
-            quantizer.push(row);
+        for (row, values) in values.chunks(cols).enumerate() {
+            quantizer.push(row, values);
         }
         let (data, scale) = quantizer.into_parts();
 
-        assert_eq!(scale.len(), cols);
-        for column in 0..cols {
-            let max = (0..rows)
-                .map(|row| values[row * cols + column].abs())
-                .fold(0.0f32, f32::max);
-            assert_eq!(scale[column], max / 127.0);
+        let groups = rows.div_ceil(group);
+        assert_eq!(scale.len(), groups * cols);
+        for g in 0..groups {
+            for column in 0..cols {
+                let max = (g * group..rows.min((g + 1) * group))
+                    .map(|row| values[row * cols + column].abs())
+                    .fold(0.0f32, f32::max);
+                assert_eq!(scale[g * cols + column], max / 127.0);
+            }
         }
-        check_round_trip(&data, &scale, &values, |index| index % cols);
+        check_round_trip(&data, &scale, &values, |index| {
+            index / cols / group * cols + index % cols
+        });
     }
 
     #[test]
-    fn rows_keep_one_scale_per_row_and_handle_zero_rows() {
-        let (rows, row_len) = (5, 11);
+    fn rows_keep_one_scale_per_row_and_group_and_handle_zero_rows() {
+        let (rows, row_len, group) = (5, 11, 4);
         let mut values: Vec<f32> = (0..rows * row_len)
             .map(|i| ((i * 41 + 3) % 89) as f32 / 17.0 - 2.5)
             .collect();
         values[row_len..2 * row_len].fill(0.0);
 
-        let mut quantizer = Rows::with_capacity(rows, rows * row_len);
+        let mut quantizer = Rows::new(rows, row_len, group);
         for row in values.chunks(row_len) {
             quantizer.push(row);
         }
         let (data, scale) = quantizer.into_parts();
 
-        assert_eq!(scale.len(), rows);
-        assert_eq!(scale[1], 0.0);
-        check_round_trip(&data, &scale, &values, |index| index / row_len);
+        let groups = row_len.div_ceil(group);
+        assert_eq!(scale.len(), rows * groups);
+        for g in 0..groups {
+            assert_eq!(scale[groups + g], 0.0);
+        }
+        check_round_trip(&data, &scale, &values, |index| {
+            index / row_len * groups + index % row_len / group
+        });
     }
 }

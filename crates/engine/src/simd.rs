@@ -236,6 +236,7 @@ mod neon {
         n_out: usize,
         first_column: usize,
         columns: usize,
+        group: usize,
     }
 
     impl Int8Linear<'_> {
@@ -255,49 +256,61 @@ mod neon {
             let bias = self.bias.as_ptr();
             let n_in = self.n_in;
             let n_out = self.n_out;
-            let mut acc = [[[vdupq_n_f32(0.0); 2]; R]; V];
+            let group = self.group;
+            let mut total = [[[vdupq_n_f32(0.0); 2]; R]; V];
 
             let mut p = 0;
-            while p + 4 <= n_in {
-                let mut xv = [vdupq_n_f32(0.0); R];
-                for (r, value) in xv.iter_mut().enumerate() {
-                    *value = vld1q_f32(x.add((i + r) * n_in + p));
+            while p < n_in {
+                let group_end = (p / group * group + group).min(n_in);
+                let scale_row = p / group * n_out;
+                let mut acc = [[[vdupq_n_f32(0.0); 2]; R]; V];
+                while p + 4 <= group_end {
+                    let mut xv = [vdupq_n_f32(0.0); R];
+                    for (r, value) in xv.iter_mut().enumerate() {
+                        *value = vld1q_f32(x.add((i + r) * n_in + p));
+                    }
+                    for c in 0..V {
+                        let column = j + c * 8;
+                        let w0 = widen8(weight.add(p * n_out + column));
+                        let w1 = widen8(weight.add((p + 1) * n_out + column));
+                        let w2 = widen8(weight.add((p + 2) * n_out + column));
+                        let w3 = widen8(weight.add((p + 3) * n_out + column));
+                        for r in 0..R {
+                            for k in 0..2 {
+                                acc[c][r][k] = vfmaq_laneq_f32::<0>(acc[c][r][k], w0[k], xv[r]);
+                                acc[c][r][k] = vfmaq_laneq_f32::<1>(acc[c][r][k], w1[k], xv[r]);
+                                acc[c][r][k] = vfmaq_laneq_f32::<2>(acc[c][r][k], w2[k], xv[r]);
+                                acc[c][r][k] = vfmaq_laneq_f32::<3>(acc[c][r][k], w3[k], xv[r]);
+                            }
+                        }
+                    }
+                    p += 4;
                 }
+                while p < group_end {
+                    for r in 0..R {
+                        let a = *x.add((i + r) * n_in + p);
+                        for c in 0..V {
+                            let w = widen8(weight.add(p * n_out + j + c * 8));
+                            for k in 0..2 {
+                                acc[c][r][k] = vfmaq_n_f32(acc[c][r][k], w[k], a);
+                            }
+                        }
+                    }
+                    p += 1;
+                }
+
                 for c in 0..V {
-                    let column = j + c * 8;
-                    let w0 = widen8(weight.add(p * n_out + column));
-                    let w1 = widen8(weight.add((p + 1) * n_out + column));
-                    let w2 = widen8(weight.add((p + 2) * n_out + column));
-                    let w3 = widen8(weight.add((p + 3) * n_out + column));
                     for r in 0..R {
                         for k in 0..2 {
-                            acc[c][r][k] = vfmaq_laneq_f32::<0>(acc[c][r][k], w0[k], xv[r]);
-                            acc[c][r][k] = vfmaq_laneq_f32::<1>(acc[c][r][k], w1[k], xv[r]);
-                            acc[c][r][k] = vfmaq_laneq_f32::<2>(acc[c][r][k], w2[k], xv[r]);
-                            acc[c][r][k] = vfmaq_laneq_f32::<3>(acc[c][r][k], w3[k], xv[r]);
+                            let column = scale_row + j + c * 8 + k * 4;
+                            total[c][r][k] = vfmaq_f32(
+                                total[c][r][k],
+                                acc[c][r][k],
+                                vld1q_f32(scale.add(column)),
+                            );
                         }
                     }
                 }
-                p += 4;
-            }
-            while p < n_in {
-                for r in 0..R {
-                    let a = *x.add((i + r) * n_in + p);
-                    for c in 0..V {
-                        let w = widen8(weight.add(p * n_out + j + c * 8));
-                        for k in 0..2 {
-                            let mut lanes = [0.0; 4];
-                            vst1q_f32(lanes.as_mut_ptr(), acc[c][r][k]);
-                            let mut product = [0.0; 4];
-                            vst1q_f32(product.as_mut_ptr(), w[k]);
-                            for lane in 0..4 {
-                                lanes[lane] += a * product[lane];
-                            }
-                            acc[c][r][k] = vld1q_f32(lanes.as_ptr());
-                        }
-                    }
-                }
-                p += 1;
             }
 
             for c in 0..V {
@@ -306,10 +319,7 @@ mod neon {
                     let out = y.as_mut_ptr().add(row);
                     for k in 0..2 {
                         let column = j + c * 8 + k * 4;
-                        let value = vaddq_f32(
-                            vmulq_f32(acc[c][r][k], vld1q_f32(scale.add(column))),
-                            vld1q_f32(bias.add(column)),
-                        );
+                        let value = vaddq_f32(total[c][r][k], vld1q_f32(bias.add(column)));
                         let out = out.add(k * 4);
                         if GELU {
                             let mut lanes = [0.0; 4];
@@ -349,11 +359,18 @@ mod neon {
             for r in 0..R {
                 for column in j..self.first_column + self.columns {
                     let mut sum = 0.0;
-                    for p in 0..self.n_in {
-                        sum += self.x[(i + r) * self.n_in + p]
-                            * self.weight[p * self.n_out + column] as f32;
+                    let mut p = 0;
+                    while p < self.n_in {
+                        let end = (p / self.group * self.group + self.group).min(self.n_in);
+                        let mut partial = 0.0;
+                        for q in p..end {
+                            partial += self.x[(i + r) * self.n_in + q]
+                                * self.weight[q * self.n_out + column] as f32;
+                        }
+                        sum += partial * self.scale[p / self.group * self.n_out + column];
+                        p = end;
                     }
-                    let value = sum * self.scale[column] + self.bias[column];
+                    let value = sum + self.bias[column];
                     y[(i + r) * self.columns + column - self.first_column] =
                         if GELU { gelu(value) } else { value };
                 }
@@ -371,6 +388,7 @@ mod neon {
         n_in: usize,
         n_out: usize,
         y: &mut [f32],
+        group: usize,
     ) {
         let kernel = Int8Linear {
             x,
@@ -381,6 +399,7 @@ mod neon {
             n_out,
             first_column: 0,
             columns: n_out,
+            group,
         };
         let mut i = 0;
         while i < rows {
@@ -412,13 +431,14 @@ mod neon {
         n_out: usize,
         y: &mut [f32],
         epilogue: Epilogue,
+        group: usize,
     ) {
         match epilogue {
             Epilogue::Store => {
-                int8_tiled::<4, 2, false>(x, weight, scale, bias, rows, n_in, n_out, y)
+                int8_tiled::<4, 1, false>(x, weight, scale, bias, rows, n_in, n_out, y, group)
             }
             Epilogue::Gelu => {
-                int8_tiled::<4, 2, true>(x, weight, scale, bias, rows, n_in, n_out, y)
+                int8_tiled::<4, 1, true>(x, weight, scale, bias, rows, n_in, n_out, y, group)
             }
         }
     }
@@ -434,6 +454,7 @@ mod neon {
         columns: Range<usize>,
         y: &mut [f32],
         epilogue: Epilogue,
+        group: usize,
     ) {
         assert!(
             columns.start.is_multiple_of(32),
@@ -448,6 +469,7 @@ mod neon {
             n_out,
             first_column: columns.start,
             columns: columns.len(),
+            group,
         };
         match epilogue {
             Epilogue::Store => kernel.block_rows::<1, 2, false>(0, y),
@@ -455,7 +477,7 @@ mod neon {
         }
     }
 
-    pub(crate) fn int8_dot(x: &[f32], weight: &[i8]) -> f32 {
+    pub(crate) fn int8_dot(x: &[f32], weight: &[i8], scale: &[f32], group: usize) -> f32 {
         assert_eq!(x.len(), weight.len(), "dot product needs equal lengths");
         let n = x.len();
         let x = x.as_ptr();
@@ -463,40 +485,46 @@ mod neon {
 
         // SAFETY: every load stays within `0..n`, and the scalar tail handles the rest.
         unsafe {
-            let mut acc = [vdupq_n_f32(0.0); 8];
-            let mut i = 0;
-            while i + 32 <= n {
-                let g0 = widen8(weight.add(i));
-                let g1 = widen8(weight.add(i + 8));
-                let g2 = widen8(weight.add(i + 16));
-                let g3 = widen8(weight.add(i + 24));
-                for k in 0..2 {
-                    acc[k] = vfmaq_f32(acc[k], g0[k], vld1q_f32(x.add(i + k * 4)));
-                    acc[2 + k] = vfmaq_f32(acc[2 + k], g1[k], vld1q_f32(x.add(i + 8 + k * 4)));
-                    acc[4 + k] = vfmaq_f32(acc[4 + k], g2[k], vld1q_f32(x.add(i + 16 + k * 4)));
-                    acc[6 + k] = vfmaq_f32(acc[6 + k], g3[k], vld1q_f32(x.add(i + 24 + k * 4)));
+            let mut total = 0.0;
+            let mut p = 0;
+            while p < n {
+                let group_start = p / group * group;
+                let group_end = (group_start + group).min(n);
+                let mut acc = [vdupq_n_f32(0.0); 8];
+                while p + 32 <= group_end {
+                    let g0 = widen8(weight.add(p));
+                    let g1 = widen8(weight.add(p + 8));
+                    let g2 = widen8(weight.add(p + 16));
+                    let g3 = widen8(weight.add(p + 24));
+                    for k in 0..2 {
+                        acc[k] = vfmaq_f32(acc[k], g0[k], vld1q_f32(x.add(p + k * 4)));
+                        acc[2 + k] = vfmaq_f32(acc[2 + k], g1[k], vld1q_f32(x.add(p + 8 + k * 4)));
+                        acc[4 + k] = vfmaq_f32(acc[4 + k], g2[k], vld1q_f32(x.add(p + 16 + k * 4)));
+                        acc[6 + k] = vfmaq_f32(acc[6 + k], g3[k], vld1q_f32(x.add(p + 24 + k * 4)));
+                    }
+                    p += 32;
                 }
-                i += 32;
-            }
-            while i + 16 <= n {
-                let g0 = widen8(weight.add(i));
-                let g1 = widen8(weight.add(i + 8));
-                for k in 0..2 {
-                    acc[k] = vfmaq_f32(acc[k], g0[k], vld1q_f32(x.add(i + k * 4)));
-                    acc[2 + k] = vfmaq_f32(acc[2 + k], g1[k], vld1q_f32(x.add(i + 8 + k * 4)));
+                while p + 16 <= group_end {
+                    let g0 = widen8(weight.add(p));
+                    let g1 = widen8(weight.add(p + 8));
+                    for k in 0..2 {
+                        acc[k] = vfmaq_f32(acc[k], g0[k], vld1q_f32(x.add(p + k * 4)));
+                        acc[2 + k] = vfmaq_f32(acc[2 + k], g1[k], vld1q_f32(x.add(p + 8 + k * 4)));
+                    }
+                    p += 16;
                 }
-                i += 16;
+                let pair = |left: float32x4_t, right: float32x4_t| vaddq_f32(left, right);
+                let mut sum = vaddvq_f32(pair(
+                    pair(pair(acc[0], acc[1]), pair(acc[2], acc[3])),
+                    pair(pair(acc[4], acc[5]), pair(acc[6], acc[7])),
+                ));
+                while p < group_end {
+                    sum += *x.add(p) * *weight.add(p) as f32;
+                    p += 1;
+                }
+                total += sum * *scale.get_unchecked(group_start / group);
             }
-            let pair = |left: float32x4_t, right: float32x4_t| vaddq_f32(left, right);
-            let mut sum = vaddvq_f32(pair(
-                pair(pair(acc[0], acc[1]), pair(acc[2], acc[3])),
-                pair(pair(acc[4], acc[5]), pair(acc[6], acc[7])),
-            ));
-            while i < n {
-                sum += *x.add(i) * *weight.add(i) as f32;
-                i += 1;
-            }
-            sum
+            total
         }
     }
 
@@ -816,10 +844,15 @@ mod scalar {
         n_out: usize,
         y: &mut [f32],
         epilogue: Epilogue,
+        group: usize,
     ) {
         match epilogue {
-            Epilogue::Store => int8_rows::<false>(x, weight, scale, bias, rows, n_in, n_out, y),
-            Epilogue::Gelu => int8_rows::<true>(x, weight, scale, bias, rows, n_in, n_out, y),
+            Epilogue::Store => {
+                int8_rows::<false>(x, weight, scale, bias, rows, n_in, n_out, y, group)
+            }
+            Epilogue::Gelu => {
+                int8_rows::<true>(x, weight, scale, bias, rows, n_in, n_out, y, group)
+            }
         }
     }
 
@@ -833,27 +866,23 @@ mod scalar {
         n_in: usize,
         n_out: usize,
         y: &mut [f32],
+        group: usize,
     ) {
-        y.fill(0.0);
-        for i in (0..rows).step_by(ROW_TILE) {
-            let block = (rows - i).min(ROW_TILE);
-            let y_block = &mut y[i * n_out..(i + block) * n_out];
-            for p in 0..n_in {
-                let w_row = &weight[p * n_out..(p + 1) * n_out];
-                for r in 0..block {
-                    let a = x[(i + r) * n_in + p];
-                    let y_row = &mut y_block[r * n_out..(r + 1) * n_out];
-                    for (sum, &w) in y_row.iter_mut().zip(w_row) {
-                        *sum += a * w as f32;
+        for i in 0..rows {
+            for column in 0..n_out {
+                let mut sum = 0.0;
+                let mut p = 0;
+                while p < n_in {
+                    let end = (p / group * group + group).min(n_in);
+                    let mut partial = 0.0;
+                    for q in p..end {
+                        partial += x[i * n_in + q] * weight[q * n_out + column] as f32;
                     }
+                    sum += partial * scale[p / group * n_out + column];
+                    p = end;
                 }
-            }
-            for r in 0..block {
-                let y_row = &mut y_block[r * n_out..(r + 1) * n_out];
-                for (column, (value, &b)) in y_row.iter_mut().zip(bias).enumerate() {
-                    let sum = *value * scale[column] + b;
-                    *value = if GELU { gelu(sum) } else { sum };
-                }
+                let value = sum + bias[column];
+                y[i * n_out + column] = if GELU { gelu(value) } else { value };
             }
         }
     }
@@ -869,12 +898,15 @@ mod scalar {
         columns: Range<usize>,
         y: &mut [f32],
         epilogue: Epilogue,
+        group: usize,
     ) {
         match epilogue {
             Epilogue::Store => {
-                int8_columns::<false>(x, weight, scale, bias, n_in, n_out, columns, y)
+                int8_columns::<false>(x, weight, scale, bias, n_in, n_out, columns, y, group)
             }
-            Epilogue::Gelu => int8_columns::<true>(x, weight, scale, bias, n_in, n_out, columns, y),
+            Epilogue::Gelu => {
+                int8_columns::<true>(x, weight, scale, bias, n_in, n_out, columns, y, group)
+            }
         }
     }
 
@@ -888,25 +920,39 @@ mod scalar {
         n_out: usize,
         columns: Range<usize>,
         y: &mut [f32],
+        group: usize,
     ) {
-        let (start, end) = (columns.start, columns.end);
-        y.fill(0.0);
-        for p in 0..n_in {
-            let a = x[p];
-            let w_row = &weight[p * n_out + start..p * n_out + end];
-            for (sum, &w) in y.iter_mut().zip(w_row) {
-                *sum += a * w as f32;
+        for (offset, column) in columns.enumerate() {
+            let mut sum = 0.0;
+            let mut p = 0;
+            while p < n_in {
+                let end = (p / group * group + group).min(n_in);
+                let mut partial = 0.0;
+                for q in p..end {
+                    partial += x[q] * weight[q * n_out + column] as f32;
+                }
+                sum += partial * scale[p / group * n_out + column];
+                p = end;
             }
-        }
-        for (offset, (value, &b)) in y.iter_mut().zip(&bias[start..end]).enumerate() {
-            let sum = *value * scale[start + offset] + b;
-            *value = if GELU { gelu(sum) } else { sum };
+            let value = sum + bias[column];
+            y[offset] = if GELU { gelu(value) } else { value };
         }
     }
 
-    pub(crate) fn int8_dot(x: &[f32], weight: &[i8]) -> f32 {
+    pub(crate) fn int8_dot(x: &[f32], weight: &[i8], scale: &[f32], group: usize) -> f32 {
         assert_eq!(x.len(), weight.len(), "dot product needs equal lengths");
-        x.iter().zip(weight).map(|(x, &w)| x * w as f32).sum()
+        let mut total = 0.0;
+        let mut p = 0;
+        while p < x.len() {
+            let end = (p / group * group + group).min(x.len());
+            let mut partial = 0.0;
+            for q in p..end {
+                partial += x[q] * weight[q] as f32;
+            }
+            total += partial * scale[p / group];
+            p = end;
+        }
+        total
     }
 
     pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -955,6 +1001,7 @@ mod int8_tests {
         n_in: usize,
         n_out: usize,
         epilogue: Epilogue,
+        group: usize,
     ) -> Vec<f32> {
         let mut y = vec![0.0; rows * n_out];
         if rows == 1 {
@@ -968,9 +1015,12 @@ mod int8_tests {
                 0..n_out,
                 &mut y,
                 epilogue,
+                group,
             );
         } else {
-            int8_linear_rows(x, weight, scale, bias, rows, n_in, n_out, &mut y, epilogue);
+            int8_linear_rows(
+                x, weight, scale, bias, rows, n_in, n_out, &mut y, epilogue, group,
+            );
         }
         y
     }
@@ -985,15 +1035,21 @@ mod int8_tests {
         n_in: usize,
         n_out: usize,
         gelu_epilogue: bool,
+        group: usize,
     ) -> Vec<f32> {
         let mut y = vec![0.0; rows * n_out];
         for i in 0..rows {
             for j in 0..n_out {
                 let mut sum = 0.0f64;
-                for p in 0..n_in {
-                    sum += x[i * n_in + p] as f64 * weight[p * n_out + j] as f64;
+                for (g, _) in (0..n_in).step_by(group).enumerate() {
+                    let end = (g * group + group).min(n_in);
+                    let mut partial = 0.0f64;
+                    for p in g * group..end {
+                        partial += x[i * n_in + p] as f64 * weight[p * n_out + j] as f64;
+                    }
+                    sum += partial * scale[g * n_out + j] as f64;
                 }
-                let value = (sum * scale[j] as f64) as f32 + bias[j];
+                let value = sum as f32 + bias[j];
                 y[i * n_out + j] = if gelu_epilogue { gelu(value) } else { value };
             }
         }
@@ -1002,15 +1058,15 @@ mod int8_tests {
 
     #[test]
     fn int8_linear_matches_dequantized_reference_on_odd_sizes() {
-        for (rows, n_in, n_out) in [
-            (1, 1, 1),
-            (1, 37, 29),
-            (1, 64, 33),
-            (2, 37, 29),
-            (5, 37, 29),
-            (7, 65, 33),
-            (4, 96, 17),
-            (9, 33, 64),
+        for (rows, n_in, n_out, group) in [
+            (1usize, 1usize, 1usize, 32usize),
+            (1, 37, 29, 7),
+            (1, 64, 33, 32),
+            (2, 37, 29, 7),
+            (5, 37, 29, 16),
+            (7, 65, 33, 64),
+            (4, 96, 17, 32),
+            (9, 33, 64, 8),
         ] {
             let x: Vec<f32> = (0..rows * n_in)
                 .map(|i| ((i * 37 + 11) % 101) as f32 / 101.0 - 0.5)
@@ -1018,11 +1074,16 @@ mod int8_tests {
             let weight: Vec<i8> = (0..n_in * n_out)
                 .map(|i| ((i * 53 + 7) % 255) as i32 as i8)
                 .collect();
-            let scale: Vec<f32> = (0..n_out).map(|j| (j % 7 + 1) as f32 / 200.0).collect();
+            let groups = n_in.div_ceil(group);
+            let scale: Vec<f32> = (0..groups * n_out)
+                .map(|j| (j % 7 + 1) as f32 / 200.0)
+                .collect();
             let bias: Vec<f32> = (0..n_out).map(|i| i as f32 / 90.0 - 1.0).collect();
 
             for epilogue in [Epilogue::Store, Epilogue::Gelu] {
-                let actual = int8_linear(&x, &weight, &scale, &bias, rows, n_in, n_out, epilogue);
+                let actual = int8_linear(
+                    &x, &weight, &scale, &bias, rows, n_in, n_out, epilogue, group,
+                );
                 let expected = int8_reference(
                     &x,
                     &weight,
@@ -1032,12 +1093,13 @@ mod int8_tests {
                     n_in,
                     n_out,
                     matches!(epilogue, Epilogue::Gelu),
+                    group,
                 );
                 for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
                     let tolerance = 1e-4 * e.abs().max(1.0);
                     assert!(
                         (a - e).abs() <= tolerance,
-                        "rows {rows}, in {n_in}, out {n_out}, element {index}: expected {e}, got {a}"
+                        "rows {rows}, in {n_in}, out {n_out}, group {group}, element {index}: expected {e}, got {a}"
                     );
                 }
             }
@@ -1046,16 +1108,35 @@ mod int8_tests {
 
     #[test]
     fn int8_dot_matches_dequantized_reference_on_odd_sizes() {
-        for n in [1, 3, 15, 16, 17, 31, 32, 33, 64, 769] {
+        for (n, group) in [
+            (1usize, 32usize),
+            (3, 1),
+            (15, 7),
+            (16, 32),
+            (17, 16),
+            (31, 8),
+            (32, 32),
+            (33, 64),
+            (64, 32),
+            (769, 128),
+        ] {
             let a: Vec<f32> = (0..n)
                 .map(|i| ((i * 29 + 3) % 71) as f32 / 71.0 - 0.5)
                 .collect();
             let b: Vec<i8> = (0..n).map(|i| ((i * 43 + 5) % 255) as i8).collect();
-            let expected: f64 = a.iter().zip(&b).map(|(x, &y)| *x as f64 * y as f64).sum();
-            let actual = int8_dot(&a, &b) as f64;
+            let groups = n.div_ceil(group);
+            let scale: Vec<f32> = (0..groups).map(|g| (g % 5 + 1) as f32 / 100.0).collect();
+            let expected: f64 = (0..groups)
+                .map(|g| {
+                    let end = (g * group + group).min(n);
+                    let partial: f64 = (g * group..end).map(|p| a[p] as f64 * b[p] as f64).sum();
+                    partial * scale[g] as f64
+                })
+                .sum();
+            let actual = int8_dot(&a, &b, &scale, group) as f64;
             assert!(
                 (actual - expected).abs() <= 1e-4 * expected.abs().max(1.0),
-                "n {n}: expected {expected}, got {actual}"
+                "n {n}, group {group}: expected {expected}, got {actual}"
             );
         }
     }

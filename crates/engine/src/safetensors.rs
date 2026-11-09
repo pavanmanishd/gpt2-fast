@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::quantize::{Columns, Rows};
+use crate::quantize::{Columns, Rows, GROUP_SIZE};
 use crate::Error;
 
 pub(crate) struct SafeTensors {
@@ -120,10 +120,12 @@ impl SafeTensors {
         rows: usize,
         cols: usize,
     ) -> Result<(Vec<i8>, Vec<f32>), Error> {
-        let mut quantizer = Columns::new(cols, rows * cols);
-        self.for_each_row(name, rows, cols, |row| quantizer.observe(row))?;
+        let mut quantizer = Columns::new(rows, cols, GROUP_SIZE);
+        self.for_each_row(name, rows, cols, |row, values| {
+            quantizer.observe(row, values)
+        })?;
         quantizer.finish();
-        self.for_each_row(name, rows, cols, |row| quantizer.push(row))?;
+        self.for_each_row(name, rows, cols, |row, values| quantizer.push(row, values))?;
         Ok(quantizer.into_parts())
     }
 
@@ -133,8 +135,8 @@ impl SafeTensors {
         rows: usize,
         cols: usize,
     ) -> Result<(Vec<i8>, Vec<f32>), Error> {
-        let mut quantizer = Rows::with_capacity(rows, rows * cols);
-        self.for_each_row(name, rows, cols, |row| quantizer.push(row))?;
+        let mut quantizer = Rows::new(rows, cols, GROUP_SIZE);
+        self.for_each_row(name, rows, cols, |_, values| quantizer.push(values))?;
         Ok(quantizer.into_parts())
     }
 
@@ -143,7 +145,7 @@ impl SafeTensors {
         name: &str,
         rows: usize,
         cols: usize,
-        mut visit: impl FnMut(&[f32]),
+        mut visit: impl FnMut(usize, &[f32]),
     ) -> Result<(), Error> {
         let start = self.f32_tensor_start(name, &[rows, cols])?;
         let row_bytes = cols * 4;
@@ -161,8 +163,8 @@ impl SafeTensors {
             for (value, chunk) in values[..count * cols].iter_mut().zip(chunks) {
                 *value = f32::from_le_bytes(*chunk);
             }
-            for values in values[..count * cols].chunks(cols) {
-                visit(values);
+            for (offset, values) in values[..count * cols].chunks(cols).enumerate() {
+                visit(row + offset, values);
             }
             row += count;
         }
