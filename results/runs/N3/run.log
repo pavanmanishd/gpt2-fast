@@ -1,0 +1,2 @@
+summary written to results/runs/N3/summary.json
+{"date":"<date>","milestone":"N3","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":43.157,"prefill_tok_s":185.168,"ttft_ms":330.562,"peak_mb":559.781,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
