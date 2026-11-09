@@ -1,7 +1,20 @@
+#[derive(Clone, Copy)]
+pub(crate) enum Epilogue {
+    Store,
+    Gelu,
+}
+
+fn gelu(x: f32) -> f32 {
+    let coefficient = (2.0 / std::f32::consts::PI).sqrt();
+    0.5 * x * (1.0 + (coefficient * (x + 0.044715 * x * x * x)).tanh())
+}
+
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use std::arch::aarch64::*;
     use std::ops::Range;
+
+    use super::{gelu, Epilogue};
 
     struct Linear<'a> {
         x: &'a [f32],
@@ -18,7 +31,12 @@ mod neon {
         // `rows * columns` elements, and all slices are sized for `rows * n_in`,
         // `n_in * n_out` and `rows * n_out` elements.
         #[allow(clippy::needless_range_loop)]
-        unsafe fn block<const R: usize, const V: usize>(&self, i: usize, j: usize, y: &mut [f32]) {
+        unsafe fn block<const R: usize, const V: usize, const GELU: bool>(
+            &self,
+            i: usize,
+            j: usize,
+            y: &mut [f32],
+        ) {
             let x = self.x.as_ptr();
             let weight = self.weight.as_ptr();
             let bias = self.bias.as_ptr();
@@ -59,30 +77,45 @@ mod neon {
             }
 
             for r in 0..R {
-                let out = y
-                    .as_mut_ptr()
-                    .add((i + r) * self.columns + j - self.first_column);
-                for (c, value) in acc[r].iter().enumerate() {
-                    let b = vld1q_f32(bias.add(j + c * 4));
-                    vst1q_f32(out.add(c * 4), vaddq_f32(*value, b));
+                let row = (i + r) * self.columns + j - self.first_column;
+                let out = y.as_mut_ptr().add(row);
+                for (c, accumulated) in acc[r].iter().enumerate() {
+                    let value = vaddq_f32(*accumulated, vld1q_f32(bias.add(j + c * 4)));
+                    let out = out.add(c * 4);
+                    if GELU {
+                        let mut lanes = [0.0; 4];
+                        vst1q_f32(lanes.as_mut_ptr(), value);
+                        vst1q_f32(out, vld1q_f32(lanes.map(gelu).as_ptr()));
+                    } else {
+                        vst1q_f32(out, value);
+                    }
                 }
             }
         }
 
-        fn block_rows<const R: usize, const V: usize>(&self, i: usize, y: &mut [f32]) {
+        fn block_rows<const R: usize, const V: usize, const GELU: bool>(
+            &self,
+            i: usize,
+            y: &mut [f32],
+        ) {
             let end = self.first_column + self.columns;
             let mut j = self.first_column;
             while j + V * 4 <= end {
                 // SAFETY: the loop condition guarantees `i + R <= rows`.
-                unsafe { self.block::<R, V>(i, j, y) };
+                unsafe { self.block::<R, V, GELU>(i, j, y) };
                 j += V * 4;
             }
             if j < end {
-                self.edge_columns::<R>(i, j, y);
+                self.edge_columns::<R, GELU>(i, j, y);
             }
         }
 
-        fn edge_columns<const R: usize>(&self, i: usize, j: usize, y: &mut [f32]) {
+        fn edge_columns<const R: usize, const GELU: bool>(
+            &self,
+            i: usize,
+            j: usize,
+            y: &mut [f32],
+        ) {
             for r in 0..R {
                 for column in j..self.first_column + self.columns {
                     let mut sum = 0.0;
@@ -90,14 +123,15 @@ mod neon {
                         sum +=
                             self.x[(i + r) * self.n_in + p] * self.weight[p * self.n_out + column];
                     }
+                    let value = sum + self.bias[column];
                     y[(i + r) * self.columns + column - self.first_column] =
-                        sum + self.bias[column];
+                        if GELU { gelu(value) } else { value };
                 }
             }
         }
     }
 
-    fn tiled<const R: usize, const V: usize>(
+    fn tiled<const R: usize, const V: usize, const GELU: bool>(
         x: &[f32],
         weight: &[f32],
         bias: &[f32],
@@ -119,16 +153,16 @@ mod neon {
         while i < rows {
             let remaining = rows - i;
             if remaining >= R {
-                kernel.block_rows::<R, V>(i, y);
+                kernel.block_rows::<R, V, GELU>(i, y);
                 i += R;
             } else if remaining >= 4 {
-                kernel.block_rows::<4, V>(i, y);
+                kernel.block_rows::<4, V, GELU>(i, y);
                 i += 4;
             } else if remaining >= 2 {
-                kernel.block_rows::<2, V>(i, y);
+                kernel.block_rows::<2, V, GELU>(i, y);
                 i += 2;
             } else {
-                kernel.block_rows::<1, V>(i, y);
+                kernel.block_rows::<1, V, GELU>(i, y);
                 i += 1;
             }
         }
@@ -136,6 +170,7 @@ mod neon {
 
     // Row slices of a multi-row matrix must stay on the 16-column kernel; the
     // rows == 1 kernel widens to 32 columns and rounds differently on the edge.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn linear_rows(
         x: &[f32],
         weight: &[f32],
@@ -144,10 +179,15 @@ mod neon {
         n_in: usize,
         n_out: usize,
         y: &mut [f32],
+        epilogue: Epilogue,
     ) {
-        tiled::<4, 4>(x, weight, bias, rows, n_in, n_out, y);
+        match epilogue {
+            Epilogue::Store => tiled::<4, 4, false>(x, weight, bias, rows, n_in, n_out, y),
+            Epilogue::Gelu => tiled::<4, 4, true>(x, weight, bias, rows, n_in, n_out, y),
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn linear_columns(
         x: &[f32],
         weight: &[f32],
@@ -156,6 +196,7 @@ mod neon {
         n_out: usize,
         columns: Range<usize>,
         y: &mut [f32],
+        epilogue: Epilogue,
     ) {
         assert!(
             columns.start.is_multiple_of(32),
@@ -170,7 +211,10 @@ mod neon {
             first_column: columns.start,
             columns: columns.len(),
         };
-        kernel.block_rows::<1, 8>(0, y);
+        match epilogue {
+            Epilogue::Store => kernel.block_rows::<1, 8, false>(0, y),
+            Epilogue::Gelu => kernel.block_rows::<1, 8, true>(0, y),
+        }
     }
 
     pub(crate) fn weighted_sum(values: &[f32], stride: usize, weights: &[f32], output: &mut [f32]) {
@@ -247,7 +291,7 @@ mod neon {
 
     #[cfg(test)]
     mod tests {
-        use super::{dot, linear_columns, linear_rows, weighted_sum};
+        use super::{dot, linear_columns, linear_rows, weighted_sum, Epilogue};
 
         fn linear(
             x: &[f32],
@@ -259,9 +303,18 @@ mod neon {
         ) -> Vec<f32> {
             let mut y = vec![0.0; rows * n_out];
             if rows == 1 {
-                linear_columns(x, weight, bias, n_in, n_out, 0..n_out, &mut y);
+                linear_columns(
+                    x,
+                    weight,
+                    bias,
+                    n_in,
+                    n_out,
+                    0..n_out,
+                    &mut y,
+                    Epilogue::Store,
+                );
             } else {
-                linear_rows(x, weight, bias, rows, n_in, n_out, &mut y);
+                linear_rows(x, weight, bias, rows, n_in, n_out, &mut y, Epilogue::Store);
             }
             y
         }
@@ -374,8 +427,11 @@ mod neon {
 mod scalar {
     use std::ops::Range;
 
+    use super::{gelu, Epilogue};
+
     const ROW_TILE: usize = 8;
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn linear_rows(
         x: &[f32],
         weight: &[f32],
@@ -384,7 +440,24 @@ mod scalar {
         n_in: usize,
         n_out: usize,
         y: &mut [f32],
+        epilogue: Epilogue,
     ) {
+        match epilogue {
+            Epilogue::Store => rows::<false>(x, weight, bias, rows, n_in, n_out, y),
+            Epilogue::Gelu => rows::<true>(x, weight, bias, rows, n_in, n_out, y),
+        }
+    }
+
+    fn rows<const GELU: bool>(
+        x: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        y: &mut [f32],
+    ) {
+        y.fill(0.0);
         for i in (0..rows).step_by(ROW_TILE) {
             let block = (rows - i).min(ROW_TILE);
             let y_block = &mut y[i * n_out..(i + block) * n_out];
@@ -401,13 +474,31 @@ mod scalar {
             for r in 0..block {
                 let y_row = &mut y_block[r * n_out..(r + 1) * n_out];
                 for (value, &b) in y_row.iter_mut().zip(bias) {
-                    *value += b;
+                    let sum = *value + b;
+                    *value = if GELU { gelu(sum) } else { sum };
                 }
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn linear_columns(
+        x: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        n_in: usize,
+        n_out: usize,
+        columns: Range<usize>,
+        y: &mut [f32],
+        epilogue: Epilogue,
+    ) {
+        match epilogue {
+            Epilogue::Store => columns::<false>(x, weight, bias, n_in, n_out, columns, y),
+            Epilogue::Gelu => columns::<true>(x, weight, bias, n_in, n_out, columns, y),
+        }
+    }
+
+    fn columns<const GELU: bool>(
         x: &[f32],
         weight: &[f32],
         bias: &[f32],
@@ -417,6 +508,7 @@ mod scalar {
         y: &mut [f32],
     ) {
         let (start, end) = (columns.start, columns.end);
+        y.fill(0.0);
         for p in 0..n_in {
             let a = x[p];
             let w_row = &weight[p * n_out + start..p * n_out + end];
@@ -425,7 +517,8 @@ mod scalar {
             }
         }
         for (value, &b) in y.iter_mut().zip(&bias[start..end]) {
-            *value += b;
+            let sum = *value + b;
+            *value = if GELU { gelu(sum) } else { sum };
         }
     }
 

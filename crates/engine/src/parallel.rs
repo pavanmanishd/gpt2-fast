@@ -109,20 +109,26 @@ impl Pool {
         let count = self.workers.len() + 1;
         let len = output.len();
         let (mine, mut rest) = output.split_at_mut(boundary(1, len, count, align));
-        let mut parts = Vec::with_capacity(count - 1);
-        for index in 1..count {
-            let range = bounds(index, len, count, align);
-            let (part, tail) = rest.split_at_mut(range.len());
-            parts.push((range.start, part as *mut [f32]));
-            rest = tail;
-        }
 
         // SAFETY: every worker finishes before `run` returns, so the task reference
         // and the output slices outlive every worker's use of them.
         let task: &'static (dyn Fn(usize, &mut [f32]) + Sync) =
             unsafe { std::mem::transmute(task) };
         // SAFETY: no worker is reading the slot; the previous job completed.
-        unsafe { *self.shared.job.get() = Some(Job { task, parts }) };
+        let job = unsafe {
+            (*self.shared.job.get()).get_or_insert_with(|| Job {
+                task,
+                parts: Vec::with_capacity(count - 1),
+            })
+        };
+        job.task = task;
+        job.parts.clear();
+        for index in 1..count {
+            let range = bounds(index, len, count, align);
+            let (part, tail) = rest.split_at_mut(range.len());
+            job.parts.push((range.start, part as *mut [f32]));
+            rest = tail;
+        }
 
         self.shared.completed.store(0, Ordering::Relaxed);
         self.shared.generation.fetch_add(1, Ordering::Release);
