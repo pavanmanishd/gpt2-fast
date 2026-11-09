@@ -1,6 +1,7 @@
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use std::arch::aarch64::*;
+    use std::ops::Range;
 
     struct Linear<'a> {
         x: &'a [f32],
@@ -8,11 +9,14 @@ mod neon {
         bias: &'a [f32],
         n_in: usize,
         n_out: usize,
+        first_column: usize,
+        columns: usize,
     }
 
     impl Linear<'_> {
-        // SAFETY: `i + R <= rows`, `j + V * 4 <= n_out`, and all slices are sized for
-        // `rows * n_in`, `n_in * n_out` and `rows * n_out` elements.
+        // SAFETY: `i + R <= rows`, `j + V * 4 <= first_column + columns`, `y` has
+        // `rows * columns` elements, and all slices are sized for `rows * n_in`,
+        // `n_in * n_out` and `rows * n_out` elements.
         #[allow(clippy::needless_range_loop)]
         unsafe fn block<const R: usize, const V: usize>(&self, i: usize, j: usize, y: &mut [f32]) {
             let x = self.x.as_ptr();
@@ -55,7 +59,9 @@ mod neon {
             }
 
             for r in 0..R {
-                let out = y.as_mut_ptr().add((i + r) * n_out + j);
+                let out = y
+                    .as_mut_ptr()
+                    .add((i + r) * self.columns + j - self.first_column);
                 for (c, value) in acc[r].iter().enumerate() {
                     let b = vld1q_f32(bias.add(j + c * 4));
                     vst1q_f32(out.add(c * 4), vaddq_f32(*value, b));
@@ -64,26 +70,28 @@ mod neon {
         }
 
         fn block_rows<const R: usize, const V: usize>(&self, i: usize, y: &mut [f32]) {
-            let mut j = 0;
-            while j + V * 4 <= self.n_out {
+            let end = self.first_column + self.columns;
+            let mut j = self.first_column;
+            while j + V * 4 <= end {
                 // SAFETY: the loop condition guarantees `i + R <= rows`.
                 unsafe { self.block::<R, V>(i, j, y) };
                 j += V * 4;
             }
-            if j < self.n_out {
+            if j < end {
                 self.edge_columns::<R>(i, j, y);
             }
         }
 
         fn edge_columns<const R: usize>(&self, i: usize, j: usize, y: &mut [f32]) {
             for r in 0..R {
-                for column in j..self.n_out {
+                for column in j..self.first_column + self.columns {
                     let mut sum = 0.0;
                     for p in 0..self.n_in {
                         sum +=
                             self.x[(i + r) * self.n_in + p] * self.weight[p * self.n_out + column];
                     }
-                    y[(i + r) * self.n_out + column] = sum + self.bias[column];
+                    y[(i + r) * self.columns + column - self.first_column] =
+                        sum + self.bias[column];
                 }
             }
         }
@@ -96,48 +104,73 @@ mod neon {
         rows: usize,
         n_in: usize,
         n_out: usize,
-    ) -> Vec<f32> {
+        y: &mut [f32],
+    ) {
         let kernel = Linear {
             x,
             weight,
             bias,
             n_in,
             n_out,
+            first_column: 0,
+            columns: n_out,
         };
-        let mut y = vec![0.0; rows * n_out];
         let mut i = 0;
         while i < rows {
             let remaining = rows - i;
             if remaining >= R {
-                kernel.block_rows::<R, V>(i, &mut y);
+                kernel.block_rows::<R, V>(i, y);
                 i += R;
             } else if remaining >= 4 {
-                kernel.block_rows::<4, V>(i, &mut y);
+                kernel.block_rows::<4, V>(i, y);
                 i += 4;
             } else if remaining >= 2 {
-                kernel.block_rows::<2, V>(i, &mut y);
+                kernel.block_rows::<2, V>(i, y);
                 i += 2;
             } else {
-                kernel.block_rows::<1, V>(i, &mut y);
+                kernel.block_rows::<1, V>(i, y);
                 i += 1;
             }
         }
-        y
     }
 
-    pub(crate) fn linear(
+    // Row slices of a multi-row matrix must stay on the 16-column kernel; the
+    // rows == 1 kernel widens to 32 columns and rounds differently on the edge.
+    pub(crate) fn linear_rows(
         x: &[f32],
         weight: &[f32],
         bias: &[f32],
         rows: usize,
         n_in: usize,
         n_out: usize,
-    ) -> Vec<f32> {
-        if rows == 1 {
-            tiled::<1, 8>(x, weight, bias, rows, n_in, n_out)
-        } else {
-            tiled::<4, 4>(x, weight, bias, rows, n_in, n_out)
-        }
+        y: &mut [f32],
+    ) {
+        tiled::<4, 4>(x, weight, bias, rows, n_in, n_out, y);
+    }
+
+    pub(crate) fn linear_columns(
+        x: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        n_in: usize,
+        n_out: usize,
+        columns: Range<usize>,
+        y: &mut [f32],
+    ) {
+        assert!(
+            columns.start.is_multiple_of(32),
+            "column split is not aligned to the vector block"
+        );
+        let kernel = Linear {
+            x,
+            weight,
+            bias,
+            n_in,
+            n_out,
+            first_column: columns.start,
+            columns: columns.len(),
+        };
+        kernel.block_rows::<1, 8>(0, y);
     }
 
     pub(crate) fn weighted_sum(values: &[f32], stride: usize, weights: &[f32], output: &mut [f32]) {
@@ -214,7 +247,24 @@ mod neon {
 
     #[cfg(test)]
     mod tests {
-        use super::{dot, linear, weighted_sum};
+        use super::{dot, linear_columns, linear_rows, weighted_sum};
+
+        fn linear(
+            x: &[f32],
+            weight: &[f32],
+            bias: &[f32],
+            rows: usize,
+            n_in: usize,
+            n_out: usize,
+        ) -> Vec<f32> {
+            let mut y = vec![0.0; rows * n_out];
+            if rows == 1 {
+                linear_columns(x, weight, bias, n_in, n_out, 0..n_out, &mut y);
+            } else {
+                linear_rows(x, weight, bias, rows, n_in, n_out, &mut y);
+            }
+            y
+        }
 
         fn close(actual: f32, expected: f32) {
             let tolerance = 1e-5 * expected.abs().max(1.0);
@@ -322,17 +372,19 @@ mod neon {
 
 #[cfg(not(target_arch = "aarch64"))]
 mod scalar {
+    use std::ops::Range;
+
     const ROW_TILE: usize = 8;
 
-    pub(crate) fn linear(
+    pub(crate) fn linear_rows(
         x: &[f32],
         weight: &[f32],
         bias: &[f32],
         rows: usize,
         n_in: usize,
         n_out: usize,
-    ) -> Vec<f32> {
-        let mut y = vec![0.0; rows * n_out];
+        y: &mut [f32],
+    ) {
         for i in (0..rows).step_by(ROW_TILE) {
             let block = (rows - i).min(ROW_TILE);
             let y_block = &mut y[i * n_out..(i + block) * n_out];
@@ -353,7 +405,28 @@ mod scalar {
                 }
             }
         }
-        y
+    }
+
+    pub(crate) fn linear_columns(
+        x: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        n_in: usize,
+        n_out: usize,
+        columns: Range<usize>,
+        y: &mut [f32],
+    ) {
+        let (start, end) = (columns.start, columns.end);
+        for p in 0..n_in {
+            let a = x[p];
+            let w_row = &weight[p * n_out + start..p * n_out + end];
+            for (sum, &w) in y.iter_mut().zip(w_row) {
+                *sum += a * w;
+            }
+        }
+        for (value, &b) in y.iter_mut().zip(&bias[start..end]) {
+            *value += b;
+        }
     }
 
     pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -379,7 +452,7 @@ mod scalar {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) use neon::{dot, linear, weighted_sum};
+pub(crate) use neon::{dot, linear_columns, linear_rows, weighted_sum};
 
 #[cfg(not(target_arch = "aarch64"))]
-pub(crate) use scalar::{dot, linear, weighted_sum};
+pub(crate) use scalar::{dot, linear_columns, linear_rows, weighted_sum};

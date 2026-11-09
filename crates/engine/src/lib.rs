@@ -1,6 +1,7 @@
 mod config;
 mod error;
 mod model;
+mod parallel;
 mod safetensors;
 mod simd;
 mod tokenizer;
