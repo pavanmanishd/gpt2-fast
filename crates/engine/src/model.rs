@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::safetensors::SafeTensors;
+use crate::simd::{dot, linear, weighted_sum};
 use crate::{argmax, Config, Error};
 
 pub struct Model {
@@ -205,14 +206,8 @@ impl Model {
         let vocab_size = self.config.vocab_size;
         let mut logits = vec![0.0; vocab_size];
         for (token, logit) in logits.iter_mut().enumerate() {
-            let mut sum = 0.0;
-            for (h, w) in hidden
-                .iter()
-                .zip(&self.wte[token * n_embd..(token + 1) * n_embd])
-            {
-                sum += h * w;
-            }
-            *logit = sum;
+            let row = &self.wte[token * n_embd..(token + 1) * n_embd];
+            *logit = dot(&hidden, row);
         }
         logits
     }
@@ -326,11 +321,7 @@ fn attention(
             let query = (position - start) * 3 * n_embd + base;
             for (past, score) in scores[..=position].iter_mut().enumerate() {
                 let key = past * n_embd + base;
-                let mut dot = 0.0;
-                for d in 0..head_dim {
-                    dot += qkv[query + d] * keys[key + d];
-                }
-                *score = dot * scale;
+                *score = dot(&qkv[query..query + head_dim], &keys[key..key + head_dim]) * scale;
             }
 
             let max = scores[..=position]
@@ -347,49 +338,10 @@ fn attention(
             }
 
             let attended = &mut output[(position - start) * n_embd + base..][..head_dim];
-            for (past, &weight) in scores[..=position].iter().enumerate() {
-                let value_row = &values[past * n_embd + base..past * n_embd + base + head_dim];
-                for (sum, &value) in attended.iter_mut().zip(value_row) {
-                    *sum += weight * value;
-                }
-            }
+            weighted_sum(&values[base..], n_embd, &scores[..=position], attended);
         }
     }
     output
-}
-
-const ROW_TILE: usize = 8;
-
-fn linear(
-    x: &[f32],
-    weight: &[f32],
-    bias: &[f32],
-    rows: usize,
-    n_in: usize,
-    n_out: usize,
-) -> Vec<f32> {
-    let mut y = vec![0.0; rows * n_out];
-    for i in (0..rows).step_by(ROW_TILE) {
-        let block = (rows - i).min(ROW_TILE);
-        let y_block = &mut y[i * n_out..(i + block) * n_out];
-        for p in 0..n_in {
-            let w_row = &weight[p * n_out..(p + 1) * n_out];
-            for r in 0..block {
-                let a = x[(i + r) * n_in + p];
-                let y_row = &mut y_block[r * n_out..(r + 1) * n_out];
-                for (sum, &w) in y_row.iter_mut().zip(w_row) {
-                    *sum += a * w;
-                }
-            }
-        }
-        for r in 0..block {
-            let y_row = &mut y_block[r * n_out..(r + 1) * n_out];
-            for (value, &b) in y_row.iter_mut().zip(bias) {
-                *value += b;
-            }
-        }
-    }
-    y
 }
 
 fn add_in_place(x: &mut [f32], y: &[f32]) {
@@ -459,11 +411,15 @@ mod tests {
                 .collect();
             let bias: Vec<f32> = (0..n_out).map(|i| i as f32 / 9.0 - 1.0).collect();
 
-            assert_eq!(
-                linear(&x, &weight, &bias, rows, n_in, n_out),
-                reference(&x, &weight, &bias, rows, n_in, n_out),
-                "rows {rows}, in {n_in}, out {n_out}"
-            );
+            let actual = linear(&x, &weight, &bias, rows, n_in, n_out);
+            let expected = reference(&x, &weight, &bias, rows, n_in, n_out);
+            for (a, e) in actual.iter().zip(&expected) {
+                let tolerance = 1e-5 * e.abs().max(1.0);
+                assert!(
+                    (a - e).abs() <= tolerance,
+                    "rows {rows}, in {n_in}, out {n_out}: expected {e}, got {a}"
+                );
+            }
         }
     }
 }

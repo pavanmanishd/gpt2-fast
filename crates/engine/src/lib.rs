@@ -2,6 +2,7 @@ mod config;
 mod error;
 mod model;
 mod safetensors;
+mod simd;
 mod tokenizer;
 
 pub use config::Config;
