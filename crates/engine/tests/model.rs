@@ -64,3 +64,24 @@ fn generates_the_same_tokens_as_transformers() {
     assert_eq!(generated, [1757, 13, 314, 1101, 257, 6260, 11, 290]);
     assert_eq!(tokenizer.decode(&generated), " John. I'm a writer, and");
 }
+
+#[test]
+fn generate_matches_recomputing_logits() {
+    let Some(model) = load_model() else {
+        return;
+    };
+    let tokenizer = Tokenizer::load(&model_dir()).expect("tokenizer loads");
+    let ids = tokenizer.encode("Hello, my name is");
+
+    let mut generated = Vec::new();
+    model.generate(&ids, 16, |token| generated.push(token));
+
+    let mut tokens = ids;
+    let mut expected = Vec::new();
+    for _ in 0..16 {
+        let next = argmax(&model.logits(&tokens));
+        expected.push(next);
+        tokens.push(next);
+    }
+    assert_eq!(generated, expected);
+}
