@@ -57,8 +57,25 @@ pub struct PromptSession {
     pub logit_max_abs_diff: f64,
     pub matched_tokens: usize,
     pub total_tokens: usize,
+    #[serde(default)]
+    pub first_mismatch: Option<usize>,
     pub runs: Vec<Run>,
     pub medians: Medians,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PerplexityReference {
+    pub tokens: usize,
+    pub perplexity: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PerplexityResult {
+    pub weights: String,
+    pub tokens: usize,
+    pub perplexity: f64,
+    pub reference_perplexity: f64,
+    pub delta: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default)]

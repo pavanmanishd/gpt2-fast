@@ -1,0 +1,7 @@
+{
+  "text": "reference/perplexity.txt",
+  "tokens": 1005,
+  "perplexity": 76.84307872137444,
+  "torch": "2.5.1",
+  "transformers": "4.46.3"
+}

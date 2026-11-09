@@ -173,6 +173,7 @@ mod tests {
                 logit_max_abs_diff: 0.0,
                 matched_tokens,
                 total_tokens,
+                first_mismatch: None,
                 runs: Vec::new(),
                 medians: Medians {
                     decode_tok_s,

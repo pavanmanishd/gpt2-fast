@@ -2,13 +2,14 @@ mod config;
 mod error;
 mod model;
 mod parallel;
+mod quantize;
 mod safetensors;
 mod simd;
 mod tokenizer;
 
 pub use config::Config;
 pub use error::Error;
-pub use model::Model;
+pub use model::{Model, Weights};
 pub use tokenizer::Tokenizer;
 
 pub fn argmax(logits: &[f32]) -> u32 {

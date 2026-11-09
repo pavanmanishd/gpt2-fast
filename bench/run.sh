@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: bench/run.sh <label> <sessions> [--warmup N] [--runs N] -- <worker command...>" >&2
+    echo "usage: bench/run.sh <label> <sessions> [--warmup N] [--runs N] [--quantized] -- <worker command...>" >&2
     exit 1
 }
 
@@ -13,6 +13,7 @@ shift 2
 
 warmup=1
 runs=5
+quantized=
 while [[ $# -gt 0 ]]; do
     case $1 in
         --warmup)
@@ -24,6 +25,10 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || usage
             runs=$2
             shift 2
+            ;;
+        --quantized)
+            quantized=--quantized
+            shift
             ;;
         --)
             shift
@@ -73,7 +78,7 @@ for session in $(seq 1 "$sessions"); do
         -v "$PWD/results/runs:/work/results/runs" \
         "$image" \
         bench run --label "$label" --prompts bench/prompts.json --expected reference/expected.json \
-        --warmup "$warmup" --runs "$runs" \
+        --warmup "$warmup" --runs "$runs" $quantized \
         --out "results/runs/$label/session-$session.json" \
         -- "${worker[@]}"
 done

@@ -3,14 +3,104 @@ use std::path::Path;
 
 use crate::parallel::Threads;
 use crate::safetensors::SafeTensors;
-use crate::simd::{dot, linear_columns, linear_rows, weighted_sum, Epilogue};
+use crate::simd::{
+    dot, int8_dot, int8_linear_columns, int8_linear_rows, linear_columns, linear_rows,
+    weighted_sum, Epilogue,
+};
 use crate::{argmax, Config, Error};
 
 const COLUMN_ALIGN: usize = 32;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Weights {
+    F32,
+    Int8,
+}
+
+impl Weights {
+    pub fn parse(name: &str) -> Option<Weights> {
+        match name {
+            "f32" => Some(Weights::F32),
+            "int8" => Some(Weights::Int8),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Weights::F32 => "f32",
+            Weights::Int8 => "int8",
+        }
+    }
+}
+
+enum Matrix {
+    F32(Vec<f32>),
+    Int8 { data: Vec<i8>, scale: Vec<f32> },
+}
+
+impl Matrix {
+    fn row_dot(&self, x: &[f32], row: usize, len: usize) -> f32 {
+        let start = row * len;
+        match self {
+            Matrix::F32(data) => dot(x, &data[start..start + len]),
+            Matrix::Int8 { data, scale } => int8_dot(x, &data[start..start + len]) * scale[row],
+        }
+    }
+
+    fn add_row_to(&self, row: usize, len: usize, addend: &[f32], out: &mut [f32]) {
+        let start = row * len;
+        match self {
+            Matrix::F32(data) => {
+                for (d, value) in out.iter_mut().enumerate() {
+                    *value = data[start + d] + addend[d];
+                }
+            }
+            Matrix::Int8 { data, scale } => {
+                let scale = scale[row];
+                for (d, value) in out.iter_mut().enumerate() {
+                    *value = data[start + d] as f32 * scale + addend[d];
+                }
+            }
+        }
+    }
+}
+
+fn load_matrix(
+    tensors: &mut SafeTensors,
+    name: &str,
+    n_in: usize,
+    n_out: usize,
+    weights: Weights,
+) -> Result<Matrix, Error> {
+    match weights {
+        Weights::F32 => Ok(Matrix::F32(tensors.load_matrix(name, n_in, n_out)?)),
+        Weights::Int8 => {
+            let (data, scale) = tensors.quantize_columns(name, n_in, n_out)?;
+            Ok(Matrix::Int8 { data, scale })
+        }
+    }
+}
+
+fn load_embedding(
+    tensors: &mut SafeTensors,
+    name: &str,
+    rows: usize,
+    cols: usize,
+    weights: Weights,
+) -> Result<Matrix, Error> {
+    match weights {
+        Weights::F32 => Ok(Matrix::F32(tensors.load_matrix(name, rows, cols)?)),
+        Weights::Int8 => {
+            let (data, scale) = tensors.quantize_rows(name, rows, cols)?;
+            Ok(Matrix::Int8 { data, scale })
+        }
+    }
+}
+
 pub struct Model {
     config: Config,
-    wte: Vec<f32>,
+    wte: Matrix,
     wpe: Vec<f32>,
     layers: Vec<Layer>,
     ln_f_weight: Vec<f32>,
@@ -21,15 +111,15 @@ pub struct Model {
 struct Layer {
     ln_1_weight: Vec<f32>,
     ln_1_bias: Vec<f32>,
-    c_attn_weight: Vec<f32>,
+    c_attn_weight: Matrix,
     c_attn_bias: Vec<f32>,
-    c_proj_weight: Vec<f32>,
+    c_proj_weight: Matrix,
     c_proj_bias: Vec<f32>,
     ln_2_weight: Vec<f32>,
     ln_2_bias: Vec<f32>,
-    c_fc_weight: Vec<f32>,
+    c_fc_weight: Matrix,
     c_fc_bias: Vec<f32>,
-    mlp_c_proj_weight: Vec<f32>,
+    mlp_c_proj_weight: Matrix,
     mlp_c_proj_bias: Vec<f32>,
 }
 
@@ -91,12 +181,22 @@ impl KvCache {
 
 impl Model {
     pub fn load(model_dir: &Path) -> Result<Model, Error> {
+        Model::load_with(model_dir, Weights::F32)
+    }
+
+    pub fn load_with(model_dir: &Path, weights: Weights) -> Result<Model, Error> {
         let config = Config::load(model_dir)?;
         let mut tensors = SafeTensors::open(&model_dir.join("model.safetensors"))?;
 
         let n_embd = config.n_embd;
         let n_inner = 4 * n_embd;
-        let wte = tensors.load_matrix("wte.weight", config.vocab_size, n_embd)?;
+        let wte = load_embedding(
+            &mut tensors,
+            "wte.weight",
+            config.vocab_size,
+            n_embd,
+            weights,
+        )?;
         let wpe = tensors.load_matrix("wpe.weight", config.n_ctx, n_embd)?;
 
         let mut layers = Vec::with_capacity(config.n_layer);
@@ -105,31 +205,39 @@ impl Model {
             layers.push(Layer {
                 ln_1_weight: tensors.load_vector(&format!("{prefix}.ln_1.weight"), n_embd)?,
                 ln_1_bias: tensors.load_vector(&format!("{prefix}.ln_1.bias"), n_embd)?,
-                c_attn_weight: tensors.load_matrix(
+                c_attn_weight: load_matrix(
+                    &mut tensors,
                     &format!("{prefix}.attn.c_attn.weight"),
                     n_embd,
                     3 * n_embd,
+                    weights,
                 )?,
                 c_attn_bias: tensors
                     .load_vector(&format!("{prefix}.attn.c_attn.bias"), 3 * n_embd)?,
-                c_proj_weight: tensors.load_matrix(
+                c_proj_weight: load_matrix(
+                    &mut tensors,
                     &format!("{prefix}.attn.c_proj.weight"),
                     n_embd,
                     n_embd,
+                    weights,
                 )?,
                 c_proj_bias: tensors.load_vector(&format!("{prefix}.attn.c_proj.bias"), n_embd)?,
                 ln_2_weight: tensors.load_vector(&format!("{prefix}.ln_2.weight"), n_embd)?,
                 ln_2_bias: tensors.load_vector(&format!("{prefix}.ln_2.bias"), n_embd)?,
-                c_fc_weight: tensors.load_matrix(
+                c_fc_weight: load_matrix(
+                    &mut tensors,
                     &format!("{prefix}.mlp.c_fc.weight"),
                     n_embd,
                     n_inner,
+                    weights,
                 )?,
                 c_fc_bias: tensors.load_vector(&format!("{prefix}.mlp.c_fc.bias"), n_inner)?,
-                mlp_c_proj_weight: tensors.load_matrix(
+                mlp_c_proj_weight: load_matrix(
+                    &mut tensors,
                     &format!("{prefix}.mlp.c_proj.weight"),
                     n_inner,
                     n_embd,
+                    weights,
                 )?,
                 mlp_c_proj_bias: tensors
                     .load_vector(&format!("{prefix}.mlp.c_proj.bias"), n_embd)?,
@@ -221,11 +329,13 @@ impl Model {
                 (id as usize) < self.config.vocab_size,
                 "token id {id} is outside the vocabulary"
             );
-            let row = id as usize * n_embd;
             let position_row = (start + offset) * n_embd;
-            for d in 0..n_embd {
-                workspace.x[offset * n_embd + d] = self.wte[row + d] + self.wpe[position_row + d];
-            }
+            self.wte.add_row_to(
+                id as usize,
+                n_embd,
+                &self.wpe[position_row..position_row + n_embd],
+                &mut workspace.x[offset * n_embd..(offset + 1) * n_embd],
+            );
         }
 
         for (index, layer) in self.layers.iter().enumerate() {
@@ -248,16 +358,75 @@ impl Model {
         let wte = &self.wte;
         self.threads.run(&mut workspace.logits, 1, |start, part| {
             for (offset, logit) in part.iter_mut().enumerate() {
-                let row = (start + offset) * n_embd;
-                *logit = dot(hidden, &wte[row..row + n_embd]);
+                *logit = wte.row_dot(hidden, start + offset, n_embd);
             }
         });
         &workspace.logits
     }
+
+    pub fn next_token_logprobs(&self, ids: &[u32]) -> Vec<f32> {
+        let n = ids.len();
+        assert!(n > 0, "next_token_logprobs requires at least one token id");
+        assert!(
+            n <= self.config.n_ctx,
+            "sequence of {n} ids exceeds context length {}",
+            self.config.n_ctx
+        );
+        for &id in ids {
+            assert!(
+                (id as usize) < self.config.vocab_size,
+                "token id {id} is outside the vocabulary"
+            );
+        }
+        if n == 1 {
+            return Vec::new();
+        }
+
+        let mut cache = KvCache::new(&self.config);
+        let mut workspace = Workspace::new(&self.config, 1);
+        let mut logprobs = Vec::with_capacity(n - 1);
+        for position in 0..n - 1 {
+            self.forward(
+                &ids[position..=position],
+                cache.len,
+                &mut cache,
+                &mut workspace,
+            );
+            let logits = self.last_logits(&mut workspace, 1);
+            logprobs.push(log_probability(logits, ids[position + 1]));
+        }
+        logprobs
+    }
+}
+
+fn log_probability(logits: &[f32], id: u32) -> f32 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = logits.iter().map(|logit| (logit - max).exp()).sum();
+    logits[id as usize] - max - sum.ln()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn linear(
+    threads: &Threads,
+    x: &[f32],
+    weight: &Matrix,
+    bias: &[f32],
+    rows: usize,
+    n_in: usize,
+    n_out: usize,
+    y: &mut [f32],
+    epilogue: Epilogue,
+) {
+    match weight {
+        Matrix::F32(weight) => linear_f32(threads, x, weight, bias, rows, n_in, n_out, y, epilogue),
+        Matrix::Int8 { data, scale } => linear_int8(
+            threads, x, data, scale, bias, rows, n_in, n_out, y, epilogue,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_f32(
     threads: &Threads,
     x: &[f32],
     weight: &[f32],
@@ -288,6 +457,52 @@ fn linear(
             linear_rows(
                 &x[first * n_in..(first + count) * n_in],
                 weight,
+                bias,
+                count,
+                n_in,
+                n_out,
+                part,
+                epilogue,
+            );
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_int8(
+    threads: &Threads,
+    x: &[f32],
+    weight: &[i8],
+    scale: &[f32],
+    bias: &[f32],
+    rows: usize,
+    n_in: usize,
+    n_out: usize,
+    y: &mut [f32],
+    epilogue: Epilogue,
+) {
+    if rows == 1 {
+        threads.run(y, COLUMN_ALIGN, |start, part| {
+            int8_linear_columns(
+                x,
+                weight,
+                scale,
+                bias,
+                n_in,
+                n_out,
+                start..start + part.len(),
+                part,
+                epilogue,
+            );
+        });
+    } else {
+        threads.run(y, n_out, |start, part| {
+            let first = start / n_out;
+            let count = part.len() / n_out;
+            int8_linear_rows(
+                &x[first * n_in..(first + count) * n_in],
+                weight,
+                scale,
                 bias,
                 count,
                 n_in,
@@ -521,7 +736,7 @@ fn layer_norm_into(x: &[f32], weight: &[f32], bias: &[f32], eps: f32, output: &m
 
 #[cfg(test)]
 mod tests {
-    use super::linear;
+    use super::{linear, Matrix};
     use crate::parallel::Threads;
     use crate::simd::Epilogue;
 
@@ -553,6 +768,7 @@ mod tests {
                 (17, 64, 65),
             ] {
                 let (x, weight, bias) = inputs(rows, n_in, n_out);
+                let weight = Matrix::F32(weight);
                 for epilogue in [Epilogue::Store, Epilogue::Gelu] {
                     let mut actual = vec![0.0; rows * n_out];
                     linear(

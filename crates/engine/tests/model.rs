@@ -85,3 +85,22 @@ fn generate_matches_recomputing_logits() {
     }
     assert_eq!(generated, expected);
 }
+
+#[test]
+fn next_token_logprobs_match_the_logits_of_each_prefix() {
+    let Some(model) = load_model() else {
+        return;
+    };
+    let tokenizer = Tokenizer::load(&model_dir()).expect("tokenizer loads");
+    let ids = tokenizer.encode("Hello, my name is");
+
+    let logprobs = model.next_token_logprobs(&ids);
+    assert_eq!(logprobs.len(), ids.len() - 1);
+    for position in 0..ids.len() - 1 {
+        let logits = model.logits(&ids[..=position]);
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|logit| (logit - max).exp()).sum();
+        let expected = logits[ids[position + 1] as usize] - max - sum.ln();
+        assert_close(logprobs[position], expected);
+    }
+}

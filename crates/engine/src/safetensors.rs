@@ -5,6 +5,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::quantize::{Columns, Rows};
 use crate::Error;
 
 pub(crate) struct SafeTensors {
@@ -111,6 +112,87 @@ impl SafeTensors {
             .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         Ok((shape, data))
+    }
+
+    pub(crate) fn quantize_columns(
+        &mut self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<i8>, Vec<f32>), Error> {
+        let mut quantizer = Columns::new(cols, rows * cols);
+        self.for_each_row(name, rows, cols, |row| quantizer.observe(row))?;
+        quantizer.finish();
+        self.for_each_row(name, rows, cols, |row| quantizer.push(row))?;
+        Ok(quantizer.into_parts())
+    }
+
+    pub(crate) fn quantize_rows(
+        &mut self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<i8>, Vec<f32>), Error> {
+        let mut quantizer = Rows::with_capacity(rows, rows * cols);
+        self.for_each_row(name, rows, cols, |row| quantizer.push(row))?;
+        Ok(quantizer.into_parts())
+    }
+
+    fn for_each_row(
+        &mut self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        mut visit: impl FnMut(&[f32]),
+    ) -> Result<(), Error> {
+        let start = self.f32_tensor_start(name, &[rows, cols])?;
+        let row_bytes = cols * 4;
+        let block_rows = (256 * 1024 / row_bytes).clamp(1, 64);
+        self.file
+            .seek(SeekFrom::Start(self.data_start + start as u64))?;
+        let mut bytes = vec![0u8; block_rows * row_bytes];
+        let mut values = vec![0.0f32; block_rows * cols];
+        let mut row = 0;
+        while row < rows {
+            let count = (rows - row).min(block_rows);
+            let length = count * row_bytes;
+            self.file.read_exact(&mut bytes[..length])?;
+            let (chunks, _) = bytes[..length].as_chunks::<4>();
+            for (value, chunk) in values[..count * cols].iter_mut().zip(chunks) {
+                *value = f32::from_le_bytes(*chunk);
+            }
+            for values in values[..count * cols].chunks(cols) {
+                visit(values);
+            }
+            row += count;
+        }
+        Ok(())
+    }
+
+    fn f32_tensor_start(&self, name: &str, shape: &[usize]) -> Result<usize, Error> {
+        let tensor = self
+            .tensors
+            .get(name)
+            .or_else(|| self.tensors.get(&format!("transformer.{name}")))
+            .ok_or_else(|| Error::new(format!("safetensors: missing tensor `{name}`")))?;
+        if tensor.dtype != "F32" {
+            return Err(Error::new(format!(
+                "safetensors: tensor `{name}` has dtype {}, expected F32",
+                tensor.dtype
+            )));
+        }
+        if tensor.shape != shape {
+            return Err(Error::new(format!(
+                "safetensors: tensor `{name}` has shape {:?}, expected {shape:?}",
+                tensor.shape
+            )));
+        }
+        if tensor.end - tensor.start != shape.iter().product::<usize>() * 4 {
+            return Err(Error::new(format!(
+                "safetensors: tensor `{name}` has inconsistent data offsets"
+            )));
+        }
+        Ok(tensor.start)
     }
 }
 

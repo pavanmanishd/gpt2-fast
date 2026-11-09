@@ -8,9 +8,10 @@ use gpt2_bench::protocol::Worker;
 use gpt2_bench::stats::median;
 use gpt2_bench::summary;
 use gpt2_bench::types::{
-    read_f32_file, ExpectedFile, Medians, PromptSession, PromptsFile, Run, Session,
+    read_f32_file, ExpectedFile, Medians, PerplexityReference, PerplexityResult, PromptSession,
+    PromptsFile, Run, Session,
 };
-use gpt2_engine::Tokenizer;
+use gpt2_engine::{Model, Tokenizer, Weights};
 use serde::de::DeserializeOwned;
 
 fn main() {
@@ -49,6 +50,13 @@ fn main() {
                 2
             }
         },
+        "perplexity" => match perplexity_command(rest) {
+            Ok(code) => code,
+            Err(message) => {
+                eprintln!("bench perplexity: {message}");
+                2
+            }
+        },
         "help" | "--help" | "-h" => {
             print_usage();
             0
@@ -64,7 +72,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>"
+        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] [--quantized] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>\n  bench perplexity --model-dir <dir> --text <file> --expected-perplexity <file> [--weights f32|int8] [--out <file>]"
     );
 }
 
@@ -77,6 +85,7 @@ struct RunOptions {
     out: String,
     only: Option<String>,
     max_new_tokens: Option<usize>,
+    quantized: bool,
     worker: Vec<String>,
 }
 
@@ -90,6 +99,7 @@ impl RunOptions {
         let mut out = None;
         let mut only = None;
         let mut max_new_tokens = None;
+        let mut quantized = false;
         let mut worker = Vec::new();
 
         let mut index = 0;
@@ -116,6 +126,7 @@ impl RunOptions {
                     }
                     max_new_tokens = Some(parsed);
                 }
+                "--quantized" => quantized = true,
                 other => return Err(format!("unknown option `{other}`")),
             }
             index += 1;
@@ -130,6 +141,7 @@ impl RunOptions {
             out: out.ok_or_else(|| "missing --out".to_string())?,
             only,
             max_new_tokens,
+            quantized,
             worker,
         };
         if options.runs == 0 {
@@ -244,34 +256,37 @@ fn run(options: RunOptions) -> Result<i32, String> {
         let mut matched_tokens = 0;
         let mut total_tokens = 0;
         let mut prompt_matches = true;
+        let mut first_mismatch = None;
         for _ in 0..options.warmup {
-            let (run, matched, total) = execute_run(
+            let outcome = execute_run(
                 &mut worker,
                 &expected_prompt.prompt_ids,
                 max_new_tokens,
                 expected_tokens,
             )
             .map_err(|error| format!("{}: {error}", prompt.id))?;
-            all_runs_match &= run.matches;
-            prompt_matches &= run.matches;
-            matched_tokens += matched;
-            total_tokens += total;
+            all_runs_match &= outcome.run.matches;
+            prompt_matches &= outcome.run.matches;
+            matched_tokens += outcome.matched;
+            total_tokens += outcome.total;
+            first_mismatch = earliest(first_mismatch, outcome.first_mismatch);
         }
 
         let mut runs = Vec::new();
         for _ in 0..options.runs {
-            let (run, matched, total) = execute_run(
+            let outcome = execute_run(
                 &mut worker,
                 &expected_prompt.prompt_ids,
                 max_new_tokens,
                 expected_tokens,
             )
             .map_err(|error| format!("{}: {error}", prompt.id))?;
-            all_runs_match &= run.matches;
-            prompt_matches &= run.matches;
-            matched_tokens += matched;
-            total_tokens += total;
-            runs.push(run);
+            all_runs_match &= outcome.run.matches;
+            prompt_matches &= outcome.run.matches;
+            matched_tokens += outcome.matched;
+            total_tokens += outcome.total;
+            first_mismatch = earliest(first_mismatch, outcome.first_mismatch);
+            runs.push(outcome.run);
         }
 
         let medians = Medians {
@@ -288,6 +303,9 @@ fn run(options: RunOptions) -> Result<i32, String> {
             if prompt_matches { "yes" } else { "no" },
             medians.decode_tok_s
         );
+        if let Some(index) = first_mismatch {
+            eprintln!("{}: first mismatch at generated token {index}", prompt.id);
+        }
 
         prompt_results.push(PromptSession {
             id: prompt.id.clone(),
@@ -295,6 +313,7 @@ fn run(options: RunOptions) -> Result<i32, String> {
             logit_max_abs_diff: logit_diff,
             matched_tokens,
             total_tokens,
+            first_mismatch,
             runs,
             medians,
         });
@@ -352,7 +371,18 @@ fn run(options: RunOptions) -> Result<i32, String> {
         .map_err(|error| format!("{}: {error}", options.out))?;
     eprintln!("session written to {}", options.out);
 
-    Ok(if matches_reference { 0 } else { 2 })
+    Ok(if matches_reference || options.quantized {
+        0
+    } else {
+        2
+    })
+}
+
+struct RunOutcome {
+    run: Run,
+    matched: usize,
+    total: usize,
+    first_mismatch: Option<usize>,
 }
 
 fn execute_run(
@@ -360,7 +390,7 @@ fn execute_run(
     ids: &[u32],
     max_new_tokens: usize,
     expected: &[u32],
-) -> Result<(Run, usize, usize), String> {
+) -> Result<RunOutcome, String> {
     let response = worker.request(ids, max_new_tokens, false)?;
 
     let ttft_ms = response
@@ -395,26 +425,37 @@ fn execute_run(
         0.0
     };
 
-    let matched_tokens = response
-        .tokens
-        .iter()
-        .zip(expected)
-        .filter(|(token, reference)| token == reference)
-        .count();
+    let mut matched_tokens = 0;
+    let mut first_mismatch = None;
+    for (index, (token, reference)) in response.tokens.iter().zip(expected).enumerate() {
+        if token == reference {
+            matched_tokens += 1;
+        } else if first_mismatch.is_none() {
+            first_mismatch = Some(index);
+        }
+    }
     let total_tokens = expected.len().min(response.tokens.len());
     let matches = matched_tokens == expected.len();
 
-    Ok((
-        Run {
+    Ok(RunOutcome {
+        run: Run {
             ttft_ms,
             prefill_tok_s,
             decode_tok_s,
             total_ms,
             matches,
         },
-        matched_tokens,
-        total_tokens,
-    ))
+        matched: matched_tokens,
+        total: total_tokens,
+        first_mismatch,
+    })
+}
+
+fn earliest(first: Option<usize>, next: Option<usize>) -> Option<usize> {
+    match (first, next) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (first, next) => first.or(next),
+    }
 }
 
 fn max_abs_diff(left: &[f32], right: &[f32]) -> f64 {
@@ -503,6 +544,106 @@ fn check_tokenizer(args: &[String]) -> Result<i32, String> {
         }
     }
     Ok(if failures == 0 { 0 } else { 1 })
+}
+
+struct PerplexityOptions {
+    model_dir: String,
+    text: String,
+    expected_perplexity: String,
+    weights: Weights,
+    out: String,
+}
+
+impl PerplexityOptions {
+    fn parse(args: &[String]) -> Result<PerplexityOptions, String> {
+        let mut model_dir = None;
+        let mut text = None;
+        let mut expected_perplexity = None;
+        let mut weights = Weights::F32;
+        let mut out = None;
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--model-dir" => model_dir = Some(take_value(args, &mut index, "--model-dir")?),
+                "--text" => text = Some(take_value(args, &mut index, "--text")?),
+                "--expected-perplexity" => {
+                    expected_perplexity =
+                        Some(take_value(args, &mut index, "--expected-perplexity")?)
+                }
+                "--weights" => {
+                    let value = take_value(args, &mut index, "--weights")?;
+                    weights = Weights::parse(&value)
+                        .ok_or_else(|| format!("--weights must be f32 or int8, got `{value}`"))?;
+                }
+                "--out" => out = Some(take_value(args, &mut index, "--out")?),
+                other => return Err(format!("unknown option `{other}`")),
+            }
+            index += 1;
+        }
+        let default_out = format!("results/runs/perplexity-{}.json", weights.name());
+        Ok(PerplexityOptions {
+            model_dir: model_dir.ok_or_else(|| "missing --model-dir".to_string())?,
+            text: text.ok_or_else(|| "missing --text".to_string())?,
+            expected_perplexity: expected_perplexity
+                .ok_or_else(|| "missing --expected-perplexity".to_string())?,
+            weights,
+            out: out.unwrap_or(default_out),
+        })
+    }
+}
+
+fn perplexity_command(args: &[String]) -> Result<i32, String> {
+    let options = PerplexityOptions::parse(args)?;
+    let tokenizer = Tokenizer::load(Path::new(&options.model_dir))
+        .map_err(|error| format!("{}: {error}", options.model_dir))?;
+    let text =
+        fs::read_to_string(&options.text).map_err(|error| format!("{}: {error}", options.text))?;
+    let ids = tokenizer.encode(&text);
+    if ids.len() < 2 {
+        return Err(format!(
+            "{}: needs at least two tokens, got {}",
+            options.text,
+            ids.len()
+        ));
+    }
+
+    let reference: PerplexityReference = read_json(Path::new(&options.expected_perplexity))?;
+    if ids.len() != reference.tokens {
+        eprintln!(
+            "warning: {} has {} tokens, the reference was measured on {}",
+            options.text,
+            ids.len(),
+            reference.tokens
+        );
+    }
+
+    let model = Model::load_with(Path::new(&options.model_dir), options.weights)
+        .map_err(|error| format!("{}: {error}", options.model_dir))?;
+    let logprobs = model.next_token_logprobs(&ids);
+    let mean_nll = -logprobs.iter().map(|&value| value as f64).sum::<f64>() / logprobs.len() as f64;
+    let perplexity = mean_nll.exp();
+    let result = PerplexityResult {
+        weights: options.weights.name().to_string(),
+        tokens: ids.len(),
+        perplexity,
+        reference_perplexity: reference.perplexity,
+        delta: perplexity - reference.perplexity,
+    };
+
+    let line = serde_json::to_string(&result)
+        .map_err(|error| format!("cannot encode perplexity: {error}"))?;
+    println!("{line}");
+    if let Some(parent) = Path::new(&options.out).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+        }
+    }
+    let text = serde_json::to_string_pretty(&result)
+        .map_err(|error| format!("cannot encode perplexity: {error}"))?;
+    fs::write(&options.out, format!("{text}\n"))
+        .map_err(|error| format!("{}: {error}", options.out))?;
+    eprintln!("perplexity written to {}", options.out);
+    Ok(0)
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
