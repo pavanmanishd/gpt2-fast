@@ -1,0 +1,12 @@
+{
+  "label": "R0-numpy",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 61.36192763600243,
+  "prefill_tok_s": 1167.1231121031417,
+  "ttft_ms": 53.259356,
+  "peak_mb": 1070.4765625,
+  "matches_reference": true,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}

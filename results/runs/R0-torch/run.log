@@ -1,0 +1,2 @@
+summary written to results/runs/R0-torch/summary.json
+{"date":"<date>","milestone":"R0-torch","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":48.449,"prefill_tok_s":1010.473,"ttft_ms":63.337,"peak_mb":1236.039,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}

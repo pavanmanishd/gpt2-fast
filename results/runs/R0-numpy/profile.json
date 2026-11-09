@@ -1,0 +1,51 @@
+{
+  "label": "R0-numpy",
+  "model": "gpt2",
+  "commit": "b3158fa",
+  "started_at": "2026-11-09T20:06:25Z",
+  "host": {
+    "nproc": 4,
+    "cpu": "unknown",
+    "memory_limit": "8589934592",
+    "kernel": "7.2.9-orbstack-00391-g2b298d05fbd4"
+  },
+  "worker_cmd": [
+    "python3",
+    "reference/worker_numpy.py",
+    "--model-dir",
+    "models/gpt2"
+  ],
+  "load_ms": 346.9671169950743,
+  "peak_mb": 1070.375,
+  "warmup": 0,
+  "runs": 1,
+  "prompts": [
+    {
+      "id": "p064",
+      "n_prompt": 64,
+      "logit_max_abs_diff": 0.0003509521484375,
+      "matched_tokens": 128,
+      "total_tokens": 128,
+      "runs": [
+        {
+          "ttft_ms": 54.966558,
+          "prefill_tok_s": 1164.3443273271723,
+          "decode_tok_s": 59.69193498092738,
+          "total_ms": 2182.557162,
+          "matches": true
+        }
+      ],
+      "medians": {
+        "decode_tok_s": 59.69193498092738,
+        "prefill_tok_s": 1164.3443273271723,
+        "ttft_ms": 54.966558
+      }
+    }
+  ],
+  "session_medians": {
+    "decode_tok_s": 59.69193498092738,
+    "prefill_tok_s": 1164.3443273271723,
+    "ttft_ms": 54.966558
+  },
+  "matches_reference": true
+}

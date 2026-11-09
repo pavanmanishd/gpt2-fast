@@ -1,0 +1,51 @@
+{
+  "label": "R0-torch",
+  "model": "gpt2",
+  "commit": "b3158fa",
+  "started_at": "2026-11-09T19:59:05Z",
+  "host": {
+    "nproc": 4,
+    "cpu": "unknown",
+    "memory_limit": "8589934592",
+    "kernel": "7.2.9-orbstack-00391-g2b298d05fbd4"
+  },
+  "worker_cmd": [
+    "python3",
+    "reference/worker_torch.py",
+    "--model-dir",
+    "models/gpt2"
+  ],
+  "load_ms": 87.70330900006229,
+  "peak_mb": 1235.96484375,
+  "warmup": 0,
+  "runs": 1,
+  "prompts": [
+    {
+      "id": "p064",
+      "n_prompt": 64,
+      "logit_max_abs_diff": 0.0,
+      "matched_tokens": 128,
+      "total_tokens": 128,
+      "runs": [
+        {
+          "ttft_ms": 63.956726,
+          "prefill_tok_s": 1000.6766137466135,
+          "decode_tok_s": 47.63507942203731,
+          "total_ms": 2730.059135,
+          "matches": true
+        }
+      ],
+      "medians": {
+        "decode_tok_s": 47.63507942203731,
+        "prefill_tok_s": 1000.6766137466135,
+        "ttft_ms": 63.956726
+      }
+    }
+  ],
+  "session_medians": {
+    "decode_tok_s": 47.63507942203731,
+    "prefill_tok_s": 1000.6766137466135,
+    "ttft_ms": 63.956726
+  },
+  "matches_reference": true
+}

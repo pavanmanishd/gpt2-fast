@@ -1,0 +1,12 @@
+{
+  "label": "R0-torch",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 48.44947932450896,
+  "prefill_tok_s": 1010.4732712610128,
+  "ttft_ms": 63.33665800000001,
+  "peak_mb": 1236.0390625,
+  "matches_reference": true,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}
