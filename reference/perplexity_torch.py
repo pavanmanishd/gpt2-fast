@@ -12,17 +12,22 @@ from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 
 def main():
     parser = argparse.ArgumentParser(description="Measure transformers perplexity on a fixed text.")
-    parser.add_argument("--model-dir", default="models/gpt2")
+    parser.add_argument("--model", default="gpt2", help="model name, for example gpt2-medium")
+    parser.add_argument("--model-dir", default=None, help="defaults to models/<model>")
     parser.add_argument("--text", default="reference/perplexity.txt")
-    parser.add_argument("--out", default="reference/perplexity.json")
+    parser.add_argument("--out", default=None, help="defaults to reference/perplexity[-<model>].json")
     args = parser.parse_args()
+
+    model_dir = args.model_dir or f"models/{args.model}"
+    suffix = "" if args.model == "gpt2" else f"-{args.model}"
+    out = args.out or f"reference/perplexity{suffix}.json"
 
     threads = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
     torch.set_num_threads(threads)
 
-    tokenizer = GPT2TokenizerFast.from_pretrained(args.model_dir)
+    tokenizer = GPT2TokenizerFast.from_pretrained(model_dir)
     ids = tokenizer.encode(Path(args.text).read_text())
-    model = GPT2LMHeadModel.from_pretrained(args.model_dir)
+    model = GPT2LMHeadModel.from_pretrained(model_dir)
     model.eval()
 
     input_ids = torch.tensor([ids], dtype=torch.long)
@@ -40,7 +45,7 @@ def main():
         "torch": torch.__version__,
         "transformers": transformers.__version__,
     }
-    Path(args.out).write_text(json.dumps(result, indent=2) + "\n")
+    Path(out).write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)
 
 

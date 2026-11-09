@@ -13,6 +13,7 @@ pub struct Summary {
     pub ttft_ms: f64,
     pub peak_mb: Option<f64>,
     pub matches_reference: bool,
+    pub near_tie_mismatch: bool,
     pub token_match_rate: f64,
     pub sessions: usize,
 }
@@ -72,6 +73,7 @@ pub fn summarize(sessions: &[Session]) -> Result<Summary, String> {
     );
 
     let matches_reference = sessions.iter().all(|session| session.matches_reference);
+    let near_tie_mismatch = sessions.iter().any(|session| session.near_tie_mismatch);
     let matched_tokens: usize = sessions
         .iter()
         .flat_map(|session| &session.prompts)
@@ -101,6 +103,7 @@ pub fn summarize(sessions: &[Session]) -> Result<Summary, String> {
         ttft_ms,
         peak_mb,
         matches_reference,
+        near_tie_mismatch,
         token_match_rate,
         sessions: sessions.len(),
     })
@@ -174,6 +177,7 @@ mod tests {
                 matched_tokens,
                 total_tokens,
                 first_mismatch: None,
+                near_tie: false,
                 runs: Vec::new(),
                 medians: Medians {
                     decode_tok_s,
@@ -187,6 +191,7 @@ mod tests {
                 ttft_ms,
             },
             matches_reference,
+            near_tie_mismatch: false,
         }
     }
 
@@ -229,6 +234,15 @@ mod tests {
         let summary = summarize(&sessions).unwrap();
         assert!(!summary.matches_reference);
         assert_eq!(summary.token_match_rate, 0.95);
+    }
+
+    #[test]
+    fn reports_near_tie_mismatches_without_failing_the_summary() {
+        let mut near_tie = session(10.0, 100.0, 4.0, None, 9, 10, true);
+        near_tie.near_tie_mismatch = true;
+        let summary = summarize(&[near_tie]).unwrap();
+        assert!(summary.matches_reference);
+        assert!(summary.near_tie_mismatch);
     }
 
     #[test]

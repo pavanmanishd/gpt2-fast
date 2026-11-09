@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: bench/profile.sh <label> <prompt-id> <max_new_tokens> -- <worker command...>" >&2
+    echo "usage: bench/profile.sh <label> <prompt-id> <max_new_tokens> [--expected <file>] -- <worker command...>" >&2
     exit 1
 }
 
@@ -12,8 +12,23 @@ prompt_id=$2
 max_new_tokens=$3
 shift 3
 
-[[ $1 == "--" ]] || usage
-shift
+expected=reference/expected.json
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --expected)
+            [[ $# -ge 2 ]] || usage
+            expected=$2
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
 [[ $# -gt 0 ]] || usage
 worker=("$@")
 
@@ -38,7 +53,7 @@ image="gpt2-fast-bench:${commit}"
 docker build --platform linux/arm64 -t "$image" -f bench/Dockerfile .
 mkdir -p "results/runs/$label"
 
-inner="perf record -e cpu-clock -F 999 -g --call-graph dwarf -o /tmp/perf.data -- bench run --label $(printf '%q' "$label") --prompts bench/prompts.json --expected reference/expected.json --only $(printf '%q' "$prompt_id") --max-new-tokens $max_new_tokens --warmup 0 --runs 1 --out $(printf '%q' "results/runs/$label/profile.json") --"
+inner="perf record -e cpu-clock -F 999 -g --call-graph dwarf -o /tmp/perf.data -- bench run --label $(printf '%q' "$label") --prompts bench/prompts.json --expected $(printf '%q' "$expected") --only $(printf '%q' "$prompt_id") --max-new-tokens $max_new_tokens --warmup 0 --runs 1 --out $(printf '%q' "results/runs/$label/profile.json") --"
 for argument in "${worker[@]}"; do
     inner+=" $(printf '%q' "$argument")"
 done

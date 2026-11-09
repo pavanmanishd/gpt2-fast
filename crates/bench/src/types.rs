@@ -31,6 +31,8 @@ pub struct ExpectedPrompt {
     pub generated_ids: Vec<u32>,
     pub generated_text: String,
     pub first_logits: String,
+    #[serde(default)]
+    pub near_tie: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -48,6 +50,8 @@ pub struct Session {
     pub prompts: Vec<PromptSession>,
     pub session_medians: Medians,
     pub matches_reference: bool,
+    #[serde(default)]
+    pub near_tie_mismatch: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -59,6 +63,8 @@ pub struct PromptSession {
     pub total_tokens: usize,
     #[serde(default)]
     pub first_mismatch: Option<usize>,
+    #[serde(default)]
+    pub near_tie: bool,
     pub runs: Vec<Run>,
     pub medians: Medians,
 }

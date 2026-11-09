@@ -11,6 +11,7 @@ use gpt2_bench::types::{
     read_f32_file, ExpectedFile, Medians, PerplexityReference, PerplexityResult, PromptSession,
     PromptsFile, Run, Session,
 };
+use gpt2_bench::verify::{verdict, PromptCheck};
 use gpt2_engine::{Model, Tokenizer, Weights};
 use serde::de::DeserializeOwned;
 
@@ -221,8 +222,7 @@ fn run(options: RunOptions) -> Result<i32, String> {
     eprintln!("worker ready in {load_ms:.1} ms");
 
     let mut prompt_results = Vec::new();
-    let mut all_runs_match = true;
-    let mut all_logits_ok = true;
+    let mut checks = Vec::new();
 
     for (prompt, expected_prompt) in selected {
         let verification = worker
@@ -241,7 +241,7 @@ fn run(options: RunOptions) -> Result<i32, String> {
             ));
         }
         let logit_diff = max_abs_diff(&logits, &expected_logits);
-        all_logits_ok &= logit_diff <= 0.01;
+        let logits_ok = logit_diff <= 0.01;
 
         let reference_len = expected_prompt.generated_ids.len();
         let compare_len = max_new_tokens.min(reference_len);
@@ -265,7 +265,6 @@ fn run(options: RunOptions) -> Result<i32, String> {
                 expected_tokens,
             )
             .map_err(|error| format!("{}: {error}", prompt.id))?;
-            all_runs_match &= outcome.run.matches;
             prompt_matches &= outcome.run.matches;
             matched_tokens += outcome.matched;
             total_tokens += outcome.total;
@@ -281,7 +280,6 @@ fn run(options: RunOptions) -> Result<i32, String> {
                 expected_tokens,
             )
             .map_err(|error| format!("{}: {error}", prompt.id))?;
-            all_runs_match &= outcome.run.matches;
             prompt_matches &= outcome.run.matches;
             matched_tokens += outcome.matched;
             total_tokens += outcome.total;
@@ -306,6 +304,12 @@ fn run(options: RunOptions) -> Result<i32, String> {
         if let Some(index) = first_mismatch {
             eprintln!("{}: first mismatch at generated token {index}", prompt.id);
         }
+        if expected_prompt.near_tie && !prompt_matches {
+            eprintln!(
+                "{}: near-tie prompt, the mismatch does not fail the session",
+                prompt.id
+            );
+        }
 
         prompt_results.push(PromptSession {
             id: prompt.id.clone(),
@@ -314,8 +318,14 @@ fn run(options: RunOptions) -> Result<i32, String> {
             matched_tokens,
             total_tokens,
             first_mismatch,
+            near_tie: expected_prompt.near_tie,
             runs,
             medians,
+        });
+        checks.push(PromptCheck {
+            near_tie: expected_prompt.near_tie,
+            logits_ok,
+            tokens_match: prompt_matches,
         });
     }
 
@@ -349,10 +359,11 @@ fn run(options: RunOptions) -> Result<i32, String> {
     let peak_mb = worker.peak_mb();
     worker.finish()?;
 
-    let matches_reference = all_runs_match && all_logits_ok;
+    let verdict = verdict(&checks);
+    let matches_reference = verdict.matches_reference;
     let session = Session {
         label: options.label,
-        model: prompts.model,
+        model: expected.model,
         commit: env::var("GPT2_FAST_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
         started_at,
         host,
@@ -364,6 +375,7 @@ fn run(options: RunOptions) -> Result<i32, String> {
         prompts: prompt_results,
         session_medians,
         matches_reference,
+        near_tie_mismatch: verdict.near_tie_mismatch,
     };
     let text = serde_json::to_string_pretty(&session)
         .map_err(|error| format!("cannot encode session: {error}"))?;
