@@ -15,9 +15,8 @@ pub struct Config {
 }
 
 impl Config {
-    pub(crate) fn load(model_dir: &Path) -> Result<Config, Error> {
-        let text = std::fs::read_to_string(model_dir.join("config.json"))?;
-        let value: Value = serde_json::from_str(&text)?;
+    pub fn from_json(text: &str) -> Result<Config, Error> {
+        let value: Value = serde_json::from_str(text)?;
 
         let n_ctx = usize_field(&value, "n_ctx")
             .or_else(|| usize_field(&value, "n_positions"))
@@ -45,6 +44,10 @@ impl Config {
             return Err(Error::new("config.json: n_embd is not divisible by n_head"));
         }
         Ok(config)
+    }
+
+    pub(crate) fn load(model_dir: &Path) -> Result<Config, Error> {
+        Config::from_json(&std::fs::read_to_string(model_dir.join("config.json"))?)
     }
 }
 

@@ -13,9 +13,13 @@ pub struct Tokenizer {
 
 impl Tokenizer {
     pub fn load(model_dir: &Path) -> Result<Tokenizer, Error> {
-        let vocab: HashMap<String, u32> =
-            serde_json::from_str(&std::fs::read_to_string(model_dir.join("vocab.json"))?)?;
+        let vocab = std::fs::read_to_string(model_dir.join("vocab.json"))?;
         let merges = std::fs::read_to_string(model_dir.join("merges.txt"))?;
+        Tokenizer::from_text(&vocab, &merges)
+    }
+
+    pub fn from_text(vocab_json: &str, merges_text: &str) -> Result<Tokenizer, Error> {
+        let vocab: HashMap<String, u32> = serde_json::from_str(vocab_json)?;
 
         let max_id = vocab
             .values()
@@ -28,7 +32,7 @@ impl Tokenizer {
         }
 
         let mut ranks: HashMap<String, HashMap<String, usize>> = HashMap::new();
-        for (rank, line) in merges.lines().enumerate() {
+        for (rank, line) in merges_text.lines().enumerate() {
             let line = line.trim_end_matches('\r');
             if line.is_empty() || line.starts_with("#version") {
                 continue;

@@ -12,7 +12,7 @@ use gpt2_bench::types::{
     PromptsFile, Run, Session,
 };
 use gpt2_bench::verify::{verdict, PromptCheck};
-use gpt2_engine::{Model, Tokenizer, Weights};
+use gpt2_engine::{write_int8, Model, Tokenizer, Weights};
 use serde::de::DeserializeOwned;
 
 fn main() {
@@ -58,6 +58,13 @@ fn main() {
                 2
             }
         },
+        "quantize" => match quantize_command(rest) {
+            Ok(code) => code,
+            Err(message) => {
+                eprintln!("bench quantize: {message}");
+                2
+            }
+        },
         "help" | "--help" | "-h" => {
             print_usage();
             0
@@ -73,7 +80,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] [--quantized] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>\n  bench perplexity --model-dir <dir> --text <file> --expected-perplexity <file> [--weights f32|int8] [--out <file>]"
+        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] [--quantized] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>\n  bench perplexity --model-dir <dir> --text <file> --expected-perplexity <file> [--weights f32|int8] [--out <file>]\n  bench quantize --model-dir <dir> --out <file>"
     );
 }
 
@@ -655,6 +662,53 @@ fn perplexity_command(args: &[String]) -> Result<i32, String> {
     fs::write(&options.out, format!("{text}\n"))
         .map_err(|error| format!("{}: {error}", options.out))?;
     eprintln!("perplexity written to {}", options.out);
+    Ok(0)
+}
+
+struct QuantizeOptions {
+    model_dir: String,
+    out: String,
+}
+
+impl QuantizeOptions {
+    fn parse(args: &[String]) -> Result<QuantizeOptions, String> {
+        let mut model_dir = None;
+        let mut out = None;
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--model-dir" => model_dir = Some(take_value(args, &mut index, "--model-dir")?),
+                "--out" => out = Some(take_value(args, &mut index, "--out")?),
+                other => return Err(format!("unknown option `{other}`")),
+            }
+            index += 1;
+        }
+        Ok(QuantizeOptions {
+            model_dir: model_dir.ok_or_else(|| "missing --model-dir".to_string())?,
+            out: out.ok_or_else(|| "missing --out".to_string())?,
+        })
+    }
+}
+
+fn quantize_command(args: &[String]) -> Result<i32, String> {
+    let options = QuantizeOptions::parse(args)?;
+    let out = Path::new(&options.out);
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+        }
+    }
+    write_int8(Path::new(&options.model_dir), out)
+        .map_err(|error| format!("{}: {error}", options.model_dir))?;
+    let bytes = fs::metadata(out)
+        .map_err(|error| format!("{}: {error}", out.display()))?
+        .len();
+    println!(
+        "{}: {:.1} MB ({} bytes)",
+        out.display(),
+        bytes as f64 / 1_000_000.0,
+        bytes
+    );
     Ok(0)
 }
 

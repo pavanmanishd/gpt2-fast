@@ -1,5 +1,6 @@
 mod config;
 mod error;
+mod int8_file;
 mod model;
 mod parallel;
 mod quantize;
@@ -9,6 +10,7 @@ mod tokenizer;
 
 pub use config::Config;
 pub use error::Error;
+pub use int8_file::write_int8;
 pub use model::{Model, Weights};
 pub use tokenizer::Tokenizer;
 

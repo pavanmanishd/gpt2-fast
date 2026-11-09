@@ -86,7 +86,14 @@ fn load_matrix(
     match weights {
         Weights::F32 => Ok(Matrix::F32(tensors.load_matrix(name, n_in, n_out)?)),
         Weights::Int8 => {
-            let (data, scale) = tensors.quantize_columns(name, n_in, n_out)?;
+            let (data, scale) = match tensors.load_int8(name, n_in, n_out)? {
+                Some(data) => {
+                    let groups = n_in.div_ceil(GROUP_SIZE);
+                    let scale = tensors.load_matrix(&format!("{name}.scales"), groups, n_out)?;
+                    (data, scale)
+                }
+                None => tensors.quantize_columns(name, n_in, n_out)?,
+            };
             Ok(Matrix::Int8 { data, scale })
         }
     }
@@ -102,7 +109,14 @@ fn load_embedding(
     match weights {
         Weights::F32 => Ok(Matrix::F32(tensors.load_matrix(name, rows, cols)?)),
         Weights::Int8 => {
-            let (data, scale) = tensors.quantize_rows(name, rows, cols)?;
+            let (data, scale) = match tensors.load_int8(name, rows, cols)? {
+                Some(data) => {
+                    let groups = cols.div_ceil(GROUP_SIZE);
+                    let scale = tensors.load_matrix(&format!("{name}.scales"), rows, groups)?;
+                    (data, scale)
+                }
+                None => tensors.quantize_rows(name, rows, cols)?,
+            };
             Ok(Matrix::Int8 { data, scale })
         }
     }
@@ -196,8 +210,25 @@ impl Model {
 
     pub fn load_with(model_dir: &Path, weights: Weights) -> Result<Model, Error> {
         let config = Config::load(model_dir)?;
-        let mut tensors = SafeTensors::open(&model_dir.join("model.safetensors"))?;
+        let tensors = SafeTensors::open(&model_dir.join("model.safetensors"))?;
+        Model::from_tensors(config, tensors, weights)
+    }
 
+    pub fn from_bytes(
+        config_json: &str,
+        weights_bytes: &[u8],
+        weights: Weights,
+    ) -> Result<Model, Error> {
+        let config = Config::from_json(config_json)?;
+        let tensors = SafeTensors::from_bytes(weights_bytes)?;
+        Model::from_tensors(config, tensors, weights)
+    }
+
+    fn from_tensors(
+        config: Config,
+        mut tensors: SafeTensors<'_>,
+        weights: Weights,
+    ) -> Result<Model, Error> {
         let n_embd = config.n_embd;
         let n_inner = 4 * n_embd;
         let wte = load_embedding(

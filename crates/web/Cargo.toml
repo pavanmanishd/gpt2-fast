@@ -1,0 +1,12 @@
+[package]
+name = "gpt2_web"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gpt2_engine = { path = "../engine" }
+js-sys = "=0.3.107"
+wasm-bindgen = "=0.2.130"

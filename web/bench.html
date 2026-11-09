@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>gpt2-fast: browser benchmark</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --ink: #16181d;
+        --muted: #6b7280;
+        --line: #d8dbe2;
+        --paper: #ffffff;
+        --panel: #f5f6f8;
+        --accent: #0b6bcb;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --ink: #eceef2;
+          --muted: #9aa1ad;
+          --line: #30343c;
+          --paper: #121317;
+          --panel: #1a1c21;
+          --accent: #6aa9ff;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+          sans-serif;
+      }
+      main {
+        max-width: 68rem;
+        margin: 0 auto;
+        padding: 3rem 1.25rem 4rem;
+      }
+      h1 {
+        margin: 0 0 0.4rem;
+        font-size: 1.5rem;
+        letter-spacing: -0.02em;
+      }
+      .lede {
+        margin: 0 0 1.25rem;
+        color: var(--muted);
+      }
+      .status {
+        margin: 0 0 1.25rem;
+        padding: 0.6rem 0.8rem;
+        border: 1px solid var(--line);
+        border-radius: 0.5rem;
+        background: var(--panel);
+        color: var(--muted);
+        font-size: 0.9rem;
+        font-variant-numeric: tabular-nums;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-variant-numeric: tabular-nums;
+      }
+      th,
+      td {
+        padding: 0.45rem 0.5rem;
+        border-bottom: 1px solid var(--line);
+        text-align: right;
+        white-space: nowrap;
+      }
+      th:first-child,
+      td:first-child {
+        text-align: left;
+      }
+      th {
+        color: var(--muted);
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .summary {
+        margin: 1.25rem 0;
+        color: var(--muted);
+      }
+      button {
+        padding: 0.55rem 1.1rem;
+        border: 1px solid transparent;
+        border-radius: 0.45rem;
+        background: var(--accent);
+        color: #fff;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .warn {
+        color: #b45309;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Browser benchmark</h1>
+      <p class="lede">
+        The same five prompts and the same protocol as <code>crates/bench</code>,
+        running in this tab. One check run, one warmup, five timed runs.
+      </p>
+      <p id="status" class="status">Starting the worker.</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Prompt</th>
+            <th>Tokens</th>
+            <th>Matched</th>
+            <th>First mismatch</th>
+            <th>Logit diff</th>
+            <th>TTFT</th>
+            <th>Prefill tok/s</th>
+            <th>Decode tok/s</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+
+      <p id="summary" class="summary"></p>
+      <button id="download" disabled>Download session JSON</button>
+    </main>
+    <script type="module" src="./bench.js"></script>
+  </body>
+</html>
