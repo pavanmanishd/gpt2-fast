@@ -33,7 +33,7 @@ Median across prompts: **0.12 tokens per second** decode, 16 prompt tokens per s
 
 Every one of the 640 generated tokens matches the PyTorch reference. The largest difference in the first-token scores is 0.00014, against a 0.053 safety margin.
 
-For comparison, PyTorch on the same 4-core container does 48 tokens per second, about 390 times faster.
+For comparison, PyTorch on the same 4-core container does 48 tokens per second, about 394 times faster.
 
 ## Why it is slow
 
@@ -49,4 +49,4 @@ Two causes, both visible in the numbers:
 
 ## Post draft
 
-> Step 1: GPT-2 in plain Rust, no libraries. Correct on every token, and 0.12 tokens per second: one word every 8 seconds, about 390x slower than PyTorch. 98% of the time sits in one triple loop. Two reasons: the engine re-reads the whole text for every new word, and the loop walks memory the wrong way. Next: fix the first one.
+> Step 1: GPT-2 in plain Rust, no libraries. Correct on every token, and 0.12 tokens per second: one word every 8 seconds, about 394x slower than PyTorch. 98% of the time sits in one triple loop. Two reasons: the engine re-reads the whole text for every new word, and the loop walks memory the wrong way. Next: fix the first one.
