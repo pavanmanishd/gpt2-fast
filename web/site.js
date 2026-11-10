@@ -4,7 +4,10 @@ const MODEL_BASE_URL = "/models/gpt2/";
 const CACHE_NAME = "gpt2-weights-v2";
 const WEIGHTS = "int8";
 const WEIGHTS_FILE = "model-int8.safetensors";
-const THREAD_MILESTONE = /^N5-threads\d+$/;
+const THREAD_CAP = 8;
+const DEFAULT_DATA_URL = "./data/milestones.json";
+
+const SIMD_SUPPORTED = detectSimd();
 
 const els = {
   loadPanel: document.getElementById("load-panel"),
@@ -17,28 +20,36 @@ const els = {
   generate: document.getElementById("generate"),
   stop: document.getElementById("stop"),
   maxTokens: document.getElementById("max-tokens"),
+  backendMode: document.getElementById("backend-mode"),
   output: document.getElementById("output"),
   meterSpeed: document.getElementById("meter-speed"),
   meterTtft: document.getElementById("meter-ttft"),
   meterTokens: document.getElementById("meter-tokens"),
   demoStatus: document.getElementById("demo-status"),
-  simd: document.getElementById("simd-state"),
-  threads: document.getElementById("threads-state"),
+  running: document.getElementById("running-state"),
+  weights: document.getElementById("weights-state"),
+  cache: document.getElementById("cache-state"),
+  backendNote: document.getElementById("backend-note"),
   deviceCopy: document.getElementById("device-copy"),
   runBench: document.getElementById("run-bench"),
   benchStatus: document.getElementById("bench-status"),
-  benchResult: document.getElementById("bench-result"),
-  deviceDecode: document.getElementById("device-decode"),
-  devicePrefill: document.getElementById("device-prefill"),
-  deviceTtft: document.getElementById("device-ttft"),
-  projectDecode: document.getElementById("project-decode"),
-  projectPrefill: document.getElementById("project-prefill"),
-  projectTtft: document.getElementById("project-ttft"),
-  projectNote: document.getElementById("project-note"),
-  chart: document.getElementById("chart"),
-  milestones: document.getElementById("milestones"),
+  benchTableWrap: document.getElementById("bench-table-wrap"),
+  benchBody: document.getElementById("bench-body"),
+  benchNote: document.getElementById("bench-note"),
+  benchHint: document.getElementById("bench-hint"),
+  story: document.getElementById("story"),
   storyIntro: document.getElementById("story-intro"),
+  storyNative: document.getElementById("story-native"),
+  storyRace: document.getElementById("story-race"),
+  storySizes: document.getElementById("story-sizes"),
+  storyWeb: document.getElementById("story-web"),
   storyNote: document.getElementById("story-note"),
+  nativeChart: document.getElementById("native-chart"),
+  nativeMilestones: document.getElementById("native-milestones"),
+  raceTables: document.getElementById("race-tables"),
+  sizesBody: document.getElementById("sizes-body"),
+  webChart: document.getElementById("web-chart"),
+  webMilestones: document.getElementById("web-milestones"),
 };
 
 const integerFormat = new Intl.NumberFormat("en-US");
@@ -46,22 +57,36 @@ const rateFormat1 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 })
 const rateFormat2 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 const rateFormat3 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 3 });
 
-let worker = null;
-let pending = new Map();
-let nextId = 1;
-let loadHandlers = null;
+let pageClient = null;
+let modelReady = null;
 let probing = true;
 let loading = false;
-let ready = false;
-let busy = false;
 let generating = false;
+let busy = false;
 let stopRequested = false;
 let downloaded = false;
-let deviceBench = null;
 let lastTokenCount = 0;
-let chartEntries = [];
-let lastChartWidth = 0;
-let chartFrame = 0;
+let backendMode = "auto";
+let payloadData = null;
+let deviceBench = null;
+let benchRunning = false;
+let benchResults = [];
+
+const chartData = new Map();
+const chartWidths = new Map();
+
+function detectSimd() {
+  try {
+    return WebAssembly.validate(
+      new Uint8Array([
+        0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10,
+        10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11,
+      ]),
+    );
+  } catch {
+    return false;
+  }
+}
 
 function formatCount(value) {
   if (value === null || value === undefined) {
@@ -145,6 +170,14 @@ function formatBytes(bytes) {
   return `${number} B`;
 }
 
+function formatPerplexity(value) {
+  if (value === null || value === undefined) {
+    return "\u2013";
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(2) : "\u2013";
+}
+
 function formatProtocol(key, value) {
   if (value === null || value === undefined) {
     return "\u2013";
@@ -162,16 +195,16 @@ function describeError(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function isComparisonEngine(entry) {
-  const id = String(entry.milestone);
-  return id.startsWith("R0-") || (id.startsWith("N9-") && !/gpt2/i.test(id));
+function isReference(entry) {
+  return String(entry.milestone).startsWith("R0");
 }
 
 function isQuantized(entry) {
-  return (
-    /(?:^|[-_])q8(?:_|$)|int8/i.test(String(entry.milestone)) ||
-    (entry.perplexity_f32 !== null && entry.perplexity_f32 !== undefined)
-  );
+  if (entry.quantized !== undefined) {
+    return Boolean(entry.quantized);
+  }
+  const milestone = String(entry.milestone ?? "");
+  return milestone.endsWith("-int8") || milestone === "N7";
 }
 
 function escapeXml(value) {
@@ -188,6 +221,195 @@ function escapeXml(value) {
   );
 }
 
+function preferredThreads() {
+  const requested = Number.parseInt(
+    new URLSearchParams(location.search).get("threads") ?? "",
+    10,
+  );
+  if (Number.isFinite(requested) && requested > 0) {
+    return Math.min(requested, 32);
+  }
+  return Math.min(navigator.hardwareConcurrency || 1, THREAD_CAP);
+}
+
+function workerPackage() {
+  if (!SIMD_SUPPORTED) {
+    return "pkg-nosimd";
+  }
+  return self.crossOriginIsolated && preferredThreads() > 1
+    ? "pkg-threads"
+    : "pkg";
+}
+
+function requestedBackend() {
+  return backendMode === "cpu" ? "cpu" : "webgpu";
+}
+
+function workerUrl(requested) {
+  const params = new URLSearchParams({
+    backend: requested,
+    pkg: workerPackage(),
+    threads: String(preferredThreads()),
+  });
+  return `./worker.js?${params.toString()}`;
+}
+
+class EngineClient {
+  constructor(requested, options = {}) {
+    this.requested = requested;
+    this.onProgress = options.onProgress ?? null;
+    this.onError = options.onError ?? null;
+    this.pending = new Map();
+    this.nextId = 1;
+    this.loadWaiter = null;
+    this.closed = false;
+    this.worker = new Worker(new URL(workerUrl(requested), import.meta.url), {
+      type: "module",
+    });
+    this.worker.onmessage = (event) => this.handle(event.data);
+    this.worker.onerror = (event) =>
+      this.fail(event.message || "The worker failed.");
+  }
+
+  load(weights) {
+    if (this.closed) {
+      return Promise.reject(new Error("The worker is not running."));
+    }
+    return new Promise((resolve, reject) => {
+      this.loadWaiter = { resolve, reject };
+      this.worker.postMessage({ type: "load", weights });
+    });
+  }
+
+  request(message, onToken) {
+    if (this.closed) {
+      return Promise.reject(new Error("The worker is not running."));
+    }
+    const id = this.nextId;
+    this.nextId += 1;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject, onToken });
+      this.worker.postMessage({ ...message, id });
+    });
+  }
+
+  terminate(message = "Stopped") {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.worker.terminate();
+    const error = new Error(message);
+    if (this.loadWaiter) {
+      this.loadWaiter.reject(error);
+      this.loadWaiter = null;
+    }
+    for (const request of this.pending.values()) {
+      request.reject(error);
+    }
+    this.pending.clear();
+  }
+
+  handle(message) {
+    if (this.closed) {
+      return;
+    }
+    if (message.type === "progress") {
+      this.onProgress?.(message);
+      return;
+    }
+    if (message.type === "ready") {
+      if (this.loadWaiter) {
+        const waiter = this.loadWaiter;
+        this.loadWaiter = null;
+        waiter.resolve(message);
+      }
+      return;
+    }
+    if (message.type === "error" && message.id === undefined) {
+      const waiter = this.loadWaiter;
+      this.loadWaiter = null;
+      if (waiter) {
+        waiter.reject(new Error(message.message));
+      } else {
+        this.onError?.(message.message);
+      }
+      return;
+    }
+
+    const request = this.pending.get(message.id);
+    if (!request) {
+      return;
+    }
+    if (message.type === "token") {
+      request.onToken?.(message);
+      return;
+    }
+    this.pending.delete(message.id);
+    if (message.type === "error") {
+      request.reject(new Error(message.message));
+    } else {
+      request.resolve(message);
+    }
+  }
+
+  fail(message) {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.worker.terminate();
+    const error = new Error(message);
+    const waiter = this.loadWaiter;
+    this.loadWaiter = null;
+    for (const request of this.pending.values()) {
+      request.reject(error);
+    }
+    this.pending.clear();
+    if (waiter) {
+      waiter.reject(error);
+    } else {
+      this.onError?.(message);
+    }
+  }
+}
+
+function describeEngine(ready) {
+  if (!ready) {
+    return "not loaded";
+  }
+  if (ready.backend === "webgpu") {
+    const adapter = ready.gpu?.adapter ?? {};
+    const name = [adapter.vendor, adapter.architecture]
+      .filter(Boolean)
+      .join(" ");
+    const detail =
+      name || adapter.description || adapter.device || "adapter not named";
+    return `WebGPU \u00b7 ${detail}`;
+  }
+  const threads = Number(ready.threads) || 1;
+  const simd = ready.simd ? "SIMD" : "scalar";
+  if (threads > 1) {
+    return `WebAssembly \u00b7 ${threads} threads \u00b7 ${simd}`;
+  }
+  return `WebAssembly \u00b7 ${simd} \u00b7 1 thread`;
+}
+
+function weightsLabel() {
+  const weights = payloadData?.weights;
+  if (!weights) {
+    return "int8";
+  }
+  const size = Number(weights.bytes);
+  const sizeText = Number.isFinite(size) ? `, ${formatBytes(size)}` : "";
+  return `${weights.format}${sizeText}`;
+}
+
+function updateLoadButton() {
+  const size = payloadData?.weights ? `${weightsLabel()}, ` : "";
+  els.loadButton.textContent = `Load the model (${size}cached after the first time)`;
+}
+
 function updateProgress(percent) {
   const value = Math.max(0, Math.min(100, Math.round(percent)));
   els.progressFill.style.width = `${value}%`;
@@ -195,15 +417,29 @@ function updateProgress(percent) {
 }
 
 function updateControls() {
-  els.loadButton.hidden = probing || loading || ready;
+  els.loadButton.hidden = probing || loading || modelReady !== null;
   els.loadButton.disabled = loading;
   els.progressWrap.hidden = !loading;
-  els.loadPanel.hidden = ready;
-  els.generate.disabled = !ready || busy;
+  els.loadPanel.hidden = modelReady !== null;
+  els.generate.disabled = modelReady === null || busy;
   els.stop.disabled = !generating;
   els.prompt.disabled = busy;
   els.maxTokens.disabled = busy;
-  els.runBench.disabled = !ready || busy || !deviceBench;
+  els.backendMode.disabled = loading || busy;
+  els.runBench.disabled =
+    modelReady === null || busy || benchRunning || !deviceBench;
+}
+
+function setRunningState() {
+  els.running.textContent = describeEngine(modelReady);
+  els.weights.textContent = weightsLabel();
+  if (modelReady === null) {
+    els.cache.textContent = "not loaded";
+  } else {
+    els.cache.textContent = downloaded
+      ? "downloaded and cached"
+      : "from browser cache";
+  }
 }
 
 async function modelIsCached() {
@@ -216,72 +452,6 @@ async function modelIsCached() {
   return Boolean(await cache.match(url.href));
 }
 
-function createWorker() {
-  const threads = preferredThreads();
-  const pkg = self.crossOriginIsolated && threads > 1 ? "pkg-threads" : "pkg";
-  const instance = new Worker(
-    new URL(
-      `./worker.js?pkg=${encodeURIComponent(pkg)}&threads=${threads}`,
-      import.meta.url,
-    ),
-    { type: "module" },
-  );
-  instance.onmessage = (event) => handleMessage(instance, event.data);
-  instance.onerror = (event) =>
-    handleWorkerFailure(instance, event.message || "The worker failed.");
-  return instance;
-}
-
-const THREAD_CAP = 8;
-
-function preferredThreads() {
-  const requested = Number.parseInt(
-    new URLSearchParams(location.search).get("threads") ?? "",
-    10,
-  );
-  if (Number.isFinite(requested) && requested > 0) {
-    return Math.min(requested, 32);
-  }
-  return Math.min(navigator.hardwareConcurrency || 1, THREAD_CAP);
-}
-
-function handleMessage(instance, message) {
-  if (instance !== worker) {
-    return;
-  }
-  if (message.type === "progress") {
-    handleProgress(message);
-    return;
-  }
-  if (message.type === "ready") {
-    if (loadHandlers) {
-      const handlers = loadHandlers;
-      loadHandlers = null;
-      handlers.resolve(message);
-    }
-    return;
-  }
-  if (message.type === "error" && message.id === undefined) {
-    handleGlobalError(message.message);
-    return;
-  }
-
-  const request = pending.get(message.id);
-  if (!request) {
-    return;
-  }
-  if (message.type === "token") {
-    request.onToken?.(message);
-    return;
-  }
-  pending.delete(message.id);
-  if (message.type === "error") {
-    request.reject(new Error(message.message));
-  } else {
-    request.resolve(message);
-  }
-}
-
 function handleProgress(message) {
   const filePart =
     message.total > 0 ? Math.min(1, message.loaded / message.total) : 0;
@@ -289,6 +459,11 @@ function handleProgress(message) {
     ((message.index - 1 + filePart) / message.count) * 100,
   );
   updateProgress(overall);
+  const file = String(message.file ?? "");
+  if (file.startsWith("GPU ")) {
+    els.loadStatus.textContent = `Uploading weights to the GPU (${overall}%).`;
+    return;
+  }
   if (!message.cached) {
     downloaded = true;
   }
@@ -296,42 +471,19 @@ function handleProgress(message) {
     ? `${formatBytes(message.loaded)} of ${formatBytes(message.total)}`
     : formatBytes(message.loaded);
   const action = message.cached ? "Reading from cache" : "Downloading";
-  els.loadStatus.textContent = `${action} ${message.file} (${overall}%, ${size}).`;
+  els.loadStatus.textContent = `${action} ${file} (${overall}%, ${size}).`;
 }
 
-function handleGlobalError(message) {
-  if (loadHandlers) {
-    const handlers = loadHandlers;
-    loadHandlers = null;
-    handlers.reject(new Error(message));
-    if (worker) {
-      worker.terminate();
-      worker = null;
-    }
-    return;
-  }
-  handleWorkerFailure(worker, message);
-}
-
-function handleWorkerFailure(instance, message) {
-  if (instance !== worker) {
-    return;
-  }
-  const error = new Error(message);
-  rejectAll(error);
-  if (worker) {
-    worker.terminate();
-    worker = null;
-  }
-  if (loadHandlers) {
-    const handlers = loadHandlers;
-    loadHandlers = null;
-    handlers.reject(error);
+function handlePageWorkerError(message) {
+  modelReady = null;
+  if (pageClient) {
+    pageClient.terminate();
+    pageClient = null;
   }
   if (loading) {
     return;
   }
-  ready = false;
+  loading = false;
   busy = false;
   generating = false;
   els.loadPanel.hidden = false;
@@ -340,71 +492,72 @@ function handleWorkerFailure(instance, message) {
   els.loadStatus.textContent = `The worker stopped: ${message}`;
   els.demoStatus.textContent = "The model is not loaded.";
   els.benchStatus.textContent = "Load the model above first.";
-  els.simd.textContent = "not loaded";
-  els.threads.textContent = "not loaded";
+  els.backendNote.hidden = true;
+  els.running.textContent = "not loaded";
+  els.cache.textContent = "not loaded";
+  setRunningState();
   updateControls();
 }
 
-function rejectAll(error) {
-  for (const request of pending.values()) {
-    request.reject(error);
-  }
-  pending.clear();
-}
-
-function request(message, onToken) {
-  if (!worker) {
-    return Promise.reject(new Error("The worker is not running."));
-  }
-  const id = nextId;
-  nextId += 1;
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject, onToken });
-    worker.postMessage({ ...message, id });
-  });
-}
-
-async function loadModel() {
-  if (loading || ready) {
+async function loadModel(options = {}) {
+  if (loading || modelReady !== null) {
     return;
   }
   loading = true;
   downloaded = false;
   updateProgress(0);
   els.loadPanel.hidden = false;
-  els.loadStatus.textContent = "Starting the worker.";
+  els.running.textContent = "starting";
+  els.cache.textContent = options.switching ? "cached" : "not loaded";
+  els.loadStatus.textContent = options.switching
+    ? "Switching engine. Weights stay in the browser's cache."
+    : "Starting the worker.";
   els.demoStatus.textContent = "Loading the model.";
+  els.backendNote.hidden = true;
   updateControls();
 
   try {
-    if (!worker) {
-      worker = createWorker();
+    if (!pageClient) {
+      pageClient = new EngineClient(requestedBackend(), {
+        onProgress: handleProgress,
+        onError: handlePageWorkerError,
+      });
     }
-    const message = await new Promise((resolve, reject) => {
-      loadHandlers = { resolve, reject };
-      worker.postMessage({ type: "load", weights: WEIGHTS });
-    });
-    ready = true;
+    const message = await pageClient.load(WEIGHTS);
     loading = false;
+    modelReady = message;
     els.loadPanel.hidden = true;
     els.progressWrap.hidden = true;
-    els.simd.textContent = message.simd ? "on" : "off";
-    els.threads.textContent =
-      message.threads > 1
-        ? `${message.threads} threads`
-        : `off (1 thread)`;
-    els.demoStatus.textContent = `Model ready in ${formatLoadTime(message.loadMs)}${downloaded ? ", downloaded and cached" : ", from browser cache"}.`;
-    if (deviceBench) {
+    setRunningState();
+
+    const fallback =
+      message.requestedBackend === "webgpu" && message.backend !== "webgpu";
+    let status;
+    if (fallback) {
+      const reason = message.fallback
+        ? ` (${message.fallback})`
+        : "";
+      status = `Model ready on the CPU engine.`;
+      els.backendNote.textContent = `WebGPU is not available here${reason}. The CPU engine is running.`;
+      els.backendNote.hidden = false;
+    } else {
+      status = downloaded
+        ? "Model ready, downloaded and cached."
+        : "Model ready, from browser cache.";
+      els.backendNote.hidden = true;
+    }
+    status += ` Loaded in ${formatLoadTime(message.loadMs)}.`;
+    els.demoStatus.textContent = status;
+    if (deviceBench && benchResults.length === 0) {
       els.benchStatus.textContent = "Ready to run.";
     }
     updateControls();
   } catch (error) {
-    loadHandlers = null;
     loading = false;
-    ready = false;
-    if (worker) {
-      worker.terminate();
-      worker = null;
+    modelReady = null;
+    if (pageClient) {
+      pageClient.terminate();
+      pageClient = null;
     }
     els.loadPanel.hidden = false;
     els.loadButton.hidden = false;
@@ -412,10 +565,36 @@ async function loadModel() {
     els.loadStatus.textContent = `Could not load the model: ${describeError(error)}`;
     els.demoStatus.textContent = "The model is not loaded.";
     els.benchStatus.textContent = "Load the model above first.";
-    els.simd.textContent = "not loaded";
-    els.threads.textContent = "not loaded";
+    els.backendNote.hidden = true;
+    els.running.textContent = "not loaded";
+    els.cache.textContent = "not loaded";
     updateControls();
   }
+}
+
+function handleBackendChange() {
+  const mode = els.backendMode.value;
+  if (mode === backendMode) {
+    return;
+  }
+  backendMode = mode;
+  if (loading || busy || modelReady === null || !pageClient) {
+    updateControls();
+    return;
+  }
+  const required = requestedBackend();
+  if (pageClient.requested === required) {
+    return;
+  }
+  pageClient.terminate();
+  pageClient = null;
+  modelReady = null;
+  busy = false;
+  generating = false;
+  els.running.textContent = "starting";
+  els.cache.textContent = "cached";
+  els.backendNote.hidden = true;
+  loadModel({ switching: true });
 }
 
 function stopGeneration() {
@@ -423,12 +602,11 @@ function stopGeneration() {
     return;
   }
   stopRequested = true;
-  if (worker) {
-    worker.terminate();
-    worker = null;
+  if (pageClient) {
+    pageClient.terminate();
+    pageClient = null;
   }
-  rejectAll(new Error("Stopped"));
-  ready = false;
+  modelReady = null;
   loading = false;
   busy = false;
   generating = false;
@@ -441,13 +619,14 @@ function stopGeneration() {
       ? `Stopped after ${formatCount(lastTokenCount)} tokens.`
       : "Stopped before the first token.";
   els.benchStatus.textContent = "Load the model above first.";
-  els.simd.textContent = "not loaded";
-  els.threads.textContent = "not loaded";
+  els.backendNote.hidden = true;
+  els.running.textContent = "not loaded";
+  els.cache.textContent = "in browser cache";
   updateControls();
 }
 
 async function generate() {
-  if (!ready || busy) {
+  if (modelReady === null || busy || !pageClient) {
     return;
   }
   const text = els.prompt.value;
@@ -471,13 +650,13 @@ async function generate() {
   let firstAt = 0;
 
   try {
-    const encoded = await request({ type: "encode", text });
+    const encoded = await pageClient.request({ type: "encode", text });
     if (!encoded.ids || encoded.ids.length === 0) {
       throw new Error("The prompt produced no tokens.");
     }
     els.demoStatus.textContent = "Prefilling the prompt.";
     const startedAt = performance.now();
-    const done = await request(
+    const done = await pageClient.request(
       {
         type: "generate",
         ids: encoded.ids,
@@ -519,16 +698,14 @@ async function generate() {
       if (timings.length > 1) {
         const seconds = (timings[timings.length - 1] - timings[0]) / 1000;
         if (seconds > 0) {
-          els.meterSpeed.textContent = formatRate(
-            (tokenCount - 1) / seconds,
-          );
+          els.meterSpeed.textContent = formatRate((tokenCount - 1) / seconds);
         }
       }
     }
     const speed = els.meterSpeed.textContent;
     els.demoStatus.textContent = `Generated ${formatCount(tokenCount)} tokens${
       speed !== "\u2013" ? ` at ${speed} tokens/s` : ""
-    }.`;
+    } on ${describeEngine(modelReady)}.`;
   } catch (error) {
     if (!stopRequested) {
       els.demoStatus.textContent = `Generation failed: ${describeError(error)}`;
@@ -541,67 +718,294 @@ async function generate() {
   }
 }
 
-async function runBenchmark() {
-  if (!ready || busy || !deviceBench) {
-    return;
+function runMetrics(promptTokens, done, fallbackCount) {
+  const timings = Array.isArray(done.timings) ? done.timings : [];
+  const tokens = Array.isArray(done.tokens) ? done.tokens : [];
+  if (timings.length === 0) {
+    throw new Error("The worker returned no timings.");
   }
-  busy = true;
-  els.benchResult.hidden = true;
-  els.benchStatus.textContent = "Running one warm-up.";
-  updateControls();
+  const tokenCount = tokens.length || fallbackCount;
+  const ttft = Number(timings[0]);
+  const decodeSeconds =
+    timings.length > 1
+      ? (Number(timings[timings.length - 1]) - ttft) / 1000
+      : 0;
+  return {
+    ttft,
+    tokens: tokenCount,
+    decode: decodeSeconds > 0 ? (tokenCount - 1) / decodeSeconds : 0,
+    prefill: ttft > 0 ? promptTokens / (ttft / 1000) : 0,
+  };
+}
 
+function median(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[middle];
+  }
+  return (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function medianMetrics(runs) {
+  return {
+    decode: median(runs.map((run) => run.decode)),
+    prefill: median(runs.map((run) => run.prefill)),
+    ttft: median(runs.map((run) => run.ttft)),
+    tokens: runs[0]?.tokens ?? 0,
+  };
+}
+
+function benchProgress(message, label) {
+  const filePart =
+    message.total > 0 ? Math.min(1, message.loaded / message.total) : 0;
+  const overall = Math.round(
+    ((message.index - 1 + filePart) / message.count) * 100,
+  );
+  if (String(message.file ?? "").startsWith("GPU ")) {
+    els.benchStatus.textContent = `${label}: uploading weights to the GPU (${overall}%).`;
+  } else {
+    els.benchStatus.textContent = `${label}: preparing the engine (${overall}%).`;
+  }
+}
+
+async function benchmarkBackend(requested, label) {
+  const client = new EngineClient(requested, {
+    onProgress: (message) => benchProgress(message, label),
+  });
   try {
-    const encoded = await request({
+    const ready = await client.load(WEIGHTS);
+    if (requested === "webgpu" && ready.backend !== "webgpu") {
+      return { ready, skipped: true, label };
+    }
+    const encoded = await client.request({
       type: "encode",
       text: deviceBench.prompt,
     });
     if (!encoded.ids || encoded.ids.length === 0) {
-      throw new Error("The prompt produced no tokens.");
+      throw new Error("The benchmark prompt produced no tokens.");
     }
-    await request({
-      type: "generate",
-      ids: encoded.ids,
-      maxNewTokens: Number(deviceBench.max_new_tokens),
-      stream: false,
-    });
-
-    els.benchStatus.textContent = "Running the timed run.";
-    const done = await request({
-      type: "generate",
-      ids: encoded.ids,
-      maxNewTokens: Number(deviceBench.max_new_tokens),
-      stream: false,
-    });
-    const timings = Array.isArray(done.timings) ? done.timings : [];
-    const tokenCount = Array.isArray(done.tokens)
-      ? done.tokens.length
-      : Number(deviceBench.max_new_tokens);
-    if (timings.length === 0) {
-      throw new Error("The worker returned no timings.");
+    const warmups = Math.max(0, Number(deviceBench.warmup) || 0);
+    for (let index = 0; index < warmups; index += 1) {
+      els.benchStatus.textContent = `${label}: warm-up ${index + 1} of ${warmups}.`;
+      await client.request({
+        type: "generate",
+        ids: encoded.ids,
+        maxNewTokens: Number(deviceBench.max_new_tokens),
+        stream: false,
+      });
     }
-
-    const ttft = timings[0];
-    const decodeSeconds =
-      timings.length > 1
-        ? (timings[timings.length - 1] - timings[0]) / 1000
-        : 0;
-    const decode =
-      decodeSeconds > 0 ? (tokenCount - 1) / decodeSeconds : 0;
-    const prefill = ttft > 0 ? encoded.ids.length / (ttft / 1000) : 0;
-
-    els.deviceDecode.textContent = formatRate(decode);
-    els.devicePrefill.textContent = formatRate(prefill);
-    els.deviceTtft.textContent = formatMs(ttft);
-    els.benchResult.hidden = false;
-    els.benchStatus.textContent = `Finished: ${formatCount(
-      tokenCount,
-    )} new tokens after one warm-up.`;
-  } catch (error) {
-    els.benchStatus.textContent = `Benchmark failed: ${describeError(error)}`;
+    const runs = Math.max(1, Number(deviceBench.runs) || 1);
+    const measured = [];
+    for (let index = 0; index < runs; index += 1) {
+      els.benchStatus.textContent = `${label}: timed run ${index + 1} of ${runs}.`;
+      const done = await client.request({
+        type: "generate",
+        ids: encoded.ids,
+        maxNewTokens: Number(deviceBench.max_new_tokens),
+        stream: false,
+      });
+      measured.push(
+        runMetrics(
+          encoded.ids.length,
+          done,
+          Number(deviceBench.max_new_tokens),
+        ),
+      );
+    }
+    return { ready, label, metrics: medianMetrics(measured) };
   } finally {
-    busy = false;
-    updateControls();
+    client.terminate();
   }
+}
+
+function projectEntryFor(ready) {
+  const web = payloadData?.web ?? [];
+  if (web.length === 0) {
+    return null;
+  }
+  const candidates = web.filter((entry) => isQuantized(entry));
+  if (ready.backend === "webgpu") {
+    return (
+      candidates.find((entry) => entry.milestone === "W4") ??
+      candidates.find((entry) => entry.target === "webgpu") ??
+      null
+    );
+  }
+  if ((Number(ready.threads) || 1) > 1) {
+    return (
+      candidates.find((entry) => entry.milestone === "W3") ??
+      candidates.find((entry) => entry.target === "wasm-threads") ??
+      null
+    );
+  }
+  if (ready.simd) {
+    return (
+      candidates.find((entry) => entry.milestone === "W2") ??
+      candidates.find((entry) => entry.target === "wasm-simd") ??
+      null
+    );
+  }
+  return (
+    candidates.find((entry) => entry.milestone === "W1") ??
+    candidates.find((entry) => entry.target === "wasm") ??
+    null
+  );
+}
+
+function appendMetricCells(row, metrics) {
+  const cells = [
+    ["Decode tok/s", formatRate(metrics.decode)],
+    ["Prompt tok/s", formatRate(metrics.prefill)],
+    ["First token", formatMs(metrics.ttft)],
+  ];
+  for (const [label, text] of cells) {
+    const cell = document.createElement("td");
+    cell.dataset.label = label;
+    cell.textContent = text;
+    row.append(cell);
+  }
+}
+
+function renderBenchResults() {
+  els.benchBody.replaceChildren();
+  let missingProject = false;
+
+  for (const result of benchResults) {
+    const project = projectEntryFor(result.ready);
+    if (project === null) {
+      missingProject = true;
+    }
+    const rowspan = project === null ? 1 : 2;
+
+    const deviceRow = document.createElement("tr");
+    const engineCell = document.createElement("th");
+    engineCell.scope = "row";
+    engineCell.rowSpan = rowspan;
+    const engineName = document.createElement("strong");
+    engineName.textContent = result.label;
+    const engineDetail = document.createElement("span");
+    engineDetail.className = "engine-detail";
+    engineDetail.textContent = describeEngine(result.ready);
+    engineCell.append(engineName, engineDetail);
+
+    const deviceSource = document.createElement("td");
+    deviceSource.className = "source-cell";
+    deviceSource.dataset.label = "Source";
+    deviceSource.textContent = "this device";
+
+    deviceRow.append(engineCell, deviceSource);
+    appendMetricCells(deviceRow, result.metrics);
+    els.benchBody.append(deviceRow);
+
+    if (project !== null) {
+      const projectRow = document.createElement("tr");
+      projectRow.className = "project-row";
+      const projectSource = document.createElement("td");
+      projectSource.className = "source-cell";
+      projectSource.dataset.label = "Source";
+      projectSource.textContent = `${project.milestone} \u00b7 ${
+        project.browser ?? "browser"
+      }`;
+      projectRow.append(projectSource);
+      appendMetricCells(projectRow, {
+        decode: project.decode_tok_s,
+        prefill: project.prefill_tok_s,
+        ttft: project.ttft_ms,
+      });
+      els.benchBody.append(projectRow);
+    }
+  }
+
+  els.benchTableWrap.hidden = benchResults.length === 0;
+  if (missingProject && benchResults.length > 0) {
+    els.benchNote.textContent =
+      "The project has no recorded browser run for this engine yet.";
+    els.benchNote.hidden = false;
+  }
+}
+
+function suggestBackend() {
+  const cpu = benchResults.find((result) => result.ready.backend === "cpu");
+  const gpu = benchResults.find((result) => result.ready.backend === "webgpu");
+  if (!cpu || !gpu) {
+    return;
+  }
+  if (cpu.metrics.decode > gpu.metrics.decode) {
+    els.benchHint.textContent = `The CPU engine decoded faster on this device: ${formatRate(
+      cpu.metrics.decode,
+    )} vs ${formatRate(gpu.metrics.decode)} tokens/s. Use the engine control above to switch to CPU.`;
+    els.benchHint.hidden = false;
+  }
+}
+
+async function runBenchmark() {
+  if (modelReady === null || busy || !deviceBench || benchRunning) {
+    return;
+  }
+  busy = true;
+  benchRunning = true;
+  benchResults = [];
+  let benchFailure = null;
+  let benchUnavailable = null;
+  let benchError = null;
+  els.benchBody.replaceChildren();
+  els.benchTableWrap.hidden = true;
+  els.benchNote.hidden = true;
+  els.benchHint.hidden = true;
+  els.benchStatus.textContent = "Running the CPU benchmark.";
+  updateControls();
+
+  try {
+    const cpu = await benchmarkBackend("cpu", "CPU");
+    benchResults.push(cpu);
+    renderBenchResults();
+  } catch (error) {
+    benchFailure = describeError(error);
+  }
+
+  if (benchFailure === null) {
+    try {
+      const gpu = await benchmarkBackend("webgpu", "WebGPU");
+      if (gpu.skipped) {
+        benchUnavailable =
+          gpu.ready.fallback || "WebGPU is not available on this device";
+      } else {
+        benchResults.push(gpu);
+        renderBenchResults();
+      }
+    } catch (error) {
+      benchError = describeError(error);
+    }
+  }
+
+  busy = false;
+  benchRunning = false;
+  suggestBackend();
+  if (benchResults.length > 0) {
+    els.benchTableWrap.hidden = false;
+  }
+
+  if (benchFailure) {
+    els.benchStatus.textContent = `Benchmark failed: ${benchFailure}`;
+  } else if (benchUnavailable) {
+    els.benchStatus.textContent = `Finished on CPU. WebGPU is not available here: ${benchUnavailable}`;
+    els.benchNote.textContent = `The WebGPU engine was requested but ran the CPU engine instead: ${benchUnavailable}.`;
+    els.benchNote.hidden = false;
+  } else if (benchError) {
+    els.benchStatus.textContent = `Finished on CPU. WebGPU failed: ${benchError}`;
+    els.benchNote.textContent = `The WebGPU run failed, so only the CPU result is shown.`;
+    els.benchNote.hidden = false;
+  } else {
+    const warmups = Math.max(0, Number(deviceBench.warmup) || 0);
+    const runs = Math.max(1, Number(deviceBench.runs) || 1);
+    els.benchStatus.textContent = `Finished: ${formatCount(
+      warmups,
+    )} warm-up${warmups === 1 ? "" : "s"} and ${formatCount(
+      runs,
+    )} timed run${runs === 1 ? "" : "s"} on each engine.`;
+  }
+  updateControls();
 }
 
 function appendDelta(list, label, before, after, unit, formatter) {
@@ -636,62 +1040,104 @@ function appendDelta(list, label, before, after, unit, formatter) {
   list.append(item);
 }
 
-function correctnessText(entry, protocol) {
+function nativeCorrectness(entry, protocol) {
   const total = Number(protocol.tokens_checked);
-  const tokenText =
-    Number.isFinite(total) && total > 0 ? formatCount(total) : "the reference";
   if (entry.milestone === "R0-torch") {
     return "The reference run. Every engine is checked against these tokens.";
   }
+  if (isQuantized(entry)) {
+    const parts = [];
+    const rate = Number(entry.token_match_rate);
+    if (Number.isFinite(rate)) {
+      const matched = Number.isFinite(total) ? Math.round(rate * total) : null;
+      const matchedText =
+        matched === null
+          ? ""
+          : ` (${formatCount(matched)} of ${formatCount(total)})`;
+      parts.push(
+        `${Math.round(rate * 100)}% of reference tokens match${matchedText}`,
+      );
+    }
+    const perplexity = Number(entry.perplexity);
+    const perplexityF32 = Number(entry.perplexity_f32);
+    if (Number.isFinite(perplexity)) {
+      let text = `perplexity ${perplexity.toFixed(2)}`;
+      if (Number.isFinite(perplexityF32)) {
+        const delta = (perplexity / perplexityF32 - 1) * 100;
+        text += ` vs ${perplexityF32.toFixed(2)} f32 (${delta >= 0 ? "+" : ""}${delta.toFixed(1)}%)`;
+      }
+      parts.push(text);
+    }
+    return `int8: ${parts.join("; ")}.`;
+  }
   if (entry.matches_reference) {
-    return `Matches the reference on all ${tokenText} tokens.`;
+    return `Matches the reference on all ${formatCount(total)} tokens.`;
   }
   const rate = Number(entry.token_match_rate);
-  const quantized = isQuantized(entry);
-  if (
-    quantized &&
-    entry.perplexity !== null &&
-    entry.perplexity !== undefined &&
-    entry.perplexity_f32 !== null &&
-    entry.perplexity_f32 !== undefined
-  ) {
-    const delta =
-      (Number(entry.perplexity) / Number(entry.perplexity_f32) - 1) * 100;
-    const sign = delta >= 0 ? "+" : "";
-    const matched =
-      Number.isFinite(total) && total > 0 && Number.isFinite(rate)
-        ? ` (${formatCount(Math.round(rate * total))} of ${tokenText})`
-        : "";
-    const percent = Number.isFinite(rate) ? Math.round(rate * 100) : "?";
-    return `int8: ${percent}% of tokens match${matched}, perplexity ${sign}${delta.toFixed(
-      1,
-    )}% (${Number(entry.perplexity).toFixed(2)} vs ${Number(
-      entry.perplexity_f32,
-    ).toFixed(2)} f32).`;
-  }
   if (Number.isFinite(rate)) {
-    const matched =
-      Number.isFinite(total) && total > 0
-        ? ` (${formatCount(Math.round(rate * total))} of ${tokenText})`
-        : "";
-    if (rate >= 1) {
-      return `All ${tokenText} tokens match; the run misses the project's logit tolerance, so it is not an exact match.`;
-    }
-    if (quantized) {
-      return `int8: ${Math.round(rate * 100)}% of tokens match${matched}.`;
-    }
-    return `${Math.round(rate * 100)}% of tokens match${matched}.`;
+    const matched = Number.isFinite(total) ? Math.round(rate * total) : null;
+    const matchedText =
+      matched === null
+        ? ""
+        : ` (${formatCount(matched)} of ${formatCount(total)})`;
+    return `${Math.round(rate * 100)}% of tokens match${matchedText}.`;
   }
   return "This milestone does not match the reference exactly.";
 }
 
+function webCorrectness(entry, protocol) {
+  const total = Number(protocol.tokens_checked);
+  const parts = [];
+  if (entry.matches_native) {
+    parts.push("produced exactly the native int8 engine's tokens");
+  }
+  if (entry.matches_reference) {
+    parts.push(`matches the reference on all ${formatCount(total)} tokens`);
+  } else {
+    const rate = Number(entry.token_match_rate);
+    if (Number.isFinite(rate)) {
+      const matched = Number.isFinite(total) ? Math.round(rate * total) : null;
+      const matchedText =
+        matched === null
+          ? ""
+          : ` (${formatCount(matched)} of ${formatCount(total)})`;
+      parts.push(
+        `${Math.round(rate * 100)}% of reference tokens match${matchedText}`,
+      );
+    }
+  }
+  if (parts.length === 0) {
+    return "No correctness result is recorded for this run.";
+  }
+  const text = parts.join("; ");
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)}.`;
+}
+
+function appendCompareNote(article, entry, baseline) {
+  if (
+    !entry.baseline ||
+    !baseline ||
+    String(baseline.milestone) !== String(entry.baseline)
+  ) {
+    return;
+  }
+  const note = document.createElement("p");
+  note.className = "compare-note";
+  note.textContent = `Compared with ${entry.baseline}.`;
+  article.append(note);
+}
+
 function buildThreadTable(entry, scaling, protocol) {
   const rows = scaling.map((item) => ({
-    threads: Number(String(item.milestone).replace("N5-threads", "")),
+    threads: Number(item.threads ?? String(item.milestone).replace(/\D/g, "")),
     item,
   }));
   const cores = Number(protocol.cores);
-  if (Number.isFinite(cores) && cores > 0) {
+  if (
+    Number.isFinite(cores) &&
+    cores > 0 &&
+    !rows.some((row) => row.threads === cores)
+  ) {
     rows.push({ threads: cores, item: entry });
   }
   rows.sort((left, right) => left.threads - right.threads);
@@ -706,7 +1152,7 @@ function buildThreadTable(entry, scaling, protocol) {
 
   const head = document.createElement("thead");
   const headRow = document.createElement("tr");
-  for (const label of ["Threads", "Decode tok/s", "Prefill tok/s"]) {
+  for (const label of ["Threads", "Decode tok/s", "Prompt tok/s"]) {
     const cell = document.createElement("th");
     cell.scope = "col";
     cell.textContent = label;
@@ -733,8 +1179,11 @@ function buildThreadTable(entry, scaling, protocol) {
   return table;
 }
 
-function renderCards(entries, scaling, protocol) {
-  els.milestones.replaceChildren();
+function renderNativeCards(entries, protocol) {
+  els.nativeMilestones.replaceChildren();
+  const byMilestone = new Map(
+    entries.map((entry) => [String(entry.milestone), entry]),
+  );
   let previous = null;
 
   for (const entry of entries) {
@@ -748,20 +1197,21 @@ function renderCards(entries, scaling, protocol) {
     id.textContent = entry.milestone;
     meta.append(id);
 
-    const metaParts = [entry.date, entry.commit, entry.target].filter(Boolean);
+    for (const part of [entry.date, entry.commit]) {
+      if (part) {
+        const node = document.createElement("span");
+        node.textContent = part;
+        meta.append(node);
+      }
+    }
     if (
       entry.sessions !== undefined &&
       Number(entry.sessions) !== Number(protocol.sessions)
     ) {
-      metaParts.push(
-        `${formatCount(entry.sessions)} session${
-          Number(entry.sessions) === 1 ? "" : "s"
-        }`,
-      );
-    }
-    for (const part of metaParts) {
       const node = document.createElement("span");
-      node.textContent = part;
+      node.textContent = `${formatCount(entry.sessions)} session${
+        Number(entry.sessions) === 1 ? "" : "s"
+      }`;
       meta.append(node);
     }
     if (isQuantized(entry)) {
@@ -778,15 +1228,18 @@ function renderCards(entries, scaling, protocol) {
     headline.className = "milestone-headline";
     headline.textContent = entry.headline;
 
+    const baseline =
+      (entry.baseline && byMilestone.get(String(entry.baseline))) ||
+      previous;
+    const showBefore =
+      baseline !== null && !isReference(entry) && entry.milestone !== "N1";
+
     const deltas = document.createElement("ul");
     deltas.className = "deltas";
-    const isComparison = isComparisonEngine(entry);
-    const showBefore =
-      !isComparison && entry.milestone !== "N1" && previous !== null;
     appendDelta(
       deltas,
       "Decode",
-      showBefore ? previous.decode_tok_s : null,
+      showBefore ? baseline.decode_tok_s : null,
       entry.decode_tok_s,
       "tok/s",
       formatRate,
@@ -794,7 +1247,7 @@ function renderCards(entries, scaling, protocol) {
     appendDelta(
       deltas,
       "Prefill",
-      showBefore ? previous.prefill_tok_s : null,
+      showBefore ? baseline.prefill_tok_s : null,
       entry.prefill_tok_s,
       "tok/s",
       formatRate,
@@ -802,7 +1255,7 @@ function renderCards(entries, scaling, protocol) {
     appendDelta(
       deltas,
       "First token",
-      showBefore ? previous.ttft_ms : null,
+      showBefore ? baseline.ttft_ms : null,
       entry.ttft_ms,
       "",
       formatMs,
@@ -810,7 +1263,7 @@ function renderCards(entries, scaling, protocol) {
     appendDelta(
       deltas,
       "Peak memory",
-      showBefore ? previous.peak_mb : null,
+      showBefore ? baseline.peak_mb : null,
       entry.peak_mb,
       "",
       formatMemory,
@@ -818,12 +1271,14 @@ function renderCards(entries, scaling, protocol) {
 
     const correctness = document.createElement("p");
     correctness.className = "correctness";
-    correctness.textContent = correctnessText(entry, protocol);
+    correctness.textContent = nativeCorrectness(entry, protocol);
 
-    article.append(meta, title, headline, deltas, correctness);
+    article.append(meta, title, headline, deltas);
+    appendCompareNote(article, entry, baseline);
+    article.append(correctness);
 
-    if (entry.milestone === "N5" && scaling.length > 0) {
-      article.append(buildThreadTable(entry, scaling, protocol));
+    if (Array.isArray(entry.scaling) && entry.scaling.length > 0) {
+      article.append(buildThreadTable(entry, entry.scaling, protocol));
     }
 
     if (entry.journal) {
@@ -834,22 +1289,371 @@ function renderCards(entries, scaling, protocol) {
       article.append(link);
     }
 
-    els.milestones.append(article);
-    if (!isComparison) {
-      previous = entry;
+    els.nativeMilestones.append(article);
+    previous = entry;
+  }
+}
+
+function tokenMatchText(row) {
+  const matched = Number(row.matched_tokens);
+  const total = Number(row.tokens_total);
+  if (!Number.isFinite(matched) || !Number.isFinite(total)) {
+    return "\u2013";
+  }
+  return `${formatCount(matched)} / ${formatCount(total)}`;
+}
+
+function renderRace(tables) {
+  els.raceTables.replaceChildren();
+  for (const tableData of tables) {
+    const card = document.createElement("div");
+    card.className = "race-card";
+
+    const heading = document.createElement("h4");
+    heading.textContent = tableData.label;
+
+    const note = document.createElement("p");
+    note.className = "block-note";
+    note.textContent = tableData.note;
+
+    const scroll = document.createElement("div");
+    scroll.className = "table-scroll";
+
+    const table = document.createElement("table");
+    table.className = "data-table race-table";
+    const caption = document.createElement("caption");
+    caption.className = "sr-only";
+    caption.textContent = `${tableData.label}: engines in the same container.`;
+    table.append(caption);
+
+    const head = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    for (const label of [
+      "Engine",
+      "Decode tok/s",
+      "Prompt tok/s",
+      "First token",
+      "Tokens matching",
+    ]) {
+      const cell = document.createElement("th");
+      cell.scope = "col";
+      cell.textContent = label;
+      headRow.append(cell);
+    }
+    head.append(headRow);
+    table.append(head);
+
+    const body = document.createElement("tbody");
+    for (const row of tableData.rows) {
+      const tr = document.createElement("tr");
+      if (row.quantized) {
+        tr.className = "row--int8";
+      }
+      const engineCell = document.createElement("th");
+      engineCell.scope = "row";
+      const label = document.createElement("span");
+      label.className = "row-label";
+      label.textContent = row.label;
+      const runId = document.createElement("span");
+      runId.className = "run-id";
+      runId.textContent = row.milestone;
+      engineCell.append(label, runId);
+      tr.append(engineCell);
+      const cells = [
+        ["Decode tok/s", formatRate(row.decode_tok_s)],
+        ["Prompt tok/s", formatRate(row.prefill_tok_s)],
+        ["First token", formatMs(row.ttft_ms)],
+        ["Tokens matching", tokenMatchText(row)],
+      ];
+      for (const [cellLabel, text] of cells) {
+        const cell = document.createElement("td");
+        cell.dataset.label = cellLabel;
+        cell.textContent = text;
+        tr.append(cell);
+      }
+      body.append(tr);
+    }
+    table.append(body);
+    scroll.append(table);
+    card.append(heading, note, scroll);
+    els.raceTables.append(card);
+  }
+}
+
+function sizeRowLabel(row) {
+  const label = document.createElement("span");
+  label.className = "row-label";
+  label.textContent = row.label;
+  const runId = document.createElement("span");
+  runId.className = "run-id";
+  runId.textContent = row.milestone;
+  return [label, runId];
+}
+
+function renderSizes(groups, protocol) {
+  els.sizesBody.replaceChildren();
+  const memory = Number(protocol.memory_gb);
+  const oomText = Number.isFinite(memory)
+    ? `did not fit in ${formatCount(memory)} GB`
+    : "did not fit";
+  for (const [groupIndex, group] of groups.entries()) {
+    for (const [rowIndex, row] of group.rows.entries()) {
+      const tr = document.createElement("tr");
+      tr.dataset.model = group.label;
+      if (rowIndex === 0 && groupIndex > 0) {
+        tr.className = "group-start";
+      }
+      if (rowIndex === 0) {
+        const modelCell = document.createElement("th");
+        modelCell.scope = "rowgroup";
+        modelCell.rowSpan = group.rows.length;
+        modelCell.className = "model-cell";
+        modelCell.textContent = group.label;
+        tr.append(modelCell);
+      }
+      const engineCell = document.createElement("th");
+      engineCell.scope = "row";
+      engineCell.append(...sizeRowLabel(row));
+      tr.append(engineCell);
+
+      if (row.status === "oom") {
+        const cell = document.createElement("td");
+        cell.colSpan = 4;
+        cell.className = "oom";
+        cell.dataset.label = "Result";
+        cell.textContent = oomText;
+        tr.append(cell);
+      } else {
+        const cells = [
+          ["Decode tok/s", formatRate(row.decode_tok_s)],
+          ["Prompt tok/s", formatRate(row.prefill_tok_s)],
+          ["Peak memory", formatMemory(row.peak_mb)],
+          ["Perplexity", formatPerplexity(row.perplexity)],
+        ];
+        for (const [label, text] of cells) {
+          const cell = document.createElement("td");
+          cell.dataset.label = label;
+          cell.textContent = text;
+          tr.append(cell);
+        }
+      }
+      els.sizesBody.append(tr);
     }
   }
 }
 
-function renderChart(entries) {
-  if (entries.length === 0) {
-    els.chart.replaceChildren();
+function variantMatch(variant) {
+  if (variant.matches_native) {
+    return "native int8";
+  }
+  if (variant.matches_reference) {
+    return "reference";
+  }
+  const rate = Number(variant.token_match_rate);
+  if (Number.isFinite(rate)) {
+    return `${Math.round(rate * 100)}%`;
+  }
+  return "\u2013";
+}
+
+function buildVariantTable(entry) {
+  if (!Array.isArray(entry.variants) || entry.variants.length === 0) {
+    return null;
+  }
+  const scroll = document.createElement("div");
+  scroll.className = "table-scroll";
+  const table = document.createElement("table");
+  table.className = "data-table variant-table";
+  const caption = document.createElement("caption");
+  caption.className = "sr-only";
+  caption.textContent = `Other runs of ${entry.milestone}.`;
+  table.append(caption);
+
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const label of [
+    "Run",
+    "Browser",
+    "Weights",
+    "Threads",
+    "Decode tok/s",
+    "Prompt tok/s",
+    "First token",
+    "Match",
+  ]) {
+    const cell = document.createElement("th");
+    cell.scope = "col";
+    cell.textContent = label;
+    headRow.append(cell);
+  }
+  head.append(headRow);
+  table.append(head);
+
+  const body = document.createElement("tbody");
+  for (const variant of entry.variants) {
+    const tr = document.createElement("tr");
+    const runCell = document.createElement("th");
+    runCell.scope = "row";
+    const runLabel = document.createElement("span");
+    runLabel.className = "row-label";
+    runLabel.textContent = variant.milestone;
+    const target = document.createElement("span");
+    target.className = "run-id";
+    target.textContent = variant.target ?? "";
+    runCell.append(runLabel, target);
+    tr.append(runCell);
+
+    const cells = [
+      ["Browser", variant.browser ?? "\u2013"],
+      ["Weights", variant.weights ?? "\u2013"],
+      [
+        "Threads",
+        variant.threads === undefined ? "\u2013" : formatCount(variant.threads),
+      ],
+      ["Decode tok/s", formatRate(variant.decode_tok_s)],
+      ["Prompt tok/s", formatRate(variant.prefill_tok_s)],
+      ["First token", formatMs(variant.ttft_ms)],
+      ["Match", variantMatch(variant)],
+    ];
+    for (const [label, text] of cells) {
+      const cell = document.createElement("td");
+      cell.dataset.label = label;
+      cell.textContent = text;
+      tr.append(cell);
+    }
+    body.append(tr);
+  }
+  table.append(body);
+  scroll.append(table);
+  return scroll;
+}
+
+function renderWebCards(entries, protocol) {
+  els.webMilestones.replaceChildren();
+  const byMilestone = new Map(
+    entries.map((entry) => [String(entry.milestone), entry]),
+  );
+  let previous = null;
+
+  for (const entry of entries) {
+    const article = document.createElement("article");
+    article.className = "milestone";
+
+    const meta = document.createElement("p");
+    meta.className = "milestone-meta";
+    const id = document.createElement("span");
+    id.className = "milestone-id";
+    id.textContent = entry.milestone;
+    meta.append(id);
+    for (const part of [entry.browser, entry.target, entry.date]) {
+      if (part) {
+        const node = document.createElement("span");
+        node.textContent = part;
+        meta.append(node);
+      }
+    }
+    if (entry.threads !== undefined) {
+      const node = document.createElement("span");
+      const count = Number(entry.threads);
+      node.textContent = `${formatCount(entry.threads)} thread${
+        count === 1 ? "" : "s"
+      }`;
+      meta.append(node);
+    }
+    const weights = document.createElement("span");
+    weights.className = "tag";
+    weights.textContent = entry.weights ?? "weights";
+    meta.append(weights);
+    if (
+      entry.sessions !== undefined &&
+      Number(entry.sessions) !== Number(protocol.sessions)
+    ) {
+      const node = document.createElement("span");
+      node.textContent = `${formatCount(entry.sessions)} session${
+        Number(entry.sessions) === 1 ? "" : "s"
+      }`;
+      meta.append(node);
+    }
+
+    const title = document.createElement("h3");
+    title.textContent = entry.title;
+
+    const headline = document.createElement("p");
+    headline.className = "milestone-headline";
+    headline.textContent = entry.headline;
+
+    const baseline =
+      (entry.baseline && byMilestone.get(String(entry.baseline))) || previous;
+    const showBefore = baseline !== null;
+
+    const deltas = document.createElement("ul");
+    deltas.className = "deltas";
+    appendDelta(
+      deltas,
+      "Decode",
+      showBefore ? baseline.decode_tok_s : null,
+      entry.decode_tok_s,
+      "tok/s",
+      formatRate,
+    );
+    appendDelta(
+      deltas,
+      "Prompt",
+      showBefore ? baseline.prefill_tok_s : null,
+      entry.prefill_tok_s,
+      "tok/s",
+      formatRate,
+    );
+    appendDelta(
+      deltas,
+      "First token",
+      showBefore ? baseline.ttft_ms : null,
+      entry.ttft_ms,
+      "",
+      formatMs,
+    );
+
+    const correctness = document.createElement("p");
+    correctness.className = "correctness";
+    correctness.textContent = webCorrectness(entry, protocol);
+
+    article.append(meta, title, headline, deltas);
+    appendCompareNote(article, entry, baseline);
+    article.append(correctness);
+
+    const variants = buildVariantTable(entry);
+    if (variants) {
+      article.append(variants);
+    }
+
+    if (entry.journal) {
+      const link = document.createElement("a");
+      link.className = "journal-link";
+      link.href = REPO_URL + entry.journal;
+      link.textContent = "Journal note";
+      article.append(link);
+    }
+
+    els.webMilestones.append(article);
+    previous = entry;
+  }
+}
+
+function renderChart(container, entries, options = {}) {
+  const valid = entries.filter(
+    (entry) => Number.isFinite(Number(entry.decode_tok_s)) && Number(entry.decode_tok_s) > 0,
+  );
+  if (valid.length === 0) {
+    container.replaceChildren();
+    chartWidths.set(container, 0);
     return;
   }
-  const width = Math.max(240, Math.floor(els.chart.clientWidth || 600));
-  lastChartWidth = width;
+
+  const compact = options.compact === true;
+  const width = Math.max(240, Math.floor(container.clientWidth || 600));
+  chartWidths.set(container, width);
   const narrow = width < 430;
-  const longestLabel = entries.reduce(
+  const longestLabel = valid.reduce(
     (longest, entry) => Math.max(longest, String(entry.milestone).length),
     0,
   );
@@ -867,34 +1671,28 @@ function renderChart(entries) {
         68,
         Math.min(140, width - valueWidth - 80, longestLabel * 7.2 + 10),
       );
-  const rowHeight = narrow ? 30 : 32;
-  const barHeight = narrow ? 14 : 16;
+  const rowHeight = compact ? 28 : narrow ? 30 : 32;
+  const barHeight = compact ? 13 : narrow ? 14 : 16;
   const top = 20;
   const axisHeight = 28;
   const left = labelWidth;
   const right = width - valueWidth;
   const plotWidth = Math.max(80, right - left);
-  const height = top + entries.length * rowHeight + axisHeight;
+  const height = top + valid.length * rowHeight + axisHeight;
 
-  const values = entries
-    .map((entry) => Number(entry.decode_tok_s))
-    .filter((value) => Number.isFinite(value) && value > 0);
-  if (values.length === 0) {
-    els.chart.replaceChildren();
-    return;
-  }
-
+  const values = valid.map((entry) => Number(entry.decode_tok_s));
   const minLog = Math.floor(Math.log10(Math.min(...values)));
   const maxLog = Math.ceil(Math.log10(Math.max(...values)) * 10) / 10;
   const logSpan = Math.max(0.1, maxLog - minLog);
   const xFor = (value) =>
     left + ((Math.log10(value) - minLog) / logSpan) * plotWidth;
+  const hatchId = `${container.id || "chart"}-hatch`;
 
   const parts = [
     `<svg class="chart-svg${
       narrow ? " chart-svg--narrow" : ""
     }" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" aria-hidden="true" focusable="false">`,
-    '<defs><pattern id="int8-hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect class="chart-hatch-bg" width="6" height="6"/><line class="chart-hatch-line" x1="0" y1="0" x2="0" y2="6"/></pattern></defs>',
+    `<defs><pattern id="${hatchId}" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect class="chart-hatch-bg" width="6" height="6"/><line class="chart-hatch-line" x1="0" y1="0" x2="0" y2="6"/></pattern></defs>`,
   ];
 
   for (let exponent = minLog; exponent <= Math.floor(maxLog); exponent += 1) {
@@ -903,43 +1701,42 @@ function renderChart(entries) {
     parts.push(
       `<line class="chart-grid" x1="${x.toFixed(1)}" y1="${
         top - 6
-      }" x2="${x.toFixed(1)}" y2="${top + entries.length * rowHeight}"/>`,
+      }" x2="${x.toFixed(1)}" y2="${top + valid.length * rowHeight}"/>`,
     );
     const anchor = x < left + 12 ? "start" : x > right - 12 ? "end" : "middle";
     parts.push(
       `<text class="chart-tick" x="${x.toFixed(1)}" y="${
-        top + entries.length * rowHeight + 16
+        top + valid.length * rowHeight + 16
       }" text-anchor="${anchor}">${value}</text>`,
     );
   }
 
-  entries.forEach((entry, index) => {
+  valid.forEach((entry, index) => {
     const value = Number(entry.decode_tok_s);
     const y = top + index * rowHeight + (rowHeight - barHeight) / 2;
     const rowCenter = y + barHeight / 2 + 4;
     const quantized = isQuantized(entry);
-    const comparison = isComparisonEngine(entry);
-    const barWidth =
-      Number.isFinite(value) && value > 0
-        ? Math.max(2, xFor(value) - left)
-        : 0;
+    const comparison = isReference(entry);
+    const barWidth = Math.max(2, xFor(value) - left);
     const barClass = quantized
       ? "chart-bar-int8"
       : comparison
         ? "chart-bar-ref"
         : "chart-bar-ours";
+    const fill =
+      quantized
+        ? ` fill="url(#${hatchId})"`
+        : "";
     parts.push(
       `<text class="chart-label" x="2" y="${rowCenter.toFixed(
         1,
       )}">${escapeXml(entry.milestone)}</text>`,
     );
-    if (barWidth > 0) {
-      parts.push(
-        `<rect class="${barClass}" x="${left}" y="${y.toFixed(
-          1,
-        )}" width="${barWidth.toFixed(1)}" height="${barHeight}" rx="2"/>`,
-      );
-    }
+    parts.push(
+      `<rect class="${barClass}"${fill} x="${left}" y="${y.toFixed(
+        1,
+      )}" width="${barWidth.toFixed(1)}" height="${barHeight}" rx="2"/>`,
+    );
     const int8 = quantized
       ? '<tspan class="chart-int8" dx="4">int8</tspan>'
       : "";
@@ -953,80 +1750,176 @@ function renderChart(entries) {
   });
 
   parts.push("</svg>");
-  els.chart.innerHTML = parts.join("");
+  container.innerHTML = parts.join("");
 }
 
-function scheduleChart() {
-  if (chartEntries.length === 0) {
+function scheduleChart(container) {
+  const entries = chartData.get(container) ?? [];
+  if (entries.length === 0) {
     return;
   }
-  cancelAnimationFrame(chartFrame);
-  chartFrame = requestAnimationFrame(() => {
-    const width = Math.max(240, Math.floor(els.chart.clientWidth || 600));
-    if (width !== lastChartWidth) {
-      renderChart(chartEntries);
-    }
-  });
+  const width = Math.max(240, Math.floor(container.clientWidth || 600));
+  if (width !== chartWidths.get(container)) {
+    renderChart(container, entries, { compact: container === els.webChart });
+  }
 }
 
-function renderStory(payload) {
-  const protocol = payload.protocol ?? {};
-  const milestones = payload.milestones ?? [];
-  const main = milestones.filter(
-    (entry) => !THREAD_MILESTONE.test(String(entry.milestone)),
-  );
-  const scaling = milestones.filter((entry) =>
-    THREAD_MILESTONE.test(String(entry.milestone)),
-  );
-
-  chartEntries = main;
-  renderChart(main);
-  renderCards(main, scaling, protocol);
-
-  const n1 = milestones.find((entry) => entry.milestone === "N1");
+function describeSessionNote(native, protocol) {
+  const n1 = native.find((entry) => entry.milestone === "N1");
   if (
     n1 &&
     Number.isFinite(Number(n1.sessions)) &&
     Number(n1.sessions) !== Number(protocol.sessions)
   ) {
-    els.storyNote.textContent = `N1 used ${formatCount(
-      n1.sessions,
-    )} session${
+    return `N1 used ${formatCount(n1.sessions)} session${
       Number(n1.sessions) === 1 ? "" : "s"
     } and no warm-up. From N2 on, each milestone uses ${formatCount(
       protocol.sessions,
     )} sessions.`;
-  } else {
-    els.storyNote.textContent = "";
   }
+  return "";
 }
 
-function renderDevice(protocol, bench, milestone) {
-  const weights = milestone && isQuantized(milestone) ? "int8" : "f32";
-  if (!bench) {
-    els.deviceCopy.textContent =
-      "The benchmark configuration could not be loaded.";
-  } else {
-    els.deviceCopy.textContent = `Run prompt ${bench.prompt_id} with ${formatCount(
-      bench.max_new_tokens,
-    )} new tokens: ${formatCount(bench.warmup)} warm-up${
-      Number(bench.warmup) === 1 ? "" : "s"
-    }, then one timed run. This page uses int8 weights in WebAssembly; the project column is the same ${weights} engine in a Linux container limited to ${formatCount(
-      protocol.cores,
-    )} cores.`;
-  }
+function renderStory(payload) {
+  const protocol = payload.protocol ?? {};
+  const native = payload.native ?? [];
+  const race = payload.race ?? [];
+  const sizes = payload.sizes ?? [];
+  const web = payload.web ?? [];
+  const hasStory =
+    native.length > 0 || race.length > 0 || sizes.length > 0 || web.length > 0;
 
-  if (!milestone) {
-    els.projectNote.textContent = "";
+  els.story.hidden = !hasStory;
+  if (!hasStory) {
     return;
   }
 
-  els.projectDecode.textContent = formatRate(milestone.decode_tok_s);
-  els.projectPrefill.textContent = formatRate(milestone.prefill_tok_s);
-  els.projectTtft.textContent = formatMs(milestone.ttft_ms);
-  els.projectNote.textContent = `Project: ${
-    milestone.milestone
-  }, ${weights} weights, ${formatCount(protocol.cores)} cores, Linux container. Numbers from this tab are measured in the browser.`;
+  els.storyNative.hidden = native.length === 0;
+  els.storyRace.hidden = race.length === 0;
+  els.storySizes.hidden = sizes.length === 0;
+  els.storyWeb.hidden = web.length === 0;
+
+  if (native.length > 0) {
+    chartData.set(els.nativeChart, native);
+    renderChart(els.nativeChart, native);
+    renderNativeCards(native, protocol);
+  }
+  if (race.length > 0) {
+    renderRace(race);
+  }
+  if (sizes.length > 0) {
+    renderSizes(sizes, protocol);
+  }
+  if (web.length > 0) {
+    chartData.set(els.webChart, web);
+    renderChart(els.webChart, web, { compact: true });
+    renderWebCards(web, protocol);
+  }
+
+  const note = describeSessionNote(native, protocol);
+  els.storyNote.textContent = note;
+  els.storyNote.hidden = note.length === 0;
+}
+
+function renderDevice(payload) {
+  const protocol = payload.protocol ?? {};
+  const bench = payload.benchmark ?? null;
+  deviceBench = bench;
+
+  if (!bench) {
+    els.deviceCopy.textContent =
+      "The benchmark configuration could not be loaded.";
+    els.benchStatus.textContent = "The benchmark is unavailable.";
+    return;
+  }
+
+  const warmups = Number(bench.warmup);
+  const runs = Number(bench.runs);
+  els.deviceCopy.textContent = `Run prompt ${bench.prompt_id} with ${formatCount(
+    bench.max_new_tokens,
+  )} new tokens: ${formatCount(warmups)} warm-up${
+    warmups === 1 ? "" : "s"
+  }, then ${formatCount(runs)} timed run${
+    runs === 1 ? "" : "s"
+  }. It runs on each engine this device supports, one after the other. The project rows are browser measurements from this repository on the development laptop, not the container.`;
+  els.benchStatus.textContent =
+    modelReady === null ? "Load the model above first." : "Ready to run.";
+}
+
+function renderMethod(protocol) {
+  for (const element of document.querySelectorAll("[data-protocol]")) {
+    element.textContent = formatProtocol(
+      element.dataset.protocol,
+      protocol[element.dataset.protocol],
+    );
+  }
+}
+
+function renderData(payload) {
+  payloadData = payload;
+  const protocol = payload.protocol ?? {};
+  els.weights.textContent = weightsLabel();
+  updateLoadButton();
+  renderMethod(protocol);
+  renderDevice(payload);
+  renderStory(payload);
+  if (modelReady !== null) {
+    setRunningState();
+  }
+  if (modelReady !== null && benchResults.length === 0) {
+    els.benchStatus.textContent = "Ready to run.";
+  }
+  updateControls();
+}
+
+function renderDataError(error) {
+  console.error(error);
+  payloadData = null;
+  deviceBench = null;
+  els.story.hidden = true;
+  els.storyIntro.textContent = "The milestone data could not be loaded.";
+  const message = document.createElement("p");
+  message.className = "status";
+  message.textContent = "The milestone data is unavailable.";
+  els.nativeMilestones.replaceChildren(message);
+  els.nativeChart.replaceChildren();
+  els.webChart.replaceChildren();
+  els.storyNote.textContent = "";
+  els.deviceCopy.textContent = "The benchmark configuration could not be loaded.";
+  els.benchStatus.textContent = "The benchmark is unavailable.";
+  els.weights.textContent = "int8";
+  for (const element of document.querySelectorAll("[data-protocol]")) {
+    element.textContent = "\u2013";
+  }
+  updateControls();
+}
+
+function dataUrl() {
+  const raw = new URLSearchParams(location.search).get("data");
+  if (!raw) {
+    return DEFAULT_DATA_URL;
+  }
+  if (
+    /^[a-z][a-z0-9+.-]*:/i.test(raw) ||
+    raw.startsWith("//") ||
+    raw.startsWith("/")
+  ) {
+    return DEFAULT_DATA_URL;
+  }
+  try {
+    const url = new URL(raw, location.href);
+    return url.origin === location.origin ? url.href : DEFAULT_DATA_URL;
+  } catch {
+    return DEFAULT_DATA_URL;
+  }
+}
+
+async function fetchData() {
+  const response = await fetch(dataUrl(), { cache: "no-cache" });
+  if (!response.ok) {
+    throw new Error(`data file: HTTP ${response.status}`);
+  }
+  return response.json();
 }
 
 function linkRepo() {
@@ -1038,84 +1931,41 @@ function linkRepo() {
   }
 }
 
-function renderData(payload) {
-  const protocol = payload.protocol ?? {};
-  for (const element of document.querySelectorAll("[data-protocol]")) {
-    element.textContent = formatProtocol(
-      element.dataset.protocol,
-      protocol[element.dataset.protocol],
-    );
-  }
-
-  const milestones = payload.milestones ?? [];
-  deviceBench = payload.device_bench ?? null;
-  const projectMilestone =
-    milestones.find((entry) => entry.milestone === "N7") ??
-    [...milestones].reverse().find(isQuantized) ??
-    milestones[milestones.length - 1] ??
-    null;
-
-  renderDevice(protocol, deviceBench, projectMilestone);
-  renderStory(payload);
-  if (ready && deviceBench) {
-    els.benchStatus.textContent = "Ready to run.";
-  }
-  updateControls();
-}
-
-function renderDataError(error) {
-  console.error(error);
-  els.storyIntro.textContent = "The milestone data could not be loaded.";
-  const message = document.createElement("p");
-  message.className = "status";
-  message.textContent = "The milestone data is unavailable.";
-  els.milestones.replaceChildren(message);
-  els.chart.replaceChildren();
-  els.storyNote.textContent = "";
-  els.deviceCopy.textContent = "The benchmark configuration could not be loaded.";
-  els.benchStatus.textContent = "The benchmark is unavailable.";
-  for (const element of document.querySelectorAll("[data-protocol]")) {
-    element.textContent = "\u2013";
-  }
-  updateControls();
-}
-
-async function fetchData() {
-  const response = await fetch("./data/milestones.json", {
-    cache: "no-cache",
-  });
-  if (!response.ok) {
-    throw new Error(`data/milestones.json: HTTP ${response.status}`);
-  }
-  return response.json();
-}
-
 function wireEvents() {
-  els.loadButton.addEventListener("click", loadModel);
+  els.loadButton.addEventListener("click", () => loadModel());
   els.generate.addEventListener("click", generate);
   els.stop.addEventListener("click", stopGeneration);
   els.runBench.addEventListener("click", runBenchmark);
-  window.addEventListener("resize", scheduleChart);
+  els.backendMode.addEventListener("change", handleBackendChange);
+  window.addEventListener("resize", () => {
+    for (const container of [els.nativeChart, els.webChart]) {
+      scheduleChart(container);
+    }
+  });
+}
+
+function observeCharts() {
+  if (!("ResizeObserver" in window)) {
+    return;
+  }
+  const observer = new ResizeObserver(() => {
+    for (const container of [els.nativeChart, els.webChart]) {
+      scheduleChart(container);
+    }
+  });
+  observer.observe(els.nativeChart);
+  observer.observe(els.webChart);
 }
 
 async function init() {
   wireEvents();
   linkRepo();
+  observeCharts();
 
-  if ("ResizeObserver" in window) {
-    const observer = new ResizeObserver(() => {
-      if (chartEntries.length === 0) {
-        return;
-      }
-      const width = Math.max(
-        240,
-        Math.floor(els.chart.clientWidth || 600),
-      );
-      if (width !== lastChartWidth) {
-        renderChart(chartEntries);
-      }
-    });
-    observer.observe(els.chart);
+  const initial = new URLSearchParams(location.search).get("backend");
+  if (initial === "cpu" || initial === "webgpu") {
+    backendMode = initial;
+    els.backendMode.value = initial;
   }
 
   fetchData().then(renderData).catch(renderDataError);

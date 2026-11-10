@@ -8,6 +8,7 @@
       name="description"
       content="GPT-2 written from scratch in Rust, measured one step at a time, and running in your browser."
     />
+    <link rel="icon" href="data:," />
     <link rel="stylesheet" href="./site.css" />
   </head>
   <body>
@@ -18,8 +19,8 @@
         <h1>GPT-2, one measured step at a time</h1>
         <p class="lede">
           GPT-2 written from scratch in Rust, made faster one measured step at a
-          time, and compiled to WebAssembly to run in this browser; nothing you
-          type is sent to a server.
+          time, and compiled to run in this browser on WebGPU or WebAssembly.
+          Nothing you type leaves this tab.
         </p>
       </header>
 
@@ -27,8 +28,9 @@
         <div class="section-head">
           <h2 id="demo-title">Try it</h2>
           <p class="section-note">
-            The model runs in a Web Worker on this device. The weights download
-            once and stay in the browser's cache.
+            The model runs in a Web Worker on this device. Auto uses WebGPU when
+            it is available, otherwise WebAssembly with threads or SIMD. The
+            weights download once and stay in the browser's cache.
           </p>
         </div>
 
@@ -37,7 +39,9 @@
         </noscript>
 
         <div id="load-panel" class="load-panel">
-          <button id="load-model" type="button" hidden>Load the model (135 MB, cached after the first time)</button>
+          <button id="load-model" type="button" hidden>
+            Load the model (cached after the first time)
+          </button>
           <p id="load-status" class="load-status" role="status" aria-live="polite">
             Checking browser storage.
           </p>
@@ -73,6 +77,14 @@
               <option value="256">256</option>
             </select>
           </label>
+          <label class="select-label" for="backend-mode">
+            Engine
+            <select id="backend-mode">
+              <option value="auto" selected>Auto</option>
+              <option value="webgpu">WebGPU</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </label>
         </div>
 
         <dl class="meter" aria-label="Live generation meter">
@@ -97,11 +109,12 @@
         </p>
 
         <dl class="specs">
-          <div><dt>Weights</dt><dd>int8</dd></div>
-          <div><dt>WebAssembly SIMD</dt><dd id="simd-state">not loaded</dd></div>
-          <div><dt>Threads</dt><dd id="threads-state">not loaded</dd></div>
+          <div><dt>Running</dt><dd id="running-state">not loaded</dd></div>
+          <div><dt>Weights</dt><dd id="weights-state">checking</dd></div>
+          <div><dt>Cache</dt><dd id="cache-state">not loaded</dd></div>
         </dl>
 
+        <p id="backend-note" class="fine" hidden></p>
         <p class="fine">
           Greedy decoding: the same prompt always gives the same text. Stop ends
           the worker; the next load comes from the browser's cache.
@@ -121,39 +134,32 @@
           Load the model above first.
         </p>
 
-        <table id="bench-result" class="compare" hidden>
-          <caption class="sr-only">Benchmark comparison</caption>
-          <thead>
-            <tr>
-              <th scope="col"><span class="sr-only">Metric</span></th>
-              <th scope="col">This device</th>
-              <th scope="col">Project</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th scope="row">Decode, tok/s</th>
-              <td id="device-decode">&ndash;</td>
-              <td id="project-decode">&ndash;</td>
-            </tr>
-            <tr>
-              <th scope="row">Prefill, tok/s</th>
-              <td id="device-prefill">&ndash;</td>
-              <td id="project-prefill">&ndash;</td>
-            </tr>
-            <tr>
-              <th scope="row">First token</th>
-              <td id="device-ttft">&ndash;</td>
-              <td id="project-ttft">&ndash;</td>
-            </tr>
-          </tbody>
-        </table>
+        <div id="bench-table-wrap" class="table-scroll" hidden>
+          <table id="bench-result" class="bench-table">
+            <caption class="sr-only">
+              Benchmark on this device against the project's browser numbers
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col">Engine</th>
+                <th scope="col">Source</th>
+                <th scope="col">Decode tok/s</th>
+                <th scope="col">Prompt tok/s</th>
+                <th scope="col">First token</th>
+              </tr>
+            </thead>
+            <tbody id="bench-body"></tbody>
+          </table>
+        </div>
 
-        <p id="project-note" class="fine"></p>
-        <p class="fine">Results stay in this tab. Nothing is sent anywhere.</p>
+        <p id="bench-note" class="fine" hidden></p>
+        <p id="bench-hint" class="hint" hidden></p>
+        <p class="fine">
+          Results stay in this tab. Nothing is sent anywhere.
+        </p>
       </section>
 
-      <section id="story" aria-labelledby="story-title">
+      <section id="story" aria-labelledby="story-title" hidden>
         <div class="section-head">
           <h2 id="story-title">The story</h2>
           <p id="story-intro" class="section-note">
@@ -163,29 +169,110 @@
           </p>
         </div>
 
-        <figure class="chart-figure">
-          <div id="chart" class="chart" aria-hidden="true"></div>
-          <div class="legend" aria-hidden="true">
-            <span><span class="swatch swatch-ref"></span>Reference and comparison engines</span>
-            <span><span class="swatch swatch-ours"></span>gpt2-fast</span>
-            <span>
-              <svg class="swatch-hatch" width="14" height="10" viewBox="0 0 14 10" aria-hidden="true">
-                <rect class="legend-hatch-bg" width="14" height="10" />
-                <path class="legend-hatch-line" d="M-2 10 L8 -2 M3 12 L13 2" />
-                <rect class="legend-hatch-edge" x="0.5" y="0.5" width="13" height="9" />
-              </svg>
-              int8
-            </span>
+        <div id="story-native" class="story-block" hidden>
+          <div class="block-head">
+            <h3>Native engine</h3>
+            <p class="block-note">
+              The reference and the measured steps for GPT-2, in the Linux
+              container.
+            </p>
           </div>
-          <figcaption>
-            Decode speed in tokens per second, on a log scale. The N5 thread
-            runs are in the N5 card.
-          </figcaption>
-        </figure>
 
-        <div id="milestones" class="milestones">
-          <p class="status">Loading the milestone data.</p>
+          <figure class="chart-figure">
+            <div id="native-chart" class="chart" aria-hidden="true"></div>
+            <div class="legend" aria-hidden="true">
+              <span><span class="swatch swatch-ref"></span>Reference</span>
+              <span><span class="swatch swatch-ours"></span>gpt2-fast</span>
+              <span>
+                <svg class="swatch-hatch" width="14" height="10" viewBox="0 0 14 10" aria-hidden="true">
+                  <rect class="legend-hatch-bg" width="14" height="10" />
+                  <path class="legend-hatch-line" d="M-2 10 L8 -2 M3 12 L13 2" />
+                  <rect class="legend-hatch-edge" x="0.5" y="0.5" width="13" height="9" />
+                </svg>
+                int8
+              </span>
+            </div>
+            <figcaption>
+              Decode speed in tokens per second, on a log scale. Thread scaling
+              runs are inside their parent cards.
+            </figcaption>
+          </figure>
+
+          <div id="native-milestones" class="milestones"></div>
         </div>
+
+        <div id="story-race" class="story-block" hidden>
+          <div class="block-head">
+            <h3>The race</h3>
+            <p class="block-note">
+              The same GPT-2 in the container: PyTorch, NumPy, gpt2-fast and
+              llama.cpp. Tokens matching counts greedy tokens equal to the
+              reference; an exact result also needs the logit check.
+            </p>
+          </div>
+          <div id="race-tables" class="race-tables"></div>
+        </div>
+
+        <div id="story-sizes" class="story-block" hidden>
+          <div class="block-head">
+            <h3>Bigger models</h3>
+            <p class="block-note">
+              Every GPT-2 size measured in the same container. A row that did
+              not fit is marked, not measured.
+            </p>
+          </div>
+          <div class="table-scroll">
+            <table id="sizes-table" class="data-table sizes-table">
+              <caption class="sr-only">
+                Decode speed, prompt speed, peak memory and perplexity by model
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Model</th>
+                  <th scope="col">Engine</th>
+                  <th scope="col">Decode tok/s</th>
+                  <th scope="col">Prompt tok/s</th>
+                  <th scope="col">Peak memory</th>
+                  <th scope="col">Perplexity</th>
+                </tr>
+              </thead>
+              <tbody id="sizes-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div id="story-web" class="story-block" hidden>
+          <div class="block-head">
+            <h3>In the browser</h3>
+            <p class="block-note">
+              Browser numbers, measured in Chromium and WebKit on the
+              development laptop, not in the container. Same prompts, same
+              metrics.
+            </p>
+          </div>
+
+          <figure class="chart-figure">
+            <div id="web-chart" class="chart" aria-hidden="true"></div>
+            <div class="legend" aria-hidden="true">
+              <span><span class="swatch swatch-ours"></span>gpt2-fast in a browser</span>
+              <span>
+                <svg class="swatch-hatch" width="14" height="10" viewBox="0 0 14 10" aria-hidden="true">
+                  <rect class="legend-hatch-bg" width="14" height="10" />
+                  <path class="legend-hatch-line" d="M-2 10 L8 -2 M3 12 L13 2" />
+                  <rect class="legend-hatch-edge" x="0.5" y="0.5" width="13" height="9" />
+                </svg>
+                int8
+              </span>
+            </div>
+            <figcaption>
+              Decode speed in tokens per second for the headline run of each web
+              step. Variants are inside the cards.
+            </figcaption>
+          </figure>
+
+          <div id="web-milestones" class="milestones"></div>
+        </div>
+
         <p id="story-note" class="fine"></p>
       </section>
 
@@ -210,7 +297,7 @@
             number is the median of the session medians.
           </p>
           <p>
-            Decode speed counts tokens after the first. Prefill speed is prompt
+            Decode speed counts tokens after the first. Prompt speed is prompt
             tokens divided by time to first token. Time to first token is
             measured from the start of generation.
           </p>
@@ -226,6 +313,12 @@
             at least <span data-protocol="near_tie_min"></span> logit at every
             step, which leaves room for rounding differences. The closest margin
             in the set is <span data-protocol="closest_gap"></span>.
+          </p>
+          <p>
+            Browser numbers are labelled as browser numbers. They were measured
+            in Chromium and WebKit on the development laptop, on the same
+            prompts, not in the container. Your own numbers on this page are
+            measured in this tab.
           </p>
           <p class="fine">
             Raw sessions and flame graphs are in

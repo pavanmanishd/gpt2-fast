@@ -2,6 +2,7 @@
   "source": "results/log.jsonl",
   "protocol": {
     "host": "Apple M4 Pro, OrbStack Linux VM (kernel 7.2.9), container 4 cores, 8 GB limit",
+    "browser_host": "",
     "cores": 4,
     "memory_gb": 8,
     "sessions": 5,
@@ -13,18 +14,25 @@
     "near_tie_min": 0.05,
     "closest_gap": 0.053
   },
-  "device_bench": {
+  "benchmark": {
     "prompt_id": "p064",
     "prompt": "When I wrote the following pages, or rather the bulk of them, I lived alone, in the woods, a mile from any neighbor, in a house which I had built myself, on the shore of Walden Pond, in Concord, Massachusetts, and earned my living by the labor of my hands only. I lived",
     "max_new_tokens": 64,
-    "warmup": 1
+    "warmup": 1,
+    "runs": 1
   },
-  "milestones": [
+  "weights": {
+    "format": "int8",
+    "file": "model-int8.safetensors",
+    "bytes": 134901520
+  },
+  "native": [
     {
       "milestone": "R0-torch",
       "title": "Reference: Hugging Face transformers on PyTorch (CPU, f32)",
       "date": "2026-11-10",
       "commit": "b3158fa",
+      "model": "gpt2-124m",
       "target": "cpu-linux",
       "decode_tok_s": 48.45,
       "prefill_tok_s": 1010.5,
@@ -34,13 +42,15 @@
       "token_match_rate": 1.0,
       "sessions": 5,
       "headline": "PyTorch runs GPT-2 124M at 48 tokens per second on 4 CPU cores, and its profile shows more than half the time going to copying and reordering weight matrices rather than multiplying them.",
-      "journal": "docs/journal/R0-reference.md"
+      "journal": "docs/journal/R0-reference.md",
+      "quantized": false
     },
     {
       "milestone": "R0-numpy",
       "title": "Reference: GPT-2 from scratch in NumPy (f32, KV cache)",
       "date": "2026-11-10",
       "commit": "b3158fa",
+      "model": "gpt2-124m",
       "target": "cpu-linux",
       "decode_tok_s": 61.36,
       "prefill_tok_s": 1167.1,
@@ -50,13 +60,15 @@
       "token_match_rate": 1.0,
       "sessions": 5,
       "headline": "A 137-line NumPy GPT-2 decodes at 61 tokens per second on 4 CPU cores, faster than PyTorch on the same model.",
-      "journal": "docs/journal/R0-reference.md"
+      "journal": "docs/journal/R0-reference.md",
+      "quantized": false
     },
     {
       "milestone": "N1",
       "title": "Naive Rust: f32, single thread, recompute every token",
       "date": "2026-11-10",
       "commit": "b3158fa",
+      "model": "gpt2-124m",
       "target": "cpu-linux",
       "decode_tok_s": 0.123,
       "prefill_tok_s": 16.1,
@@ -66,13 +78,15 @@
       "token_match_rate": 1.0,
       "sessions": 1,
       "headline": "Plain Rust GPT-2 with no libraries matches PyTorch on every token but runs at 0.12 tokens per second, about 394 times slower, with 98% of the time in one triple loop.",
-      "journal": "docs/journal/N1-naive.md"
+      "journal": "docs/journal/N1-naive.md",
+      "quantized": false
     },
     {
       "milestone": "N2",
       "title": "KV cache: keep attention keys and values of past tokens",
       "date": "2026-11-10",
       "commit": "60624b4",
+      "model": "gpt2-124m",
       "target": "cpu-linux",
       "decode_tok_s": 11.73,
       "prefill_tok_s": 16.0,
@@ -82,13 +96,15 @@
       "token_match_rate": 1.0,
       "sessions": 5,
       "headline": "Keeping the attention keys and values of past tokens makes decoding 95 times faster (0.12 to 11.7 tokens per second) with bit-identical output, matching the predicted 88-fold cut in work.",
-      "journal": "docs/journal/N2-kv-cache.md"
+      "journal": "docs/journal/N2-kv-cache.md",
+      "quantized": false
     },
     {
       "milestone": "N3",
       "title": "Matmul loop order and tiling",
       "date": "2026-11-10",
       "commit": "53dcec1",
+      "model": "gpt2-124m",
       "target": "cpu-linux",
       "decode_tok_s": 43.16,
       "prefill_tok_s": 185.2,
@@ -98,13 +114,15 @@
       "token_match_rate": 1.0,
       "sessions": 5,
       "headline": "Swapping two loops so the matrix multiply reads weights in memory order, plus 8-row tiles, makes decoding 3.7 times faster and prompt processing 11.6 times faster with bit-identical output.",
-      "journal": "docs/journal/N3-loop-order-tiling.md"
+      "journal": "docs/journal/N3-loop-order-tiling.md",
+      "quantized": false
     },
     {
       "milestone": "N4",
       "title": "Hand-written NEON SIMD",
       "date": "2026-11-10",
       "commit": "c4162c5",
+      "model": "gpt2-124m",
       "target": "cpu-linux",
       "decode_tok_s": 61.32,
       "prefill_tok_s": 363.4,
@@ -114,13 +132,15 @@
       "token_match_rate": 1.0,
       "sessions": 5,
       "headline": "Hand-written NEON kernels make prompt processing twice as fast and decoding 1.4 times faster on one core, where decoding is now limited by waiting for weights from memory rather than by arithmetic.",
-      "journal": "docs/journal/N4-neon-simd.md"
+      "journal": "docs/journal/N4-neon-simd.md",
+      "quantized": false
     },
     {
       "milestone": "N5",
       "title": "Threads: split matrix work across 4 cores",
       "date": "2026-11-10",
       "commit": "26b0fc6",
+      "model": "gpt2-124m",
       "target": "cpu-linux",
       "decode_tok_s": 125.95,
       "prefill_tok_s": 821.9,
@@ -130,61 +150,38 @@
       "token_match_rate": 1.0,
       "sessions": 5,
       "headline": "A from-scratch thread pool splits each matrix across 4 cores with bit-identical output, doubling decode speed to 126 tokens per second, 2.6 times PyTorch on the same cores.",
-      "journal": "docs/journal/N5-threads.md"
-    },
-    {
-      "milestone": "N5-threads1",
-      "title": "Threads: scaling run with 1 thread",
-      "date": "2026-11-10",
-      "commit": "26b0fc6",
-      "target": "cpu-linux",
-      "decode_tok_s": 61.57,
-      "prefill_tok_s": 363.6,
-      "ttft_ms": 175.9,
-      "peak_mb": 559.9,
-      "matches_reference": true,
-      "token_match_rate": 1.0,
-      "sessions": 5,
-      "headline": "N5 with 1 thread, part of the 1-to-4 core scaling measurement.",
-      "journal": "docs/journal/N5-threads.md"
-    },
-    {
-      "milestone": "N5-threads2",
-      "title": "Threads: scaling run with 2 threads",
-      "date": "2026-11-10",
-      "commit": "26b0fc6",
-      "target": "cpu-linux",
-      "decode_tok_s": 102.32,
-      "prefill_tok_s": 581.6,
-      "ttft_ms": 109.7,
-      "peak_mb": 560.1,
-      "matches_reference": true,
-      "token_match_rate": 1.0,
-      "sessions": 5,
-      "headline": "N5 with 2 threads, part of the 1-to-4 core scaling measurement.",
-      "journal": "docs/journal/N5-threads.md"
-    },
-    {
-      "milestone": "N5-threads3",
-      "title": "Threads: scaling run with 3 threads",
-      "date": "2026-11-10",
-      "commit": "26b0fc6",
-      "target": "cpu-linux",
-      "decode_tok_s": 103.74,
-      "prefill_tok_s": 685.7,
-      "ttft_ms": 92.9,
-      "peak_mb": 560.4,
-      "matches_reference": true,
-      "token_match_rate": 1.0,
-      "sessions": 5,
-      "headline": "N5 with 3 threads, part of the 1-to-4 core scaling measurement.",
-      "journal": "docs/journal/N5-threads.md"
+      "journal": "docs/journal/N5-threads.md",
+      "quantized": false,
+      "scaling": [
+        {
+          "milestone": "N5-threads1",
+          "threads": 1,
+          "decode_tok_s": 61.57,
+          "prefill_tok_s": 363.6,
+          "ttft_ms": 175.9
+        },
+        {
+          "milestone": "N5-threads2",
+          "threads": 2,
+          "decode_tok_s": 102.32,
+          "prefill_tok_s": 581.6,
+          "ttft_ms": 109.7
+        },
+        {
+          "milestone": "N5-threads3",
+          "threads": 3,
+          "decode_tok_s": 103.74,
+          "prefill_tok_s": 685.7,
+          "ttft_ms": 92.9
+        }
+      ]
     },
     {
       "milestone": "N6",
       "title": "Fewer allocations, GELU fused into matmul",
       "date": "2026-11-10",
       "commit": "89c4e69",
+      "model": "gpt2-124m",
       "target": "cpu-linux",
       "decode_tok_s": 132.57,
       "prefill_tok_s": 1106.5,
@@ -194,13 +191,15 @@
       "token_match_rate": 1.0,
       "sessions": 5,
       "headline": "Reusing buffers (zero allocations per token, down from 184) and applying GELU as the matrix multiply stores its output speeds up prompt processing 35% and decoding 5%, with bit-identical output.",
-      "journal": "docs/journal/N6-fewer-allocations-fused-gelu.md"
+      "journal": "docs/journal/N6-fewer-allocations-fused-gelu.md",
+      "quantized": false
     },
     {
       "milestone": "N7",
       "title": "8-bit weights (int8, a scale per 64 weights)",
       "date": "2026-11-10",
       "commit": "15e5389",
+      "model": "gpt2-124m",
       "target": "cpu-linux",
       "decode_tok_s": 254.6,
       "prefill_tok_s": 960.6,
@@ -213,55 +212,235 @@
       "journal": "docs/journal/N7-int8-weights.md",
       "perplexity": 78.0,
       "perplexity_f32": 76.83,
-      "perplexity_reference": 76.84
-    },
-    {
-      "milestone": "N9-llamacpp-f32",
-      "title": "Final race: llama.cpp f32 (GGUF)",
-      "date": "2026-11-10",
-      "commit": "7fd55af",
-      "target": "cpu-linux",
-      "decode_tok_s": 310.01,
-      "prefill_tok_s": 895.0,
-      "ttft_ms": 71.1,
-      "peak_mb": 543.0,
-      "matches_reference": false,
-      "token_match_rate": 1.0,
-      "sessions": 5,
-      "headline": "llama.cpp (b11912) decodes GPT-2 124M in f32 at 310 tokens per second on 4 cores, 2.3 times gpt2-fast's 133, while gpt2-fast processes prompts faster (1,107 vs 895 tokens per second).",
-      "journal": "docs/journal/N9-final-race.md"
-    },
-    {
-      "milestone": "N9-llamacpp-f16",
-      "title": "Final race: llama.cpp f16 (GGUF)",
-      "date": "2026-11-10",
-      "commit": "7fd55af",
-      "target": "cpu-linux",
-      "decode_tok_s": 393.32,
-      "prefill_tok_s": 839.2,
-      "ttft_ms": 75.8,
-      "peak_mb": 308.8,
-      "matches_reference": false,
-      "token_match_rate": 1.0,
-      "sessions": 5,
-      "headline": "llama.cpp with 16-bit weights decodes at 393 tokens per second and still matches every reference token.",
-      "journal": "docs/journal/N9-final-race.md"
-    },
-    {
-      "milestone": "N9-llamacpp-q8_0",
-      "title": "Final race: llama.cpp q8_0 (GGUF)",
-      "date": "2026-11-10",
-      "commit": "7fd55af",
-      "target": "cpu-linux",
-      "decode_tok_s": 541.1,
-      "prefill_tok_s": 3041.2,
-      "ttft_ms": 22.1,
-      "peak_mb": 281.4,
-      "matches_reference": false,
-      "token_match_rate": 0.2844,
-      "sessions": 5,
-      "headline": "llama.cpp q8_0 decodes at 541 tokens per second, 2.1 times gpt2-fast's int8, but keeps fewer reference tokens (182 of 640 against 297).",
-      "journal": "docs/journal/N9-final-race.md"
+      "perplexity_reference": 76.84,
+      "quantized": true
     }
-  ]
+  ],
+  "race": [
+    {
+      "id": "N9",
+      "label": "Original race",
+      "note": "N6 f32 and N7 int8 against llama.cpp on the same four cores.",
+      "rows": [
+        {
+          "label": "PyTorch",
+          "milestone": "R0-torch",
+          "decode_tok_s": 48.45,
+          "prefill_tok_s": 1010.5,
+          "ttft_ms": 63.3,
+          "token_match_rate": 1.0,
+          "matched_tokens": 640,
+          "tokens_total": 640,
+          "quantized": false
+        },
+        {
+          "label": "NumPy",
+          "milestone": "R0-numpy",
+          "decode_tok_s": 61.36,
+          "prefill_tok_s": 1167.1,
+          "ttft_ms": 53.3,
+          "token_match_rate": 1.0,
+          "matched_tokens": 640,
+          "tokens_total": 640,
+          "quantized": false
+        },
+        {
+          "label": "gpt2-fast f32",
+          "milestone": "N6",
+          "decode_tok_s": 132.57,
+          "prefill_tok_s": 1106.5,
+          "ttft_ms": 56.3,
+          "token_match_rate": 1.0,
+          "matched_tokens": 640,
+          "tokens_total": 640,
+          "quantized": false
+        },
+        {
+          "label": "gpt2-fast int8",
+          "milestone": "N7",
+          "decode_tok_s": 254.6,
+          "prefill_tok_s": 960.6,
+          "ttft_ms": 64.5,
+          "token_match_rate": 0.4641,
+          "matched_tokens": 297,
+          "tokens_total": 640,
+          "quantized": true
+        },
+        {
+          "label": "llama.cpp f32",
+          "milestone": "N9-llamacpp-f32",
+          "decode_tok_s": 310.01,
+          "prefill_tok_s": 895.0,
+          "ttft_ms": 71.1,
+          "token_match_rate": 1.0,
+          "matched_tokens": 640,
+          "tokens_total": 640,
+          "quantized": false
+        },
+        {
+          "label": "llama.cpp f16",
+          "milestone": "N9-llamacpp-f16",
+          "decode_tok_s": 393.32,
+          "prefill_tok_s": 839.2,
+          "ttft_ms": 75.8,
+          "token_match_rate": 1.0,
+          "matched_tokens": 640,
+          "tokens_total": 640,
+          "quantized": false
+        },
+        {
+          "label": "llama.cpp q8_0",
+          "milestone": "N9-llamacpp-q8_0",
+          "decode_tok_s": 541.1,
+          "prefill_tok_s": 3041.2,
+          "ttft_ms": 22.1,
+          "token_match_rate": 0.2844,
+          "matched_tokens": 182,
+          "tokens_total": 640,
+          "quantized": true
+        }
+      ]
+    }
+  ],
+  "sizes": [
+    {
+      "label": "124M",
+      "rows": [
+        {
+          "label": "PyTorch",
+          "milestone": "R0-torch",
+          "decode_tok_s": 48.45,
+          "prefill_tok_s": 1010.5,
+          "peak_mb": 1236.0,
+          "matches_reference": true,
+          "token_match_rate": 1.0
+        },
+        {
+          "label": "gpt2-fast f32",
+          "milestone": "N6",
+          "decode_tok_s": 132.57,
+          "prefill_tok_s": 1106.5,
+          "peak_mb": 560.1,
+          "matches_reference": true,
+          "token_match_rate": 1.0
+        },
+        {
+          "label": "gpt2-fast int8",
+          "milestone": "N7",
+          "decode_tok_s": 254.6,
+          "prefill_tok_s": 960.6,
+          "peak_mb": 206.6,
+          "matches_reference": false,
+          "token_match_rate": 0.4641,
+          "perplexity": 78.0
+        }
+      ]
+    },
+    {
+      "label": "355M (medium)",
+      "rows": [
+        {
+          "label": "PyTorch",
+          "milestone": "N8-gpt2-medium-torch",
+          "decode_tok_s": 23.11,
+          "prefill_tok_s": 406.1,
+          "peak_mb": 3017.7,
+          "matches_reference": true,
+          "token_match_rate": 1.0,
+          "perplexity": 51.697
+        },
+        {
+          "label": "gpt2-fast f32",
+          "milestone": "N8-gpt2-medium-f32",
+          "decode_tok_s": 29.56,
+          "prefill_tok_s": 123.2,
+          "peak_mb": 1579.8,
+          "matches_reference": true,
+          "token_match_rate": 1.0,
+          "perplexity": 51.691
+        },
+        {
+          "label": "gpt2-fast int8",
+          "milestone": "N8-gpt2-medium-int8",
+          "decode_tok_s": 100.86,
+          "prefill_tok_s": 297.6,
+          "peak_mb": 562.7,
+          "matches_reference": false,
+          "token_match_rate": 0.0938,
+          "perplexity": 52.929
+        }
+      ]
+    },
+    {
+      "label": "774M (large)",
+      "rows": [
+        {
+          "label": "PyTorch",
+          "milestone": "N8-gpt2-large-torch",
+          "decode_tok_s": 12.52,
+          "prefill_tok_s": 198.6,
+          "peak_mb": 6240.6,
+          "matches_reference": true,
+          "token_match_rate": 1.0,
+          "perplexity": 43.06
+        },
+        {
+          "label": "gpt2-fast f32",
+          "milestone": "N8-gpt2-large-f32",
+          "decode_tok_s": 16.03,
+          "prefill_tok_s": 71.8,
+          "peak_mb": 3336.3,
+          "matches_reference": true,
+          "token_match_rate": 1.0,
+          "perplexity": 43.054
+        },
+        {
+          "label": "gpt2-fast int8",
+          "milestone": "N8-gpt2-large-int8",
+          "decode_tok_s": 43.91,
+          "prefill_tok_s": 137.0,
+          "peak_mb": 1158.7,
+          "matches_reference": false,
+          "token_match_rate": 1.0,
+          "perplexity": 43.062
+        }
+      ]
+    },
+    {
+      "label": "1.5B (xl)",
+      "rows": [
+        {
+          "label": "PyTorch",
+          "milestone": "N8-gpt2-xl-torch",
+          "decode_tok_s": null,
+          "prefill_tok_s": null,
+          "peak_mb": null,
+          "matches_reference": false,
+          "token_match_rate": null,
+          "status": "oom"
+        },
+        {
+          "label": "gpt2-fast f32",
+          "milestone": "N8-gpt2-xl-f32",
+          "decode_tok_s": 7.79,
+          "prefill_tok_s": 37.2,
+          "peak_mb": 6633.4,
+          "matches_reference": true,
+          "token_match_rate": 1.0,
+          "perplexity": 27.882
+        },
+        {
+          "label": "gpt2-fast int8",
+          "milestone": "N8-gpt2-xl-int8",
+          "decode_tok_s": 15.08,
+          "prefill_tok_s": 42.6,
+          "peak_mb": 2195.2,
+          "matches_reference": false,
+          "token_match_rate": 0.9969,
+          "perplexity": 27.864
+        }
+      ]
+    }
+  ],
+  "web": []
 }

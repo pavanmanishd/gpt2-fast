@@ -1,8 +1,8 @@
 # web
 
 The browser build: the same engine, compiled to WebAssembly and run in a Web
-Worker, with an optional WebGPU backend that runs the forward pass in compute
-shaders. Weights are downloaded once and kept in the browser's Cache API.
+Worker, with a WebGPU backend that runs the forward pass in compute shaders.
+Weights are downloaded once and kept in the browser's Cache API.
 
 ## Website
 
@@ -11,9 +11,9 @@ framework, bundler, external JavaScript, web fonts or analytics.
 
 | File | Purpose |
 |---|---|
-| `index.html` | The site: hero and live demo, the device benchmark, the milestone chart and cards, the measurement notes, and the footer. |
-| `site.css` | Site styles, including the light and dark palettes. |
-| `site.js` | Site behaviour: worker lifecycle, streaming meter, device benchmark, chart and story rendering. |
+| `index.html` | The site: hero, live demo, device benchmark, the milestone story, the measurement notes, and the footer. |
+| `site.css` | Site styles, including the light and dark palettes and the narrow-screen table layout. |
+| `site.js` | Site behaviour: worker lifecycle, engine choice, streaming meter, device benchmark, charts and story rendering. |
 | `data/milestones.json` | Generated milestone data. Do not edit by hand. |
 | `dev.html` | The old development page, driven by `main.js`. |
 | `worker.js` | Shared Web Worker: loads weights, encodes text, generates and streams tokens. Used by the site, the dev page and the benchmark. |
@@ -22,17 +22,58 @@ framework, bundler, external JavaScript, web fonts or analytics.
 | `thread.js` | The pool worker for the threaded build: joins the engine's shared memory and runs its worker loop. |
 | `bench.html`, `bench.js` | The browser benchmark page. |
 | `serve.py` | Development server that sends the COOP/COEP headers `SharedArrayBuffer` requires. |
-| `sync_data.py` | Builds `data/milestones.json` from the repository. |
+| `sync_data.py` | Builds `data/milestones.json` from the results log, prompts and reference output. |
 
 The site never downloads the model on page load. On a first visit it shows a
 load button; after that the four model files are in the Cache API and later
-visits load them from cache without showing the button. The device section runs prompt
-`p064` for 64 new tokens, one warm-up and one timed run. Nothing from the page is
-sent anywhere.
+visits load them from cache without showing the button.
 
-All data comes from the same origin: `data/milestones.json`, the worker, the
-WebAssembly package and `/models/gpt2/`. The journal links use the `REPO_URL`
-constant at the top of `site.js`.
+### Engine choice
+
+The **Engine** control has three settings:
+
+- **Auto** asks the worker for a WebGPU adapter. If the worker gets a real
+  adapter it runs the WebGPU engine; otherwise it runs the CPU engine with
+  WebAssembly threads when the page is cross-origin isolated, or SIMD when it
+  is not. A browser without WebAssembly SIMD gets the scalar package.
+- **WebGPU** requests the compute-shader backend. If no adapter or no usable
+  device is available, the worker falls back to the CPU engine and the page
+  says why.
+- **CPU** uses the WebAssembly engine directly.
+
+The line under the demo always shows what actually ran, for example
+`WebGPU · apple metal-3`, `WebAssembly · 8 threads · SIMD` or
+`WebAssembly · SIMD · 1 thread`, next to the weights format and size.
+
+Changing the engine starts a fresh worker, but the weights stay in the Cache
+API: the worker reads them from cache, so a switch does not download them again.
+The weights are `models/gpt2/model-int8.safetensors`, int8, about 135 MB.
+
+The device benchmark runs prompt `p064` for 64 new tokens with one warm-up and
+one timed run on each engine the device supports: CPU first, then WebGPU if the
+worker gets an adapter. It shows decode speed, prompt speed and time to first
+token next to the project's own browser measurements for the same engine from
+`data/milestones.json`. Results stay in the tab; nothing is uploaded.
+
+### Story sections
+
+The story is rendered entirely from `data/milestones.json`:
+
+- **Native engine**: R0 references and the N1 to N11 steps for GPT-2 124M, with
+  a log-scale decode chart and one card per milestone. `-threadsN` lines are
+  shown in their parent's card. A line may carry `baseline`; when it does, the
+  card compares against that milestone instead of the previous card. int8 lines
+  are hatched and labelled, with token agreement and perplexity when recorded.
+- **The race**: the original N9 llama.cpp race against N6/N7, and the N12
+  rematch against N11/N11-int8 when those lines exist.
+- **Bigger models**: GPT-2 124M, 355M, 774M and 1.5B. Later N11 rows replace the
+  N8 gpt2-fast rows for the same model. A line with `status: "oom"` is marked
+  `did not fit in 8 GB`.
+- **In the browser**: the W1 to W4 headline runs and their variants, with a
+  small chart and cards. These are browser numbers from the development laptop,
+  not container numbers.
+
+Sections with no data in the log are not rendered.
 
 ## Refreshing the site data
 
@@ -42,16 +83,35 @@ After appending a milestone to `results/log.jsonl`:
 python3 web/sync_data.py
 ```
 
-The script uses only the Python standard library. It reads the `gpt2-124m`
-entries in `results/log.jsonl`, `bench/prompts.json` and
-`reference/expected.json`, and writes `web/data/milestones.json` in log order.
-The output contains:
+The script uses only the Python standard library:
+
+```sh
+python3 web/sync_data.py --log results/log.jsonl --out web/data/milestones.json
+```
+
+It reads `results/log.jsonl`, `bench/prompts.json` and
+`reference/expected.json`, and writes one object with:
 
 - `protocol`: host, cores, memory, sessions, runs per prompt, checked token
-  count, and the near-tie margin.
-- `device_bench`: the `p064` prompt text and the 64-token run parameters.
-- `milestones`: the fields the page renders, including perplexity fields when a
-  quantized run recorded them.
+  count, the near-tie margin and the closest margin in the prompt set.
+- `benchmark`: the `p064` prompt text and the 64-token device run parameters.
+- `weights`: the int8 file name, size and format.
+- `native`: the R0/N milestone cards in log order, including `baseline`,
+  `scaling` and perplexity fields when present.
+- `race`: race tables with the engines, decode, prompt speed, first token and
+  tokens matching the reference.
+- `sizes`: the four GPT-2 sizes with decode, prompt speed, peak memory,
+  perplexity and OOM status.
+- `web`: W1 to W4 with their variants, browser, target, weights, threads and
+  match fields.
+
+For local work, `?data=` selects another data file. It must be a same-origin
+relative path; anything else falls back to `./data/milestones.json`.
+
+```sh
+python3 web/serve.py --port 8000
+# http://localhost:8000/web/?data=./data/dev-milestones.json
+```
 
 ## Build
 
@@ -109,12 +169,14 @@ under a plain static server without the headers.
 
 ## WebGPU
 
-Add `?backend=webgpu` to the worker or benchmark URL to run the forward pass
-with WGSL compute shaders instead of WebAssembly. The worker still uses the
-WebAssembly engine to parse the safetensors file and to tokenize; the weights
-are uploaded to storage buffers once. Every layer runs on the GPU: the KV cache,
-activations and the chosen token id stay there, and only the token id is copied
-back after each step (the full logits are copied only for a `logits` request).
+The worker uses `?backend=webgpu` to run the forward pass with WGSL compute
+shaders instead of WebAssembly. The site's Engine control sets it; the page
+falls back to the CPU engine and reports the reason when no usable adapter is
+available. The worker still uses the WebAssembly engine to parse the
+safetensors file and to tokenize; the weights are uploaded to storage buffers
+once. Every layer runs on the GPU: the KV cache, activations and the chosen
+token id stay there, and only the token id is copied back after each step (the
+full logits are copied only for a `logits` request).
 
 `wte` is 154 MB at f32 and can exceed the adapter's default 128 MB storage
 binding limit, so the adapter's limits are requested and the table is split
@@ -126,8 +188,8 @@ the argmax pass can feed the next step's embedding without a round trip. Use
 If `navigator.gpu` is missing, no adapter is returned, the adapter is a
 software fallback, or the limits are too small, the worker builds the usual
 CPU engine and the ready message reports `backend: "cpu"` with a `fallback`
-reason. The benchmark session then records that the requested backend was
-WebGPU but the CPU one ran.
+reason. The site then shows the CPU engine and a plain explanation in place of
+the requested WebGPU run.
 
 ```sh
 uv run web/run_bench.py --label W4-chromium --browser chromium \
