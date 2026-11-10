@@ -1,0 +1,12 @@
+{
+  "label": "N5-threads3",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 103.74200126910613,
+  "prefill_tok_s": 685.7416933403221,
+  "ttft_ms": 92.948852,
+  "peak_mb": 560.44921875,
+  "matches_reference": true,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}

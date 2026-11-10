@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N5-threads3","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":103.742,"prefill_tok_s":685.742,"ttft_ms":92.949,"peak_mb":560.449,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N5-threads3/summary.json
