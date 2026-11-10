@@ -1,0 +1,8 @@
+{
+  "text": "reference/perplexity.txt",
+  "tokens": 1005,
+  "perplexity": 27.886239092171245,
+  "torch": "2.5.1",
+  "transformers": "4.46.3",
+  "platform": "macos-arm64 host (peak RSS 8.2 GB exceeds the 8 GB bench container)"
+}
