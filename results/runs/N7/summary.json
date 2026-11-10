@@ -1,0 +1,12 @@
+{
+  "label": "N7",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 254.59909152107824,
+  "prefill_tok_s": 960.595422671254,
+  "ttft_ms": 64.529785,
+  "peak_mb": 206.55859375,
+  "matches_reference": false,
+  "token_match_rate": 0.4640625,
+  "sessions": 5
+}

@@ -1,0 +1,7 @@
+{
+  "weights": "f32",
+  "tokens": 1005,
+  "perplexity": 76.83434664730862,
+  "reference_perplexity": 76.84307872137444,
+  "delta": -0.008732074065818551
+}

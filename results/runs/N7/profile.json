@@ -1,0 +1,53 @@
+{
+  "label": "N7",
+  "model": "gpt2",
+  "commit": "15e5389",
+  "started_at": "2026-11-10T00:05:58Z",
+  "host": {
+    "nproc": 4,
+    "cpu": "unknown",
+    "memory_limit": "8589934592",
+    "kernel": "7.2.9-orbstack-00391-g2b298d05fbd4"
+  },
+  "worker_cmd": [
+    "worker",
+    "--model-dir",
+    "models/gpt2",
+    "--weights",
+    "int8"
+  ],
+  "load_ms": 161.19952600000002,
+  "peak_mb": 200.31640625,
+  "warmup": 0,
+  "runs": 1,
+  "prompts": [
+    {
+      "id": "p064",
+      "n_prompt": 64,
+      "logit_max_abs_diff": 1.06201171875,
+      "matched_tokens": 36,
+      "total_tokens": 128,
+      "first_mismatch": 35,
+      "runs": [
+        {
+          "ttft_ms": 67.587214,
+          "prefill_tok_s": 946.9246653664404,
+          "decode_tok_s": 233.67668620287174,
+          "total_ms": 611.0731820000001,
+          "matches": false
+        }
+      ],
+      "medians": {
+        "decode_tok_s": 233.67668620287174,
+        "prefill_tok_s": 946.9246653664404,
+        "ttft_ms": 67.587214
+      }
+    }
+  ],
+  "session_medians": {
+    "decode_tok_s": 233.67668620287174,
+    "prefill_tok_s": 946.9246653664404,
+    "ttft_ms": 67.587214
+  },
+  "matches_reference": false
+}
