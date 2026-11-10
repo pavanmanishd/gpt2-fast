@@ -83,9 +83,19 @@ def fit_size(text, start, width_in=7.25):
     return size
 
 
+def quantized(row):
+    return row["milestone"].endswith("-int8") or row["token_match_rate"] < 1.0
+
+
+def names_int8(row):
+    # shortening can cut a parenthetical short ("8-bit weights (int8"); don't count that
+    title = re.sub(r"\([^)]*$", "", short_title(row["title"])).lower()
+    return row["milestone"].endswith("-int8") or "int8" in title
+
+
 def label(row):
     text = f"{row['milestone']} · {short_title(row['title'])}"
-    if row["token_match_rate"] < 1.0:
+    if quantized(row) and not names_int8(row):
         text += " (int8)"
     return text
 
@@ -154,7 +164,7 @@ def progress(log_path, out_dir):
     bars = ax.barh(y, widths, left=base, height=0.6, color=colors,
                    edgecolor=TEXT, linewidth=0)
     for bar, row in zip(bars, rows):
-        if row["token_match_rate"] < 1.0:
+        if quantized(row):
             bar.set_hatch("////")
 
     for yi, value in zip(y, values):
@@ -194,19 +204,28 @@ def step(name, log_path, out_dir):
     if current is None:
         raise SystemExit(f"milestone {name!r} not found in {display_path(log_path)}")
 
-    index = rows.index(current)
-    previous = next(
-        (row for row in reversed(rows[:index])
-         if engine(row) == DEFAULT_ENGINE and row["milestone"].startswith("N")
-         and "-threads" not in row["milestone"]),
-        None,
-    )
-    if previous is None:
+    if "baseline" in current:
+        baseline = current["baseline"]
+        previous = next((row for row in rows if row["milestone"] == baseline), None)
+        if previous is None:
+            raise SystemExit(
+                f"baseline {baseline!r} of {name} not found in "
+                f"{display_path(log_path)}"
+            )
+    else:
+        index = rows.index(current)
         previous = next(
-            (row for row in rows[:index] if row["milestone"] == "R0-torch"), None
+            (row for row in reversed(rows[:index])
+             if engine(row) == DEFAULT_ENGINE and row["milestone"].startswith("N")
+             and "-threads" not in row["milestone"]),
+            None,
         )
-    if previous is None:
-        raise SystemExit(f"no earlier milestone to compare with {name}")
+        if previous is None:
+            previous = next(
+                (row for row in rows[:index] if row["milestone"] == "R0-torch"), None
+            )
+        if previous is None:
+            raise SystemExit(f"no earlier milestone to compare with {name}")
 
     ratio = current["decode_tok_s"] / previous["decode_tok_s"]
     if ratio >= 1:
@@ -259,34 +278,38 @@ def step(name, log_path, out_dir):
     finish(fig, out_dir, f"step-{name}.png")
 
 
-def race(log_path, out_dir):
+def race(log_path, out_dir, f32="N6", int8="N7", llamacpp="N9-llamacpp",
+         name="race"):
     rows = [row for row in load_rows(log_path) if is_124m(row)]
     by_milestone = {row["milestone"]: row for row in rows}
-    ours = [
-        row for row in rows
-        if engine(row) == DEFAULT_ENGINE and not row["milestone"].startswith("R0")
-    ]
-    exact = next(
-        (row for row in reversed(ours) if row["token_match_rate"] == 1.0), None
-    )
-    approx = next(
-        (row for row in reversed(ours) if row["token_match_rate"] < 1.0), None
-    )
+
+    def pick(milestone):
+        row = by_milestone.get(milestone)
+        if row is None:
+            raise SystemExit(
+                f"milestone {milestone!r} not found in {display_path(log_path)}"
+            )
+        return row
 
     entries = []
-    for row, name, color in (
+    for row, caption, color in (
         (by_milestone.get("R0-torch"), "PyTorch", GRAY),
         (by_milestone.get("R0-numpy"), "NumPy", GRAY),
-        (by_milestone.get("N9-llamacpp-f32"), "llama.cpp f32", ORANGE),
-        (exact, "gpt2-fast f32", BLUE),
-        (by_milestone.get("N9-llamacpp-f16"), "llama.cpp f16", ORANGE),
-        (by_milestone.get("N9-llamacpp-q8_0"), "llama.cpp q8_0", ORANGE),
-        (approx, "gpt2-fast int8", BLUE),
+        (by_milestone.get(f"{llamacpp}-f32"), "llama.cpp f32", ORANGE),
+        (pick(f32), "gpt2-fast f32", BLUE),
+        (by_milestone.get(f"{llamacpp}-f16"), "llama.cpp f16", ORANGE),
+        (by_milestone.get(f"{llamacpp}-q8_0"), "llama.cpp q8_0", ORANGE),
+        (pick(int8), "gpt2-fast int8", BLUE),
     ):
         if row is None:
             continue
-        display = f"{name} ({row['milestone']})" if name.startswith("gpt2-fast") else name
-        entries.append({"label": display, "name": name, "row": row, "color": color})
+        display = (
+            f"{caption} ({row['milestone']})" if caption.startswith("gpt2-fast")
+            else caption
+        )
+        entries.append(
+            {"label": display, "name": caption, "row": row, "color": color}
+        )
 
     if not entries:
         raise SystemExit(f"no race results in {display_path(log_path)}")
@@ -346,7 +369,7 @@ def race(log_path, out_dir):
         f"{host} ·\nexact-match rows first, then 16-bit and 8-bit rows",
         source=source,
     )
-    finish(fig, out_dir, "race.png")
+    finish(fig, out_dir, f"{name}.png")
 
 
 def sizes(log_path, out_dir):
@@ -471,7 +494,18 @@ def main():
     sub.add_parser("progress", help="one bar per milestone")
     step_parser = sub.add_parser("step", help="before/after card for one milestone")
     step_parser.add_argument("milestone")
-    sub.add_parser("race", help="gpt2-fast against llama.cpp and the references")
+    race_parser = sub.add_parser(
+        "race", help="gpt2-fast against llama.cpp and the references"
+    )
+    race_parser.add_argument("--f32", default="N6", metavar="MILESTONE",
+                             help="gpt2-fast f32 row (default: N6)")
+    race_parser.add_argument("--int8", default="N7", metavar="MILESTONE",
+                             help="gpt2-fast int8 row (default: N7)")
+    race_parser.add_argument("--llamacpp", default="N9-llamacpp",
+                             metavar="PREFIX",
+                             help="llama.cpp milestone prefix (default: N9-llamacpp)")
+    race_parser.add_argument("--name", default="race", metavar="STEM",
+                             help="output file stem (default: race)")
     sub.add_parser("sizes", help="decode speed at four model sizes")
     args = parser.parse_args()
 
@@ -482,7 +516,8 @@ def main():
     elif args.command == "sizes":
         sizes(args.log, args.out)
     else:
-        race(args.log, args.out)
+        race(args.log, args.out, f32=args.f32, int8=args.int8,
+             llamacpp=args.llamacpp, name=args.name)
 
 
 if __name__ == "__main__":
