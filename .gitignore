@@ -7,4 +7,5 @@ __pycache__/
 node_modules/
 web/dist/
 web/pkg/
+web/pkg-nosimd/
 .DS_Store

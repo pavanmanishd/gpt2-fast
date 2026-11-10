@@ -3,6 +3,11 @@ use wasm_bindgen::prelude::*;
 use gpt2_engine::{Model, Tokenizer, Weights};
 
 #[wasm_bindgen]
+pub fn simd_enabled() -> bool {
+    cfg!(all(target_arch = "wasm32", target_feature = "simd128"))
+}
+
+#[wasm_bindgen]
 pub struct Engine {
     model: Model,
     tokenizer: Tokenizer,

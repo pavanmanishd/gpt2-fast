@@ -1,11 +1,17 @@
 const params = new URLSearchParams(location.search);
 const WEIGHTS = params.get("weights") === "f32" ? "f32" : "int8";
+const PKG = params.get("pkg") === "pkg-nosimd" ? "pkg-nosimd" : "pkg";
+const BROWSER = {
+  name: params.get("browser") ?? "unknown",
+  version: params.get("browser_version") ?? browserVersion(),
+};
 const WARMUP = 1;
 const RUNS = 5;
 
-const worker = new Worker(new URL("./worker.js", import.meta.url), {
-  type: "module",
-});
+const worker = new Worker(
+  new URL(`./worker.js?pkg=${PKG}`, import.meta.url),
+  { type: "module" },
+);
 
 const statusLine = document.getElementById("status");
 const rows = document.getElementById("rows");
@@ -116,6 +122,13 @@ function maxAbsDiff(left, right) {
   return max;
 }
 
+function browserVersion() {
+  const match = navigator.userAgent.match(
+    /(?:Firefox|Chrome|Version)\/(\d+(?:\.\d+)*)/,
+  );
+  return match ? match[1] : "unknown";
+}
+
 function compareTokens(actual, expected) {
   let matched = 0;
   let firstMismatch = null;
@@ -194,6 +207,7 @@ async function main() {
   ]);
 
   const startedAt = new Date();
+  const target = readyMessage.simd ? "wasm-simd" : "wasm";
   const maxNewTokens = prompts.max_new_tokens;
   const promptSessions = [];
   let matchesReference = true;
@@ -278,11 +292,14 @@ async function main() {
   };
 
   const session = {
-    label: `wasm-${WEIGHTS}`,
+    label: `${target}-${WEIGHTS}`,
     model: expected.model,
     commit: "unknown",
     started_at: startedAt.toISOString(),
-    target: "wasm",
+    target,
+    browser: BROWSER,
+    pkg: PKG,
+    weights: WEIGHTS,
     host: {
       nproc: navigator.hardwareConcurrency || 1,
       cpu: navigator.userAgent,
@@ -290,8 +307,9 @@ async function main() {
         ? `${navigator.deviceMemory} GB`
         : "unknown",
       kernel: navigator.platform || "unknown",
+      user_agent: navigator.userAgent,
     },
-    worker_cmd: ["browser", `weights=${WEIGHTS}`],
+    worker_cmd: ["browser", `weights=${WEIGHTS}`, `pkg=${PKG}`],
     load_ms: readyMessage.loadMs,
     peak_mb: null,
     warmup: WARMUP,

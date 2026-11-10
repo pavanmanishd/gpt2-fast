@@ -1,9 +1,13 @@
-import init, { Engine } from "./pkg/gpt2_web.js";
-
 const MODEL_BASE_URL = "/models/gpt2/";
-const CACHE_NAME = "gpt2-weights-v1";
+const CACHE_NAME = "gpt2-weights-v2";
+const CHUNK_BYTES = 64 * 1024 * 1024;
 const TEXT_DECODER = new TextDecoder();
+const PARAMS = new URL(self.location.href).searchParams;
+const PKG = PARAMS.get("pkg") === "pkg-nosimd" ? "pkg-nosimd" : "pkg";
 
+let init = null;
+let Engine = null;
+let binding = null;
 let engine = null;
 
 self.onmessage = async (event) => {
@@ -60,6 +64,11 @@ async function load(weights) {
     files[names[index]] = await readFile(names[index], index, names.length);
   }
 
+  if (binding === null) {
+    binding = await import(`./${PKG}/gpt2_web.js`);
+    init = binding.default;
+    Engine = binding.Engine;
+  }
   await init();
   const buildStart = performance.now();
   engine = new Engine(
@@ -72,6 +81,8 @@ async function load(weights) {
   self.postMessage({
     type: "ready",
     weights,
+    pkg: PKG,
+    simd: binding.simd_enabled(),
     loadMs: performance.now() - started,
     buildMs: performance.now() - buildStart,
   });
@@ -92,26 +103,69 @@ async function readFile(name, index, count) {
 
   if ("caches" in self) {
     const cache = await caches.open(CACHE_NAME);
-    const cached = await cache.match(url);
-    if (cached) {
-      const bytes = new Uint8Array(await cached.arrayBuffer());
+    const bytes = await readCached(cache, url);
+    if (bytes) {
       progress(bytes.byteLength, bytes.byteLength, true);
       return bytes;
     }
-    const bytes = await download(url, progress);
-    await cache.put(
-      url,
-      new Response(bytes, {
-        headers: {
-          "Content-Type": "application/octet-stream",
-          "Content-Length": String(bytes.byteLength),
-        },
-      }),
-    );
-    return bytes;
+    const downloaded = await download(url, progress);
+    await writeCached(cache, url, downloaded);
+    return downloaded;
   }
 
   return readFileFromOpfs(url, name, progress);
+}
+
+function partUrl(url, part) {
+  const key = new URL(url);
+  key.search = `part=${part}`;
+  return key.href;
+}
+
+async function readCached(cache, url) {
+  const manifestResponse = await cache.match(partUrl(url, "manifest"));
+  if (!manifestResponse) {
+    return null;
+  }
+  const manifest = await manifestResponse.json();
+  const bytes = new Uint8Array(manifest.bytes);
+  let offset = 0;
+  for (let part = 0; part < manifest.parts; part += 1) {
+    const response = await cache.match(partUrl(url, part));
+    if (!response) {
+      return null;
+    }
+    const chunk = new Uint8Array(await response.arrayBuffer());
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return offset === bytes.byteLength ? bytes : null;
+}
+
+async function writeCached(cache, url, bytes) {
+  const parts = Math.max(1, Math.ceil(bytes.byteLength / CHUNK_BYTES));
+  for (let part = 0; part < parts; part += 1) {
+    const start = part * CHUNK_BYTES;
+    const chunk = bytes.subarray(
+      start,
+      Math.min(start + CHUNK_BYTES, bytes.byteLength),
+    );
+    await cache.put(
+      partUrl(url, part),
+      new Response(chunk, {
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": String(chunk.byteLength),
+        },
+      }),
+    );
+  }
+  await cache.put(
+    partUrl(url, "manifest"),
+    new Response(JSON.stringify({ parts, bytes: bytes.byteLength }), {
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
 }
 
 async function readFileFromOpfs(url, name, progress) {

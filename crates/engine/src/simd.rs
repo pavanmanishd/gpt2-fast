@@ -734,7 +734,768 @@ mod neon {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wasm {
+    use std::arch::wasm32::*;
+    use std::ops::Range;
+    use std::ptr;
+
+    use super::{gelu, Epilogue};
+
+    // SAFETY: `ptr` points to at least four readable f32 values.
+    #[inline]
+    unsafe fn load(ptr: *const f32) -> v128 {
+        ptr::read_unaligned(ptr.cast())
+    }
+
+    // SAFETY: `ptr` points to at least four writable f32 values.
+    #[inline]
+    unsafe fn store(ptr: *mut f32, value: v128) {
+        ptr::write_unaligned(ptr.cast(), value);
+    }
+
+    #[inline]
+    fn splat<const LANE: usize>(value: v128) -> v128 {
+        f32x4_splat(f32x4_extract_lane::<LANE>(value))
+    }
+
+    #[inline]
+    fn horizontal_sum(value: v128) -> f32 {
+        f32x4_extract_lane::<0>(value)
+            + f32x4_extract_lane::<1>(value)
+            + f32x4_extract_lane::<2>(value)
+            + f32x4_extract_lane::<3>(value)
+    }
+
+    #[inline]
+    fn multiply_add(target: v128, left: v128, right: v128) -> v128 {
+        f32x4_add(target, f32x4_mul(left, right))
+    }
+
+    // SAFETY: `ptr` points to at least eight readable i8 values.
+    #[inline]
+    unsafe fn widen8(ptr: *const i8) -> [v128; 2] {
+        let raw = ptr::read_unaligned(ptr.cast::<u64>()) as i64;
+        let bytes = i64x2_replace_lane::<0>(i64x2_splat(0), raw);
+        let low = i16x8_extend_low_i8x16(bytes);
+        [
+            f32x4_convert_i32x4(i32x4_extend_low_i16x8(low)),
+            f32x4_convert_i32x4(i32x4_extend_high_i16x8(low)),
+        ]
+    }
+
+    struct Linear<'a> {
+        x: &'a [f32],
+        weight: &'a [f32],
+        bias: &'a [f32],
+        n_in: usize,
+        n_out: usize,
+        first_column: usize,
+        columns: usize,
+    }
+
+    impl Linear<'_> {
+        // SAFETY: `i + R <= rows`, `j + V * 4 <= first_column + columns`, `y` has
+        // `rows * columns` elements, and all slices are sized for `rows * n_in`,
+        // `n_in * n_out` and `rows * n_out` elements.
+        #[allow(clippy::needless_range_loop)]
+        unsafe fn block<const R: usize, const V: usize, const GELU: bool>(
+            &self,
+            i: usize,
+            j: usize,
+            y: &mut [f32],
+        ) {
+            let x = self.x.as_ptr();
+            let weight = self.weight.as_ptr();
+            let bias = self.bias.as_ptr();
+            let n_in = self.n_in;
+            let n_out = self.n_out;
+            let mut acc = [[f32x4_splat(0.0); V]; R];
+
+            let mut p = 0;
+            while p + 4 <= n_in {
+                let mut xv = [f32x4_splat(0.0); R];
+                for (r, value) in xv.iter_mut().enumerate() {
+                    *value = load(x.add((i + r) * n_in + p));
+                }
+                for c in 0..V {
+                    let w = weight.add(p * n_out + j + c * 4);
+                    for (r, values) in xv.iter().enumerate() {
+                        acc[r][c] = multiply_add(acc[r][c], splat::<0>(*values), load(w));
+                        acc[r][c] =
+                            multiply_add(acc[r][c], splat::<1>(*values), load(w.add(n_out)));
+                        acc[r][c] =
+                            multiply_add(acc[r][c], splat::<2>(*values), load(w.add(2 * n_out)));
+                        acc[r][c] =
+                            multiply_add(acc[r][c], splat::<3>(*values), load(w.add(3 * n_out)));
+                    }
+                }
+                p += 4;
+            }
+            while p < n_in {
+                for r in 0..R {
+                    let a = f32x4_splat(*x.add((i + r) * n_in + p));
+                    for c in 0..V {
+                        let w = load(weight.add(p * n_out + j + c * 4));
+                        acc[r][c] = multiply_add(acc[r][c], a, w);
+                    }
+                }
+                p += 1;
+            }
+
+            for r in 0..R {
+                let row = (i + r) * self.columns + j - self.first_column;
+                let out = y.as_mut_ptr().add(row);
+                for (c, accumulated) in acc[r].iter().enumerate() {
+                    let value = f32x4_add(*accumulated, load(bias.add(j + c * 4)));
+                    let out = out.add(c * 4);
+                    if GELU {
+                        let mut lanes = [0.0; 4];
+                        store(lanes.as_mut_ptr(), value);
+                        for (offset, lane) in lanes.into_iter().enumerate() {
+                            *out.add(offset) = gelu(lane);
+                        }
+                    } else {
+                        store(out, value);
+                    }
+                }
+            }
+        }
+
+        fn block_rows<const R: usize, const V: usize, const GELU: bool>(
+            &self,
+            i: usize,
+            y: &mut [f32],
+        ) {
+            let end = self.first_column + self.columns;
+            let mut j = self.first_column;
+            while j + V * 4 <= end {
+                // SAFETY: the loop condition guarantees `i + R <= rows`.
+                unsafe { self.block::<R, V, GELU>(i, j, y) };
+                j += V * 4;
+            }
+            if j < end {
+                self.edge_columns::<R, GELU>(i, j, y);
+            }
+        }
+
+        fn edge_columns<const R: usize, const GELU: bool>(
+            &self,
+            i: usize,
+            j: usize,
+            y: &mut [f32],
+        ) {
+            for r in 0..R {
+                for column in j..self.first_column + self.columns {
+                    let mut sum = 0.0;
+                    for p in 0..self.n_in {
+                        sum +=
+                            self.x[(i + r) * self.n_in + p] * self.weight[p * self.n_out + column];
+                    }
+                    let value = sum + self.bias[column];
+                    y[(i + r) * self.columns + column - self.first_column] =
+                        if GELU { gelu(value) } else { value };
+                }
+            }
+        }
+    }
+
+    fn tiled<const R: usize, const V: usize, const GELU: bool>(
+        x: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        y: &mut [f32],
+    ) {
+        let kernel = Linear {
+            x,
+            weight,
+            bias,
+            n_in,
+            n_out,
+            first_column: 0,
+            columns: n_out,
+        };
+        let mut i = 0;
+        while i < rows {
+            let remaining = rows - i;
+            if remaining >= R {
+                kernel.block_rows::<R, V, GELU>(i, y);
+                i += R;
+            } else if remaining >= 4 {
+                kernel.block_rows::<4, V, GELU>(i, y);
+                i += 4;
+            } else if remaining >= 2 {
+                kernel.block_rows::<2, V, GELU>(i, y);
+                i += 2;
+            } else {
+                kernel.block_rows::<1, V, GELU>(i, y);
+                i += 1;
+            }
+        }
+    }
+
+    // Row slices of a multi-row matrix must stay on the 8-column kernel; the
+    // rows == 1 kernel widens to 32 columns and rounds differently on the edge.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_rows(
+        x: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        y: &mut [f32],
+        epilogue: Epilogue,
+    ) {
+        match epilogue {
+            Epilogue::Store => tiled::<4, 2, false>(x, weight, bias, rows, n_in, n_out, y),
+            Epilogue::Gelu => tiled::<4, 2, true>(x, weight, bias, rows, n_in, n_out, y),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_columns(
+        x: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        n_in: usize,
+        n_out: usize,
+        columns: Range<usize>,
+        y: &mut [f32],
+        epilogue: Epilogue,
+    ) {
+        assert!(
+            columns.start.is_multiple_of(32),
+            "column split is not aligned to the vector block"
+        );
+        let kernel = Linear {
+            x,
+            weight,
+            bias,
+            n_in,
+            n_out,
+            first_column: columns.start,
+            columns: columns.len(),
+        };
+        match epilogue {
+            Epilogue::Store => kernel.block_rows::<1, 8, false>(0, y),
+            Epilogue::Gelu => kernel.block_rows::<1, 8, true>(0, y),
+        }
+    }
+
+    struct Int8Linear<'a> {
+        x: &'a [f32],
+        weight: &'a [i8],
+        scale: &'a [f32],
+        bias: &'a [f32],
+        n_in: usize,
+        n_out: usize,
+        first_column: usize,
+        columns: usize,
+        group: usize,
+    }
+
+    impl Int8Linear<'_> {
+        // SAFETY: `i + R <= rows`, `j + V * 8 <= first_column + columns`, `y`
+        // has `rows * columns` elements, and all slices are sized for
+        // `rows * n_in`, `n_in * n_out` and `rows * n_out` elements.
+        #[allow(clippy::needless_range_loop)]
+        unsafe fn block<const R: usize, const V: usize, const GELU: bool>(
+            &self,
+            i: usize,
+            j: usize,
+            y: &mut [f32],
+        ) {
+            let x = self.x.as_ptr();
+            let weight = self.weight.as_ptr();
+            let scale = self.scale.as_ptr();
+            let bias = self.bias.as_ptr();
+            let n_in = self.n_in;
+            let n_out = self.n_out;
+            let group = self.group;
+            let mut total = [[[f32x4_splat(0.0); 2]; R]; V];
+
+            let mut p = 0;
+            while p < n_in {
+                let group_end = (p / group * group + group).min(n_in);
+                let scale_row = p / group * n_out;
+                let mut acc = [[[f32x4_splat(0.0); 2]; R]; V];
+                while p + 4 <= group_end {
+                    let mut xv = [f32x4_splat(0.0); R];
+                    for (r, value) in xv.iter_mut().enumerate() {
+                        *value = load(x.add((i + r) * n_in + p));
+                    }
+                    for c in 0..V {
+                        let column = j + c * 8;
+                        let w0 = widen8(weight.add(p * n_out + column));
+                        let w1 = widen8(weight.add((p + 1) * n_out + column));
+                        let w2 = widen8(weight.add((p + 2) * n_out + column));
+                        let w3 = widen8(weight.add((p + 3) * n_out + column));
+                        for (r, values) in xv.iter().enumerate() {
+                            for k in 0..2 {
+                                acc[c][r][k] =
+                                    multiply_add(acc[c][r][k], splat::<0>(*values), w0[k]);
+                                acc[c][r][k] =
+                                    multiply_add(acc[c][r][k], splat::<1>(*values), w1[k]);
+                                acc[c][r][k] =
+                                    multiply_add(acc[c][r][k], splat::<2>(*values), w2[k]);
+                                acc[c][r][k] =
+                                    multiply_add(acc[c][r][k], splat::<3>(*values), w3[k]);
+                            }
+                        }
+                    }
+                    p += 4;
+                }
+                while p < group_end {
+                    for r in 0..R {
+                        let a = f32x4_splat(*x.add((i + r) * n_in + p));
+                        for c in 0..V {
+                            let w = widen8(weight.add(p * n_out + j + c * 8));
+                            for k in 0..2 {
+                                acc[c][r][k] = multiply_add(acc[c][r][k], a, w[k]);
+                            }
+                        }
+                    }
+                    p += 1;
+                }
+
+                for c in 0..V {
+                    for r in 0..R {
+                        for k in 0..2 {
+                            let column = scale_row + j + c * 8 + k * 4;
+                            total[c][r][k] =
+                                multiply_add(total[c][r][k], acc[c][r][k], load(scale.add(column)));
+                        }
+                    }
+                }
+            }
+
+            for c in 0..V {
+                for r in 0..R {
+                    let row = (i + r) * self.columns + j + c * 8 - self.first_column;
+                    let out = y.as_mut_ptr().add(row);
+                    for k in 0..2 {
+                        let column = j + c * 8 + k * 4;
+                        let value = f32x4_add(total[c][r][k], load(bias.add(column)));
+                        let out = out.add(k * 4);
+                        if GELU {
+                            let mut lanes = [0.0; 4];
+                            store(lanes.as_mut_ptr(), value);
+                            for (offset, lane) in lanes.into_iter().enumerate() {
+                                *out.add(offset) = gelu(lane);
+                            }
+                        } else {
+                            store(out, value);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn block_rows<const R: usize, const V: usize, const GELU: bool>(
+            &self,
+            i: usize,
+            y: &mut [f32],
+        ) {
+            let end = self.first_column + self.columns;
+            let mut j = self.first_column;
+            while j + V * 8 <= end {
+                // SAFETY: the loop condition guarantees `i + R <= rows`.
+                unsafe { self.block::<R, V, GELU>(i, j, y) };
+                j += V * 8;
+            }
+            if j < end {
+                self.edge_columns::<R, GELU>(i, j, y);
+            }
+        }
+
+        fn edge_columns<const R: usize, const GELU: bool>(
+            &self,
+            i: usize,
+            j: usize,
+            y: &mut [f32],
+        ) {
+            for r in 0..R {
+                for column in j..self.first_column + self.columns {
+                    let mut sum = 0.0;
+                    let mut p = 0;
+                    while p < self.n_in {
+                        let end = (p / self.group * self.group + self.group).min(self.n_in);
+                        let mut partial = 0.0;
+                        for q in p..end {
+                            partial += self.x[(i + r) * self.n_in + q]
+                                * self.weight[q * self.n_out + column] as f32;
+                        }
+                        sum += partial * self.scale[p / self.group * self.n_out + column];
+                        p = end;
+                    }
+                    let value = sum + self.bias[column];
+                    y[(i + r) * self.columns + column - self.first_column] =
+                        if GELU { gelu(value) } else { value };
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn int8_tiled<const R: usize, const V: usize, const GELU: bool>(
+        x: &[f32],
+        weight: &[i8],
+        scale: &[f32],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        y: &mut [f32],
+        group: usize,
+    ) {
+        let kernel = Int8Linear {
+            x,
+            weight,
+            scale,
+            bias,
+            n_in,
+            n_out,
+            first_column: 0,
+            columns: n_out,
+            group,
+        };
+        let mut i = 0;
+        while i < rows {
+            let remaining = rows - i;
+            if remaining >= R {
+                kernel.block_rows::<R, V, GELU>(i, y);
+                i += R;
+            } else if remaining >= 4 {
+                kernel.block_rows::<4, V, GELU>(i, y);
+                i += 4;
+            } else if remaining >= 2 {
+                kernel.block_rows::<2, V, GELU>(i, y);
+                i += 2;
+            } else {
+                kernel.block_rows::<1, V, GELU>(i, y);
+                i += 1;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn int8_linear_rows(
+        x: &[f32],
+        weight: &[i8],
+        scale: &[f32],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        y: &mut [f32],
+        epilogue: Epilogue,
+        group: usize,
+    ) {
+        match epilogue {
+            Epilogue::Store => {
+                int8_tiled::<4, 1, false>(x, weight, scale, bias, rows, n_in, n_out, y, group)
+            }
+            Epilogue::Gelu => {
+                int8_tiled::<4, 1, true>(x, weight, scale, bias, rows, n_in, n_out, y, group)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn int8_linear_columns(
+        x: &[f32],
+        weight: &[i8],
+        scale: &[f32],
+        bias: &[f32],
+        n_in: usize,
+        n_out: usize,
+        columns: Range<usize>,
+        y: &mut [f32],
+        epilogue: Epilogue,
+        group: usize,
+    ) {
+        assert!(
+            columns.start.is_multiple_of(32),
+            "column split is not aligned to the vector block"
+        );
+        let kernel = Int8Linear {
+            x,
+            weight,
+            scale,
+            bias,
+            n_in,
+            n_out,
+            first_column: columns.start,
+            columns: columns.len(),
+            group,
+        };
+        match epilogue {
+            Epilogue::Store => kernel.block_rows::<1, 2, false>(0, y),
+            Epilogue::Gelu => kernel.block_rows::<1, 2, true>(0, y),
+        }
+    }
+
+    pub(crate) fn int8_dot(x: &[f32], weight: &[i8], scale: &[f32], group: usize) -> f32 {
+        assert_eq!(x.len(), weight.len(), "dot product needs equal lengths");
+        let n = x.len();
+        let x = x.as_ptr();
+        let weight = weight.as_ptr();
+
+        // SAFETY: every load stays within `0..n`, and the scalar tail handles the rest.
+        unsafe {
+            let mut total = 0.0;
+            let mut p = 0;
+            while p < n {
+                let group_start = p / group * group;
+                let group_end = (group_start + group).min(n);
+                let mut acc = [f32x4_splat(0.0); 8];
+                while p + 32 <= group_end {
+                    let g0 = widen8(weight.add(p));
+                    let g1 = widen8(weight.add(p + 8));
+                    let g2 = widen8(weight.add(p + 16));
+                    let g3 = widen8(weight.add(p + 24));
+                    for k in 0..2 {
+                        acc[k] = multiply_add(acc[k], g0[k], load(x.add(p + k * 4)));
+                        acc[2 + k] = multiply_add(acc[2 + k], g1[k], load(x.add(p + 8 + k * 4)));
+                        acc[4 + k] = multiply_add(acc[4 + k], g2[k], load(x.add(p + 16 + k * 4)));
+                        acc[6 + k] = multiply_add(acc[6 + k], g3[k], load(x.add(p + 24 + k * 4)));
+                    }
+                    p += 32;
+                }
+                while p + 16 <= group_end {
+                    let g0 = widen8(weight.add(p));
+                    let g1 = widen8(weight.add(p + 8));
+                    for k in 0..2 {
+                        acc[k] = multiply_add(acc[k], g0[k], load(x.add(p + k * 4)));
+                        acc[2 + k] = multiply_add(acc[2 + k], g1[k], load(x.add(p + 8 + k * 4)));
+                    }
+                    p += 16;
+                }
+                let pairs = f32x4_add(
+                    f32x4_add(f32x4_add(acc[0], acc[1]), f32x4_add(acc[2], acc[3])),
+                    f32x4_add(f32x4_add(acc[4], acc[5]), f32x4_add(acc[6], acc[7])),
+                );
+                let mut sum = horizontal_sum(pairs);
+                while p < group_end {
+                    sum += *x.add(p) * *weight.add(p) as f32;
+                    p += 1;
+                }
+                total += sum * *scale.get_unchecked(group_start / group);
+            }
+            total
+        }
+    }
+
+    pub(crate) fn weighted_sum(values: &[f32], stride: usize, weights: &[f32], output: &mut [f32]) {
+        let width = output.len();
+        assert!(width <= stride, "output is wider than the value stride");
+        assert!(
+            values.len() >= weights.len().saturating_sub(1) * stride + width,
+            "values are shorter than the weighted sum needs"
+        );
+
+        let values = values.as_ptr();
+        let mut offset = 0;
+        while offset + 32 <= width {
+            // SAFETY: `offset + 32 <= width <= stride`, so each row read is inside
+            // `values`, and `output` has `width >= offset + 32` elements.
+            unsafe {
+                let mut acc = [f32x4_splat(0.0); 8];
+                for (past, &weight) in weights.iter().enumerate() {
+                    let row = values.add(past * stride + offset);
+                    let weight = f32x4_splat(weight);
+                    for (c, acc_c) in acc.iter_mut().enumerate() {
+                        *acc_c = multiply_add(*acc_c, weight, load(row.add(c * 4)));
+                    }
+                }
+                for (c, acc_c) in acc.iter().enumerate() {
+                    store(output.as_mut_ptr().add(offset + c * 4), *acc_c);
+                }
+            }
+            offset += 32;
+        }
+        while offset < width {
+            let mut sum = 0.0;
+            for (past, &weight) in weights.iter().enumerate() {
+                // SAFETY: `offset < width <= stride` and the input length check above.
+                sum += weight * unsafe { *values.add(past * stride + offset) };
+            }
+            output[offset] = sum;
+            offset += 1;
+        }
+    }
+
+    pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "dot product needs equal lengths");
+        let n = a.len();
+        let a = a.as_ptr();
+        let b = b.as_ptr();
+
+        // SAFETY: every load stays within `0..n`, and the scalar tail handles the rest.
+        unsafe {
+            let mut acc = [f32x4_splat(0.0); 8];
+            let mut i = 0;
+            while i + 32 <= n {
+                for (k, acc_k) in acc.iter_mut().enumerate() {
+                    *acc_k = multiply_add(*acc_k, load(a.add(i + k * 4)), load(b.add(i + k * 4)));
+                }
+                i += 32;
+            }
+            let pairs = f32x4_add(
+                f32x4_add(f32x4_add(acc[0], acc[1]), f32x4_add(acc[2], acc[3])),
+                f32x4_add(f32x4_add(acc[4], acc[5]), f32x4_add(acc[6], acc[7])),
+            );
+            let mut sum = horizontal_sum(pairs);
+            while i < n {
+                sum += *a.add(i) * *b.add(i);
+                i += 1;
+            }
+            sum
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{dot, linear_columns, linear_rows, weighted_sum, Epilogue};
+
+        fn linear(
+            x: &[f32],
+            weight: &[f32],
+            bias: &[f32],
+            rows: usize,
+            n_in: usize,
+            n_out: usize,
+        ) -> Vec<f32> {
+            let mut y = vec![0.0; rows * n_out];
+            if rows == 1 {
+                linear_columns(
+                    x,
+                    weight,
+                    bias,
+                    n_in,
+                    n_out,
+                    0..n_out,
+                    &mut y,
+                    Epilogue::Store,
+                );
+            } else {
+                linear_rows(x, weight, bias, rows, n_in, n_out, &mut y, Epilogue::Store);
+            }
+            y
+        }
+
+        fn close(actual: f32, expected: f32) {
+            let tolerance = 1e-5 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "expected {expected}, got {actual}"
+            );
+        }
+
+        fn reference(
+            x: &[f32],
+            weight: &[f32],
+            bias: &[f32],
+            rows: usize,
+            n_in: usize,
+            n_out: usize,
+        ) -> Vec<f32> {
+            let mut y = vec![0.0; rows * n_out];
+            for i in 0..rows {
+                for j in 0..n_out {
+                    let mut sum = 0.0;
+                    for p in 0..n_in {
+                        sum += x[i * n_in + p] * weight[p * n_out + j];
+                    }
+                    y[i * n_out + j] = sum + bias[j];
+                }
+            }
+            y
+        }
+
+        #[test]
+        fn linear_matches_reference_on_odd_sizes() {
+            for (rows, n_in, n_out) in [
+                (1, 1, 1),
+                (1, 37, 29),
+                (2, 37, 29),
+                (5, 37, 29),
+                (7, 13, 17),
+                (11, 37, 29),
+                (17, 37, 29),
+                (5, 64, 65),
+                (9, 1, 33),
+                (33, 97, 130),
+            ] {
+                let x: Vec<f32> = (0..rows * n_in)
+                    .map(|i| ((i * 37 + 11) % 101) as f32 / 101.0 - 0.5)
+                    .collect();
+                let weight: Vec<f32> = (0..n_in * n_out)
+                    .map(|i| ((i * 53 + 7) % 97) as f32 / 97.0 - 0.5)
+                    .collect();
+                let bias: Vec<f32> = (0..n_out).map(|i| i as f32 / 90.0 - 1.0).collect();
+
+                let actual = linear(&x, &weight, &bias, rows, n_in, n_out);
+                let expected = reference(&x, &weight, &bias, rows, n_in, n_out);
+                assert_eq!(actual.len(), expected.len());
+                for (a, e) in actual.iter().zip(&expected) {
+                    close(*a, *e);
+                }
+            }
+        }
+
+        #[test]
+        fn weighted_sum_matches_reference_on_odd_sizes() {
+            for (count, stride, width) in [
+                (1, 7, 7),
+                (3, 13, 7),
+                (5, 13, 13),
+                (17, 64, 64),
+                (3, 64, 40),
+            ] {
+                let values: Vec<f32> = (0..(count - 1) * stride + width)
+                    .map(|i| ((i * 31 + 17) % 83) as f32 / 83.0 - 0.5)
+                    .collect();
+                let weights: Vec<f32> = (0..count)
+                    .map(|i| ((i * 47 + 5) % 73) as f32 / 73.0 - 0.5)
+                    .collect();
+                let mut actual = vec![0.0; width];
+                weighted_sum(&values, stride, &weights, &mut actual);
+                for (offset, a) in actual.iter().enumerate() {
+                    let expected: f32 = weights
+                        .iter()
+                        .enumerate()
+                        .map(|(past, weight)| weight * values[past * stride + offset])
+                        .sum();
+                    close(*a, expected);
+                }
+            }
+        }
+
+        #[test]
+        fn dot_matches_reference_on_odd_sizes() {
+            for n in [1, 3, 15, 16, 17, 31, 37, 64, 769] {
+                let a: Vec<f32> = (0..n)
+                    .map(|i| ((i * 29 + 3) % 71) as f32 / 71.0 - 0.5)
+                    .collect();
+                let b: Vec<f32> = (0..n)
+                    .map(|i| ((i * 43 + 5) % 67) as f32 / 67.0 - 0.5)
+                    .collect();
+                let expected: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+                close(dot(&a, &b), expected);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
 mod scalar {
     use std::ops::Range;
 
@@ -982,7 +1743,15 @@ pub(crate) use neon::{
     dot, int8_dot, int8_linear_columns, int8_linear_rows, linear_columns, linear_rows, weighted_sum,
 };
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub(crate) use wasm::{
+    dot, int8_dot, int8_linear_columns, int8_linear_rows, linear_columns, linear_rows, weighted_sum,
+};
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
 pub(crate) use scalar::{
     dot, int8_dot, int8_linear_columns, int8_linear_rows, linear_columns, linear_rows, weighted_sum,
 };
