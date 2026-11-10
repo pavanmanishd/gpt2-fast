@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_arch = "wasm32", target_feature = "atomics"),
+    feature(stdarch_wasm_atomic_wait)
+)]
+
 mod config;
 mod error;
 mod int8_file;
@@ -12,6 +17,8 @@ pub use config::Config;
 pub use error::Error;
 pub use int8_file::write_int8;
 pub use model::{Model, Weights};
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+pub use parallel::{thread_pool_pointer, thread_pool_worker_main, thread_pool_workers};
 pub use tokenizer::Tokenizer;
 
 pub fn argmax(logits: &[f32]) -> u32 {

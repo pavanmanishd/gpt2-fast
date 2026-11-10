@@ -7,6 +7,30 @@ pub fn simd_enabled() -> bool {
     cfg!(all(target_arch = "wasm32", target_feature = "simd128"))
 }
 
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[wasm_bindgen]
+pub fn shared_memory() -> JsValue {
+    wasm_bindgen::memory()
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[wasm_bindgen]
+pub fn thread_pool_pointer() -> u32 {
+    gpt2_engine::thread_pool_pointer() as u32
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[wasm_bindgen]
+pub fn thread_pool_workers() -> usize {
+    gpt2_engine::thread_pool_workers()
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[wasm_bindgen]
+pub fn thread_pool_worker_entry(pointer: u32, index: usize) {
+    gpt2_engine::thread_pool_worker_main(pointer as usize, index);
+}
+
 #[wasm_bindgen]
 pub struct Engine {
     model: Model,
@@ -22,11 +46,17 @@ impl Engine {
         merges_text: &str,
         weights_bytes: &[u8],
         weights: &str,
+        threads: usize,
     ) -> Result<Engine, JsValue> {
         let weights = Weights::parse(weights)
             .ok_or_else(|| JsValue::from_str("weights must be f32 or int8"))?;
-        let model = Model::from_bytes(config_json, weights_bytes, weights)
+        let mut model = Model::from_bytes(config_json, weights_bytes, weights)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        if threads > 1 {
+            model
+                .set_threads(threads)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        }
         let tokenizer = Tokenizer::from_text(vocab_json, merges_text)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         Ok(Engine { model, tokenizer })

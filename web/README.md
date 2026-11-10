@@ -16,7 +16,9 @@ framework, bundler, external JavaScript, web fonts or analytics.
 | `data/milestones.json` | Generated milestone data. Do not edit by hand. |
 | `dev.html` | The old development page, driven by `main.js`. |
 | `worker.js` | Shared Web Worker: loads weights, encodes text, generates and streams tokens. Used by the site, the dev page and the benchmark. |
+| `thread.js` | The pool worker for the threaded build: joins the engine's shared memory and runs its worker loop. |
 | `bench.html`, `bench.js` | The browser benchmark page. |
+| `serve.py` | Development server that sends the COOP/COEP headers `SharedArrayBuffer` requires. |
 | `sync_data.py` | Builds `data/milestones.json` from the repository. |
 
 The site never downloads the model on page load. On a first visit it shows a
@@ -55,6 +57,7 @@ The output contains:
 ```sh
 web/build.sh            # WebAssembly SIMD, written to web/pkg
 web/build.sh --no-simd  # scalar fallback, written to web/pkg-nosimd
+web/build.sh --threads  # SIMD plus WebAssembly threads, written to web/pkg-threads
 ```
 
 The SIMD build compiles with `-C target-feature=+simd128` and uses 128-bit
@@ -64,6 +67,12 @@ reference for checking the SIMD build.
 
 `wasm-bindgen-cli` must match the `wasm-bindgen` crates.io release pinned in
 `crates/web/Cargo.toml` (0.2.130).
+
+The threaded build recompiles the standard library with atomics, which needs
+nightly Rust. `web/rust-toolchain.toml` pins `nightly-2026-08-23` and the
+`rust-src` and `wasm32-unknown-unknown` components; `build.sh` runs the build
+from `web/`, so that file selects the compiler. It links an imported shared
+memory and exports the TLS symbols the wasm-bindgen threads transform expects.
 
 ## Quantized weights
 
@@ -76,17 +85,24 @@ cargo run --release -p gpt2_bench --bin bench -- quantize \
 
 ## Run
 
-Serve the repository root so `models/gpt2/` is reachable:
+Serve the repository root so `models/gpt2/` is reachable. `serve.py` sends
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`, which turn on cross-origin
+isolation and therefore `SharedArrayBuffer`:
 
 ```sh
-python3 -m http.server 8000
+python3 web/serve.py --port 8000
 ```
 
 Open <http://localhost:8000/web/> for the site. The dev page is
 <http://localhost:8000/web/dev.html>. The benchmark page is
 <http://localhost:8000/web/bench.html>; add `?weights=f32` to load
 `model.safetensors` and compare against the reference exactly, and
-`?pkg=pkg-nosimd` to load the scalar build.
+`?pkg=pkg-nosimd` to load the scalar build, or `?pkg=pkg-threads&threads=8` for
+the threaded build. The site only picks the threaded package when
+`crossOriginIsolated` is true and the worker falls back to `pkg` when the
+threaded build or shared memory is unavailable, so both pages keep working
+under a plain static server without the headers.
 
 ## Benchmark sessions
 
@@ -95,9 +111,12 @@ each session, waits for the page to finish and writes the session JSON to
 `results/runs/<label>/`:
 
 ```sh
-uv run web/run_bench.py --label W2-chromium --browser chromium \
-  --sessions 5 --weights int8 --pkg pkg
+uv run web/run_bench.py --label W3-chromium --browser chromium \
+  --sessions 1 --weights int8 --pkg pkg-threads --threads 8
 ```
+
+`--warmup`, `--runs` and `--only` shorten a session while iterating; the
+defaults match the benchmark protocol.
 
 Install the browsers once with:
 

@@ -6,30 +6,39 @@
 # ///
 
 import argparse
-import functools
 import json
 import threading
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlencode
 
 from playwright.sync_api import sync_playwright
 
+from serve import make_server
+
 ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT_MS = 60 * 60 * 1000
 
 
-class Handler(SimpleHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
-
-
 def serve() -> tuple[ThreadingHTTPServer, int]:
-    handler = functools.partial(Handler, directory=str(ROOT))
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server = make_server(ROOT)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, server.server_address[1]
+
+
+def positive(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def non_negative(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,19 +52,33 @@ def parse_args() -> argparse.Namespace:
         choices=["chromium", "firefox", "webkit"],
         help="browser to run, repeatable (default: chromium)",
     )
-    parser.add_argument("--sessions", type=int, default=5)
+    parser.add_argument("--sessions", type=positive, default=5)
     parser.add_argument("--weights", choices=["f32", "int8"], default="int8")
-    parser.add_argument("--pkg", choices=["pkg", "pkg-nosimd"], default="pkg")
-    args = parser.parse_args()
-    if args.sessions < 1:
-        parser.error("--sessions must be at least 1")
-    return args
+    parser.add_argument(
+        "--pkg", choices=["pkg", "pkg-nosimd", "pkg-threads"], default="pkg"
+    )
+    parser.add_argument(
+        "--threads",
+        type=positive,
+        help="thread count sent to the page as a query parameter",
+    )
+    parser.add_argument("--warmup", type=non_negative, default=1)
+    parser.add_argument("--runs", type=non_negative, default=5)
+    parser.add_argument(
+        "--only", help="comma-separated prompt ids, for example p064,p256"
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        help="output directory (default: results/runs/<label>)",
+    )
+    return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     browsers = args.browser or ["chromium"]
-    out_dir = ROOT / "results" / "runs" / args.label
+    out_dir = args.out or ROOT / "results" / "runs" / args.label
     out_dir.mkdir(parents=True, exist_ok=True)
 
     server, port = serve()
@@ -71,16 +94,21 @@ def main() -> int:
                         context = browser.new_context()
                         try:
                             page = context.new_page()
-                            query = urlencode(
-                                {
-                                    "weights": args.weights,
-                                    "pkg": args.pkg,
-                                    "browser": name,
-                                    "browser_version": version,
-                                }
-                            )
+                            query = {
+                                "weights": args.weights,
+                                "pkg": args.pkg,
+                                "browser": name,
+                                "browser_version": version,
+                                "warmup": args.warmup,
+                                "runs": args.runs,
+                            }
+                            if args.threads is not None:
+                                query["threads"] = args.threads
+                            if args.only:
+                                query["only"] = args.only
                             page.goto(
-                                f"http://127.0.0.1:{port}/web/bench.html?{query}"
+                                f"http://127.0.0.1:{port}/web/bench.html?"
+                                f"{urlencode(query)}"
                             )
                             page.wait_for_function(
                                 "window.__benchDone === true || Boolean(window.__benchError)",
@@ -88,7 +116,9 @@ def main() -> int:
                             )
                             error = page.evaluate("window.__benchError")
                             if error:
-                                raise RuntimeError(f"{name} session {session_index}: {error}")
+                                raise RuntimeError(
+                                    f"{name} session {session_index}: {error}"
+                                )
                             session = page.evaluate("window.__benchResult")
                             session["label"] = args.label
                             path = out_dir / f"session-{session_index}.json"
@@ -96,6 +126,7 @@ def main() -> int:
                             medians = session["session_medians"]
                             print(
                                 f"{name} {version} session {session_index}: "
+                                f"{session['pkg']} {session['threads']} thread(s), "
                                 f"{medians['decode_tok_s']:.2f} tok/s decode, "
                                 f"{medians['prefill_tok_s']:.1f} tok/s prefill, "
                                 f"{medians['ttft_ms']:.0f} ms ttft, "

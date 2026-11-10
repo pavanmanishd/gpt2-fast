@@ -3,12 +3,20 @@ const CACHE_NAME = "gpt2-weights-v2";
 const CHUNK_BYTES = 64 * 1024 * 1024;
 const TEXT_DECODER = new TextDecoder();
 const PARAMS = new URL(self.location.href).searchParams;
-const PKG = PARAMS.get("pkg") === "pkg-nosimd" ? "pkg-nosimd" : "pkg";
+const REQUESTED_PKG = ["pkg", "pkg-nosimd", "pkg-threads"].includes(
+  PARAMS.get("pkg"),
+)
+  ? PARAMS.get("pkg")
+  : "pkg";
+const REQUESTED_THREADS = parseThreads(PARAMS.get("threads"));
 
-let init = null;
 let Engine = null;
 let binding = null;
 let engine = null;
+let enginePkg = null;
+let wasmModule = null;
+let threads = 1;
+let poolWorkers = [];
 
 self.onmessage = async (event) => {
   const message = event.data;
@@ -64,12 +72,7 @@ async function load(weights) {
     files[names[index]] = await readFile(names[index], index, names.length);
   }
 
-  if (binding === null) {
-    binding = await import(`./${PKG}/gpt2_web.js`);
-    init = binding.default;
-    Engine = binding.Engine;
-  }
-  await init();
+  await importEngine();
   const buildStart = performance.now();
   engine = new Engine(
     TEXT_DECODER.decode(files["config.json"]),
@@ -77,15 +80,117 @@ async function load(weights) {
     TEXT_DECODER.decode(files["merges.txt"]),
     files[weightsFile],
     weights,
+    threads,
   );
+  if (threads > 1) {
+    await startPool();
+  }
   self.postMessage({
     type: "ready",
     weights,
-    pkg: PKG,
+    pkg: enginePkg,
     simd: binding.simd_enabled(),
+    threads,
     loadMs: performance.now() - started,
     buildMs: performance.now() - buildStart,
   });
+}
+
+async function importEngine() {
+  if (binding !== null) {
+    return;
+  }
+  const candidates =
+    REQUESTED_PKG === "pkg-threads" ? ["pkg-threads", "pkg"] : [REQUESTED_PKG];
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      const imported = await import(`./${candidate}/gpt2_web.js`);
+      if (candidate === "pkg-threads") {
+        if (!self.crossOriginIsolated) {
+          throw new Error("WebAssembly threads need cross-origin isolation");
+        }
+        const url = new URL(`./${candidate}/gpt2_web_bg.wasm`, import.meta.url);
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`${url}: HTTP ${response.status}`);
+        }
+        wasmModule = await WebAssembly.compile(await response.arrayBuffer());
+        imported.initSync({ module: wasmModule });
+        threads = REQUESTED_THREADS;
+      } else {
+        await imported.default();
+        wasmModule = null;
+        threads = 1;
+      }
+      binding = imported;
+      Engine = imported.Engine;
+      enginePkg = candidate;
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
+async function startPool() {
+  const workers = binding.thread_pool_workers();
+  if (workers !== threads - 1) {
+    throw new Error(
+      `the engine asked for ${threads - 1} workers, the build offers ${workers}`,
+    );
+  }
+  const memory = binding.shared_memory();
+  const pointer = binding.thread_pool_pointer();
+  const ready = [];
+  for (let index = 0; index < workers; index += 1) {
+    const worker = new Worker(new URL("./thread.js", import.meta.url), {
+      type: "module",
+    });
+    poolWorkers.push(worker);
+    ready.push(
+      new Promise((resolve, reject) => {
+        worker.onmessage = (event) => {
+          const message = event.data;
+          if (message.type === "ready") {
+            resolve();
+          } else if (message.type === "error") {
+            reject(new Error(message.message));
+          }
+        };
+        worker.onerror = (event) =>
+          reject(new Error(event.message || "The thread worker failed."));
+        worker.postMessage({
+          type: "init",
+          module: wasmModule,
+          memory,
+          pointer,
+          index,
+        });
+      }),
+    );
+  }
+  try {
+    await Promise.all(ready);
+  } catch (error) {
+    for (const worker of poolWorkers) {
+      worker.terminate();
+    }
+    poolWorkers = [];
+    throw error;
+  }
+}
+
+function parseThreads(value) {
+  if (value === null || value === "") {
+    return Math.min(navigator.hardwareConcurrency || 1, 8);
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return 1;
+  }
+  return Math.min(parsed, 32);
 }
 
 async function readFile(name, index, count) {

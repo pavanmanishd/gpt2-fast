@@ -1,0 +1,6 @@
+[toolchain]
+# WebAssembly threads need the standard library rebuilt with atomics, which
+# only nightly supports.
+channel = "nightly-2026-08-23"
+components = ["rust-src"]
+targets = ["wasm32-unknown-unknown"]

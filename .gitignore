@@ -8,4 +8,5 @@ node_modules/
 web/dist/
 web/pkg/
 web/pkg-nosimd/
+web/pkg-threads/
 .DS_Store

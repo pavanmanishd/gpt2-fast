@@ -23,6 +23,7 @@ const els = {
   meterTokens: document.getElementById("meter-tokens"),
   demoStatus: document.getElementById("demo-status"),
   simd: document.getElementById("simd-state"),
+  threads: document.getElementById("threads-state"),
   deviceCopy: document.getElementById("device-copy"),
   runBench: document.getElementById("run-bench"),
   benchStatus: document.getElementById("bench-status"),
@@ -216,13 +217,32 @@ async function modelIsCached() {
 }
 
 function createWorker() {
-  const instance = new Worker(new URL("./worker.js", import.meta.url), {
-    type: "module",
-  });
+  const threads = preferredThreads();
+  const pkg = self.crossOriginIsolated && threads > 1 ? "pkg-threads" : "pkg";
+  const instance = new Worker(
+    new URL(
+      `./worker.js?pkg=${encodeURIComponent(pkg)}&threads=${threads}`,
+      import.meta.url,
+    ),
+    { type: "module" },
+  );
   instance.onmessage = (event) => handleMessage(instance, event.data);
   instance.onerror = (event) =>
     handleWorkerFailure(instance, event.message || "The worker failed.");
   return instance;
+}
+
+const THREAD_CAP = 8;
+
+function preferredThreads() {
+  const requested = Number.parseInt(
+    new URLSearchParams(location.search).get("threads") ?? "",
+    10,
+  );
+  if (Number.isFinite(requested) && requested > 0) {
+    return Math.min(requested, 32);
+  }
+  return Math.min(navigator.hardwareConcurrency || 1, THREAD_CAP);
 }
 
 function handleMessage(instance, message) {
@@ -321,6 +341,7 @@ function handleWorkerFailure(instance, message) {
   els.demoStatus.textContent = "The model is not loaded.";
   els.benchStatus.textContent = "Load the model above first.";
   els.simd.textContent = "not loaded";
+  els.threads.textContent = "not loaded";
   updateControls();
 }
 
@@ -368,6 +389,10 @@ async function loadModel() {
     els.loadPanel.hidden = true;
     els.progressWrap.hidden = true;
     els.simd.textContent = message.simd ? "on" : "off";
+    els.threads.textContent =
+      message.threads > 1
+        ? `${message.threads} threads`
+        : `off (1 thread)`;
     els.demoStatus.textContent = `Model ready in ${formatLoadTime(message.loadMs)}${downloaded ? ", downloaded and cached" : ", from browser cache"}.`;
     if (deviceBench) {
       els.benchStatus.textContent = "Ready to run.";
@@ -388,6 +413,7 @@ async function loadModel() {
     els.demoStatus.textContent = "The model is not loaded.";
     els.benchStatus.textContent = "Load the model above first.";
     els.simd.textContent = "not loaded";
+    els.threads.textContent = "not loaded";
     updateControls();
   }
 }
@@ -416,6 +442,7 @@ function stopGeneration() {
       : "Stopped before the first token.";
   els.benchStatus.textContent = "Load the model above first.";
   els.simd.textContent = "not loaded";
+  els.threads.textContent = "not loaded";
   updateControls();
 }
 
@@ -984,7 +1011,7 @@ function renderDevice(protocol, bench, milestone) {
       bench.max_new_tokens,
     )} new tokens: ${formatCount(bench.warmup)} warm-up${
       Number(bench.warmup) === 1 ? "" : "s"
-    }, then one timed run. This page uses int8 weights on one WebAssembly thread; the project column is the same ${weights} engine in a Linux container limited to ${formatCount(
+    }, then one timed run. This page uses int8 weights in WebAssembly; the project column is the same ${weights} engine in a Linux container limited to ${formatCount(
       protocol.cores,
     )} cores.`;
   }
@@ -999,7 +1026,7 @@ function renderDevice(protocol, bench, milestone) {
   els.projectTtft.textContent = formatMs(milestone.ttft_ms);
   els.projectNote.textContent = `Project: ${
     milestone.milestone
-  }, ${weights} weights, ${formatCount(protocol.cores)} cores, Linux container. This tab runs one WebAssembly thread.`;
+  }, ${weights} weights, ${formatCount(protocol.cores)} cores, Linux container. Numbers from this tab are measured in the browser.`;
 }
 
 function linkRepo() {

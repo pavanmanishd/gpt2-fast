@@ -304,6 +304,11 @@ impl Model {
         &self.config
     }
 
+    pub fn set_threads(&mut self, count: usize) -> Result<(), Error> {
+        self.threads = Threads::with_count(count)?;
+        Ok(())
+    }
+
     pub fn logits(&self, ids: &[u32]) -> Vec<f32> {
         let n = ids.len();
         assert!(n > 0, "logits requires at least one token id");
