@@ -9,6 +9,8 @@ const REQUESTED_PKG = ["pkg", "pkg-nosimd", "pkg-threads"].includes(
   ? PARAMS.get("pkg")
   : "pkg";
 const REQUESTED_THREADS = parseThreads(PARAMS.get("threads"));
+const REQUESTED_BACKEND = PARAMS.get("backend") === "webgpu" ? "webgpu" : "cpu";
+const GPU_PIPELINE_DEPTH = parseDepth(PARAMS.get("pipeline"));
 
 let Engine = null;
 let binding = null;
@@ -17,6 +19,10 @@ let enginePkg = null;
 let wasmModule = null;
 let threads = 1;
 let poolWorkers = [];
+let gpu = null;
+let backend = "cpu";
+let fallback = null;
+let gpuQueue = Promise.resolve();
 
 self.onmessage = async (event) => {
   const message = event.data;
@@ -43,11 +49,11 @@ self.onmessage = async (event) => {
         self.postMessage({
           type: "logits",
           id: message.id,
-          values: engine.logits(Uint32Array.from(message.ids)),
+          values: await enqueue(() => computeLogits(message.ids)),
         });
         break;
       case "generate":
-        generate(message);
+        await enqueue(() => generate(message));
         break;
       default:
         throw new Error(`unknown worker message ${message.type}`);
@@ -60,6 +66,19 @@ self.onmessage = async (event) => {
     });
   }
 };
+
+function enqueue(task) {
+  const result = gpuQueue.then(task, task);
+  gpuQueue = result.catch(() => {});
+  return result;
+}
+
+async function computeLogits(ids) {
+  if (gpu) {
+    return gpu.logits(Uint32Array.from(ids));
+  }
+  return engine.logits(Uint32Array.from(ids));
+}
 
 async function load(weights) {
   const started = performance.now();
@@ -74,26 +93,94 @@ async function load(weights) {
 
   await importEngine();
   const buildStart = performance.now();
+  const config = JSON.parse(TEXT_DECODER.decode(files["config.json"]));
+  const gpuRequested = REQUESTED_BACKEND === "webgpu";
+  const cpuThreads = threads;
   engine = new Engine(
     TEXT_DECODER.decode(files["config.json"]),
     TEXT_DECODER.decode(files["vocab.json"]),
     TEXT_DECODER.decode(files["merges.txt"]),
     files[weightsFile],
     weights,
-    threads,
+    gpuRequested ? 1 : threads,
   );
-  if (threads > 1) {
+  let gpuInfo = null;
+  if (gpuRequested) {
+    try {
+      gpuInfo = await startGpu(config, weights);
+      engine.release_weights();
+      backend = "webgpu";
+    } catch (error) {
+      fallback = describe(error);
+      gpu = null;
+      backend = "cpu";
+      if (cpuThreads !== 1) {
+        threads = cpuThreads;
+        engine = new Engine(
+          TEXT_DECODER.decode(files["config.json"]),
+          TEXT_DECODER.decode(files["vocab.json"]),
+          TEXT_DECODER.decode(files["merges.txt"]),
+          files[weightsFile],
+          weights,
+          threads,
+        );
+      }
+    }
+  }
+  if (gpu === null && threads > 1) {
     await startPool();
   }
   self.postMessage({
     type: "ready",
     weights,
-    pkg: enginePkg,
+    backend,
+    requestedBackend: REQUESTED_BACKEND,
+    fallback,
+    pkg: backend === "webgpu" ? "webgpu" : enginePkg,
     simd: binding.simd_enabled(),
-    threads,
+    threads: backend === "webgpu" ? 1 : threads,
+    pipelineDepth: gpu ? GPU_PIPELINE_DEPTH : 0,
+    gpu: gpuInfo,
     loadMs: performance.now() - started,
     buildMs: performance.now() - buildStart,
   });
+}
+
+async function startGpu(config, weights) {
+  const { GpuEngine, requestGpu } = await import("./gpu/engine.js");
+  const { device, info } = await requestGpu();
+  gpu = new GpuEngine({
+    device,
+    source: engine,
+    config,
+    weights,
+    pipelineDepth: GPU_PIPELINE_DEPTH,
+  });
+  await gpu.init((name, index, count) => {
+    self.postMessage({
+      type: "progress",
+      file: `GPU ${name}`,
+      index,
+      count,
+      loaded: index,
+      total: count,
+      cached: false,
+    });
+  });
+  return {
+    adapter: info,
+    limits: {
+      max_buffer_size: device.limits.maxBufferSize,
+      max_storage_buffer_binding_size:
+        device.limits.maxStorageBufferBindingSize,
+      max_compute_workgroup_storage_size:
+        device.limits.maxComputeWorkgroupStorageSize,
+      max_storage_buffers_per_shader_stage:
+        device.limits.maxStorageBuffersPerShaderStage,
+    },
+    memory: gpu.memory(),
+    pipeline_depth: gpu.depth,
+  };
 }
 
 async function importEngine() {
@@ -339,32 +426,42 @@ async function download(url, progress) {
   return bytes;
 }
 
-function generate(message) {
+async function generate(message) {
   const started = performance.now();
   const tokens = [];
   const timings = [];
-  engine.generate(
-    Uint32Array.from(message.ids),
-    message.maxNewTokens,
-    (token) => {
-      timings.push(performance.now() - started);
-      tokens.push(token);
-      if (message.stream) {
-        self.postMessage({
-          type: "token",
-          id: message.id,
-          token,
-          text: engine.decode(Uint32Array.from(tokens)),
-        });
-      }
-    },
-  );
+  const onToken = (token) => {
+    timings.push(performance.now() - started);
+    tokens.push(token);
+    if (message.stream) {
+      self.postMessage({
+        type: "token",
+        id: message.id,
+        token,
+        text: engine.decode(Uint32Array.from(tokens)),
+      });
+    }
+  };
+  const ids = Uint32Array.from(message.ids);
+  if (gpu) {
+    await gpu.generate(ids, message.maxNewTokens, onToken);
+  } else {
+    engine.generate(ids, message.maxNewTokens, onToken);
+  }
   self.postMessage({
     type: "done",
     id: message.id,
     timings,
     tokens,
   });
+}
+
+function parseDepth(value) {
+  const parsed = Number.parseInt(value ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return 4;
+  }
+  return Math.min(parsed, 16);
 }
 
 function describe(error) {

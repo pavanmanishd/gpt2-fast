@@ -97,7 +97,7 @@ pub fn summarize(sessions: &[Session]) -> Result<Summary, String> {
     Ok(Summary {
         label: first.label.clone(),
         model: first.model.clone(),
-        target: "cpu-linux".to_string(),
+        target: first.target.clone(),
         decode_tok_s,
         prefill_tok_s,
         ttft_ms,
@@ -159,6 +159,7 @@ mod tests {
             model: "gpt2".to_string(),
             commit: "abc1234".to_string(),
             started_at: "2026-01-01T00:00:00Z".to_string(),
+            target: "cpu-linux".to_string(),
             host: HostInfo {
                 nproc: 4,
                 cpu: "test cpu".to_string(),
@@ -211,6 +212,13 @@ mod tests {
         assert!(summary.matches_reference);
         assert_eq!(summary.label, "N1");
         assert_eq!(summary.target, "cpu-linux");
+    }
+
+    #[test]
+    fn keeps_the_recorded_target() {
+        let mut browser = session(10.0, 100.0, 4.0, None, 10, 10, true);
+        browser.target = "webgpu".to_string();
+        assert_eq!(summarize(&[browser]).unwrap().target, "webgpu");
     }
 
     #[test]

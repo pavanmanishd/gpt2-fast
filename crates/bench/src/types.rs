@@ -41,6 +41,8 @@ pub struct Session {
     pub model: String,
     pub commit: String,
     pub started_at: String,
+    #[serde(default = "default_target")]
+    pub target: String,
     pub host: HostInfo,
     pub worker_cmd: Vec<String>,
     pub load_ms: f64,
@@ -52,6 +54,10 @@ pub struct Session {
     pub matches_reference: bool,
     #[serde(default)]
     pub near_tie_mismatch: bool,
+}
+
+fn default_target() -> String {
+    "cpu-linux".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

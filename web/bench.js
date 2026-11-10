@@ -1,5 +1,7 @@
 const params = new URLSearchParams(location.search);
 const WEIGHTS = params.get("weights") === "f32" ? "f32" : "int8";
+const BACKEND = params.get("backend") === "webgpu" ? "webgpu" : "cpu";
+const PIPELINE = params.get("pipeline") ?? "";
 const requestedPkg = params.get("pkg");
 const PKG = ["pkg", "pkg-nosimd", "pkg-threads"].includes(requestedPkg)
   ? requestedPkg
@@ -17,7 +19,7 @@ const ONLY = params.get("only");
 
 const worker = new Worker(
   new URL(
-    `./worker.js?pkg=${encodeURIComponent(PKG)}&threads=${encodeURIComponent(THREADS)}`,
+    `./worker.js?backend=${encodeURIComponent(BACKEND)}&pkg=${encodeURIComponent(PKG)}&threads=${encodeURIComponent(THREADS)}&pipeline=${encodeURIComponent(PIPELINE)}`,
     import.meta.url,
   ),
   { type: "module" },
@@ -223,11 +225,13 @@ async function main() {
 
   const startedAt = new Date();
   const target =
-    readyMessage.threads > 1
-      ? "wasm-threads"
-      : readyMessage.simd
-        ? "wasm-simd"
-        : "wasm";
+    readyMessage.backend === "webgpu"
+      ? "webgpu"
+      : readyMessage.threads > 1
+        ? "wasm-threads"
+        : readyMessage.simd
+          ? "wasm-simd"
+          : "wasm";
   const maxNewTokens = prompts.max_new_tokens;
   const promptSessions = [];
   let matchesReference = true;
@@ -325,6 +329,11 @@ async function main() {
     commit: "unknown",
     started_at: startedAt.toISOString(),
     target,
+    backend: readyMessage.backend,
+    requested_backend: readyMessage.requestedBackend,
+    fallback: readyMessage.fallback,
+    pipeline_depth: readyMessage.pipelineDepth,
+    gpu: readyMessage.gpu,
     browser: BROWSER,
     pkg: readyMessage.pkg,
     threads: readyMessage.threads,
@@ -341,9 +350,11 @@ async function main() {
     },
     worker_cmd: [
       "browser",
+      `backend=${BACKEND}`,
       `weights=${WEIGHTS}`,
       `pkg=${readyMessage.pkg}`,
       `threads=${readyMessage.threads}`,
+      `pipeline=${readyMessage.pipelineDepth}`,
     ],
     load_ms: readyMessage.loadMs,
     peak_mb: null,
@@ -355,7 +366,7 @@ async function main() {
     near_tie_mismatch: nearTieMismatch,
   };
 
-  summary.textContent = `${WEIGHTS} weights, ${matchesReference ? "matches the reference" : "does not match the reference"}: ${sessionMedians.decode_tok_s.toFixed(2)} tokens/s decode, ${sessionMedians.prefill_tok_s.toFixed(1)} tokens/s prefill, ${sessionMedians.ttft_ms.toFixed(0)} ms to first token.`;
+  summary.textContent = `${WEIGHTS} weights on ${target}, ${matchesReference ? "matches the reference" : "does not match the reference"}: ${sessionMedians.decode_tok_s.toFixed(2)} tokens/s decode, ${sessionMedians.prefill_tok_s.toFixed(1)} tokens/s prefill, ${sessionMedians.ttft_ms.toFixed(0)} ms to first token.`;
   statusLine.textContent = "Finished.";
   downloadButton.disabled = false;
   downloadButton.addEventListener("click", () => {
@@ -365,7 +376,7 @@ async function main() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `session-wasm-${WEIGHTS}.json`;
+    link.download = `session-${target}-${WEIGHTS}.json`;
     link.click();
     URL.revokeObjectURL(url);
   });

@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::path::Path;
 
+use serde_json::json;
+
 use crate::parallel::Threads;
 use crate::quantize::GROUP_SIZE;
 use crate::safetensors::SafeTensors;
@@ -71,6 +73,60 @@ impl Matrix {
                     *value = data[start + d] as f32 * scale[d / GROUP_SIZE] + addend[d];
                 }
             }
+        }
+    }
+
+    fn is_int8(&self) -> bool {
+        matches!(self, Matrix::Int8 { .. })
+    }
+
+    fn to_f32(&self, n_in: usize) -> Vec<f32> {
+        match self {
+            Matrix::F32(data) => data.clone(),
+            Matrix::Int8 { data, scale } => {
+                let groups = n_in.div_ceil(GROUP_SIZE);
+                data.iter()
+                    .enumerate()
+                    .map(|(index, &value)| {
+                        let column = index % n_in;
+                        let row = index / n_in;
+                        value as f32 * scale[row * groups + column / GROUP_SIZE]
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn pack_int8(&self, n_in: usize) -> Option<Vec<u32>> {
+        let Matrix::Int8 { data, .. } = self else {
+            return None;
+        };
+        if !n_in.is_multiple_of(4) {
+            return None;
+        }
+        let (words, remainder) = data.as_chunks::<4>();
+        if !remainder.is_empty() {
+            return None;
+        }
+        Some(
+            words
+                .iter()
+                .map(|bytes| {
+                    u32::from_le_bytes([
+                        bytes[0] as u8,
+                        bytes[1] as u8,
+                        bytes[2] as u8,
+                        bytes[3] as u8,
+                    ])
+                })
+                .collect(),
+        )
+    }
+
+    fn scales(&self) -> Option<&[f32]> {
+        match self {
+            Matrix::F32(_) => None,
+            Matrix::Int8 { scale, .. } => Some(scale),
         }
     }
 }
@@ -148,6 +204,32 @@ struct Layer {
     mlp_c_proj_bias: Vec<f32>,
 }
 
+impl Layer {
+    fn matrix(&self, name: &str) -> Option<&Matrix> {
+        match name {
+            "attn.c_attn.weight" => Some(&self.c_attn_weight),
+            "attn.c_proj.weight" => Some(&self.c_proj_weight),
+            "mlp.c_fc.weight" => Some(&self.c_fc_weight),
+            "mlp.c_proj.weight" => Some(&self.mlp_c_proj_weight),
+            _ => None,
+        }
+    }
+
+    fn vector(&self, name: &str) -> Option<&[f32]> {
+        match name {
+            "ln_1.weight" => Some(&self.ln_1_weight),
+            "ln_1.bias" => Some(&self.ln_1_bias),
+            "attn.c_attn.bias" => Some(&self.c_attn_bias),
+            "attn.c_proj.bias" => Some(&self.c_proj_bias),
+            "ln_2.weight" => Some(&self.ln_2_weight),
+            "ln_2.bias" => Some(&self.ln_2_bias),
+            "mlp.c_fc.bias" => Some(&self.c_fc_bias),
+            "mlp.c_proj.bias" => Some(&self.mlp_c_proj_bias),
+            _ => None,
+        }
+    }
+}
+
 struct Workspace {
     x: Vec<f32>,
     projected: Vec<f32>,
@@ -202,6 +284,10 @@ impl KvCache {
                 .copy_from_slice(&qkv[source + 2 * n_embd..source + 3 * n_embd]);
         }
     }
+}
+
+fn weight_entry(tensors: &mut Vec<serde_json::Value>, name: String, shape: Vec<usize>, int8: bool) {
+    tensors.push(json!({"name": name, "shape": shape, "int8": int8}));
 }
 
 impl Model {
@@ -307,6 +393,130 @@ impl Model {
     pub fn set_threads(&mut self, count: usize) -> Result<(), Error> {
         self.threads = Threads::with_count(count)?;
         Ok(())
+    }
+
+    pub fn weight_manifest(&self) -> String {
+        let config = &self.config;
+        let n_embd = config.n_embd;
+        let n_inner = 4 * n_embd;
+        let mut tensors = Vec::new();
+        weight_entry(
+            &mut tensors,
+            "wte.weight".to_string(),
+            vec![config.vocab_size, n_embd],
+            self.wte.is_int8(),
+        );
+        weight_entry(
+            &mut tensors,
+            "wpe.weight".to_string(),
+            vec![config.n_ctx, n_embd],
+            false,
+        );
+        for (index, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("h.{index}");
+            let name = |suffix: &str| format!("{prefix}.{suffix}");
+            for suffix in ["ln_1.weight", "ln_1.bias"] {
+                weight_entry(&mut tensors, name(suffix), vec![n_embd], false);
+            }
+            weight_entry(
+                &mut tensors,
+                name("attn.c_attn.weight"),
+                vec![3 * n_embd, n_embd],
+                layer.c_attn_weight.is_int8(),
+            );
+            weight_entry(
+                &mut tensors,
+                name("attn.c_attn.bias"),
+                vec![3 * n_embd],
+                false,
+            );
+            weight_entry(
+                &mut tensors,
+                name("attn.c_proj.weight"),
+                vec![n_embd, n_embd],
+                layer.c_proj_weight.is_int8(),
+            );
+            weight_entry(&mut tensors, name("attn.c_proj.bias"), vec![n_embd], false);
+            for suffix in ["ln_2.weight", "ln_2.bias"] {
+                weight_entry(&mut tensors, name(suffix), vec![n_embd], false);
+            }
+            weight_entry(
+                &mut tensors,
+                name("mlp.c_fc.weight"),
+                vec![n_inner, n_embd],
+                layer.c_fc_weight.is_int8(),
+            );
+            weight_entry(&mut tensors, name("mlp.c_fc.bias"), vec![n_inner], false);
+            weight_entry(
+                &mut tensors,
+                name("mlp.c_proj.weight"),
+                vec![n_embd, n_inner],
+                layer.mlp_c_proj_weight.is_int8(),
+            );
+            weight_entry(&mut tensors, name("mlp.c_proj.bias"), vec![n_embd], false);
+        }
+        for suffix in ["ln_f.weight", "ln_f.bias"] {
+            weight_entry(&mut tensors, suffix.to_string(), vec![n_embd], false);
+        }
+        serde_json::to_string(&tensors).expect("weight manifest is JSON")
+    }
+
+    pub fn weight(&self, name: &str) -> Option<Vec<f32>> {
+        if let Some((_, n_in, matrix)) = self.matrix(name) {
+            return Some(matrix.to_f32(n_in));
+        }
+        self.vector(name).map(<[f32]>::to_vec)
+    }
+
+    pub fn weight_int8(&self, name: &str) -> Option<Vec<u32>> {
+        let (_, n_in, matrix) = self.matrix(name)?;
+        matrix.pack_int8(n_in)
+    }
+
+    pub fn weight_scales(&self, name: &str) -> Option<Vec<f32>> {
+        let (_, _, matrix) = self.matrix(name)?;
+        matrix.scales().map(<[f32]>::to_vec)
+    }
+
+    pub fn release_weights(&mut self) {
+        self.wte = Matrix::F32(Vec::new());
+        self.wpe = Vec::new();
+        self.layers.clear();
+        self.ln_f_weight = Vec::new();
+        self.ln_f_bias = Vec::new();
+    }
+
+    fn matrix(&self, name: &str) -> Option<(usize, usize, &Matrix)> {
+        let n_embd = self.config.n_embd;
+        if name == "wte.weight" {
+            return Some((self.config.vocab_size, n_embd, &self.wte));
+        }
+        let rest = name.strip_prefix("h.")?;
+        let (index, suffix) = rest.split_once('.')?;
+        let layer = self.layers.get(index.parse::<usize>().ok()?)?;
+        let matrix = layer.matrix(suffix)?;
+        let (n_out, n_in) = match suffix {
+            "attn.c_attn.weight" => (3 * n_embd, n_embd),
+            "attn.c_proj.weight" => (n_embd, n_embd),
+            "mlp.c_fc.weight" => (4 * n_embd, n_embd),
+            "mlp.c_proj.weight" => (n_embd, 4 * n_embd),
+            _ => return None,
+        };
+        Some((n_out, n_in, matrix))
+    }
+
+    fn vector(&self, name: &str) -> Option<&[f32]> {
+        match name {
+            "wpe.weight" => return Some(&self.wpe),
+            "ln_f.weight" => return Some(&self.ln_f_weight),
+            "ln_f.bias" => return Some(&self.ln_f_bias),
+            _ => {}
+        }
+        let rest = name.strip_prefix("h.")?;
+        let (index, suffix) = rest.split_once('.')?;
+        self.layers
+            .get(index.parse::<usize>().ok()?)?
+            .vector(suffix)
     }
 
     pub fn logits(&self, ids: &[u32]) -> Vec<f32> {
@@ -794,6 +1004,27 @@ mod tests {
             .collect();
         let bias = (0..n_out).map(|i| i as f32 / 9.0 - 1.0).collect();
         (x, weight, bias)
+    }
+
+    #[test]
+    fn int8_matrices_dequantize_and_pack_for_the_gpu_loader() {
+        let matrix = Matrix::Int8 {
+            data: vec![-128, -1, 0, 1, 2, 3, 4, 5],
+            scale: vec![0.5, 0.25],
+        };
+        assert_eq!(
+            matrix.to_f32(4),
+            vec![-64.0, -0.5, 0.0, 0.5, 0.5, 0.75, 1.0, 1.25]
+        );
+        assert_eq!(
+            matrix.pack_int8(4).expect("packed"),
+            vec![
+                u32::from_le_bytes([0x80, 0xff, 0x00, 0x01]),
+                u32::from_le_bytes([0x02, 0x03, 0x04, 0x05]),
+            ]
+        );
+        assert_eq!(matrix.scales(), Some(&[0.5, 0.25][..]));
+        assert!(matrix.pack_int8(3).is_none());
     }
 
     #[test]

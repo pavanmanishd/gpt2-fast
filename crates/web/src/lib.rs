@@ -93,4 +93,24 @@ impl Engine {
             None => Ok(()),
         }
     }
+
+    pub fn weight_manifest(&self) -> String {
+        self.model.weight_manifest()
+    }
+
+    pub fn weight(&self, name: &str) -> Option<Vec<f32>> {
+        self.model.weight(name)
+    }
+
+    pub fn weight_int8(&self, name: &str) -> Option<Vec<u32>> {
+        self.model.weight_int8(name)
+    }
+
+    pub fn weight_scales(&self, name: &str) -> Option<Vec<f32>> {
+        self.model.weight_scales(name)
+    }
+
+    pub fn release_weights(&mut self) {
+        self.model.release_weights();
+    }
 }

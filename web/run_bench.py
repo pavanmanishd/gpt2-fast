@@ -7,6 +7,7 @@
 
 import argparse
 import json
+import sys
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -49,10 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--browser",
         action="append",
-        choices=["chromium", "firefox", "webkit"],
+        choices=["chromium", "chrome", "firefox", "webkit"],
         help="browser to run, repeatable (default: chromium)",
     )
     parser.add_argument("--sessions", type=positive, default=5)
+    parser.add_argument("--backend", choices=["cpu", "webgpu"], default="cpu")
     parser.add_argument("--weights", choices=["f32", "int8"], default="int8")
     parser.add_argument(
         "--pkg", choices=["pkg", "pkg-nosimd", "pkg-threads"], default="pkg"
@@ -61,6 +63,11 @@ def parse_args() -> argparse.Namespace:
         "--threads",
         type=positive,
         help="thread count sent to the page as a query parameter",
+    )
+    parser.add_argument(
+        "--pipeline",
+        type=positive,
+        help="WebGPU decode steps submitted before the first token is read back",
     )
     parser.add_argument("--warmup", type=non_negative, default=1)
     parser.add_argument("--runs", type=non_negative, default=5)
@@ -80,13 +87,36 @@ def main() -> int:
     browsers = args.browser or ["chromium"]
     out_dir = args.out or ROOT / "results" / "runs" / args.label
     out_dir.mkdir(parents=True, exist_ok=True)
+    gpu_args = [
+        "--headless=new",
+        "--enable-unsafe-webgpu",
+        "--ignore-gpu-blocklist",
+    ]
+    if sys.platform == "darwin":
+        gpu_args.append("--use-angle=metal")
+    else:
+        gpu_args.append("--enable-features=Vulkan")
 
     server, port = serve()
     session_index = 0
     try:
         with sync_playwright() as playwright:
             for name in browsers:
-                browser = getattr(playwright, name).launch(headless=True)
+                if name == "chrome":
+                    if args.backend == "webgpu":
+                        browser = playwright.chromium.launch(
+                            headless=False,
+                            args=gpu_args,
+                            channel="chrome",
+                        )
+                    else:
+                        browser = playwright.chromium.launch(
+                            headless=True, channel="chrome"
+                        )
+                elif name == "chromium" and args.backend == "webgpu":
+                    browser = playwright.chromium.launch(headless=False, args=gpu_args)
+                else:
+                    browser = getattr(playwright, name).launch(headless=True)
                 version = browser.version
                 try:
                     for _ in range(args.sessions):
@@ -96,6 +126,7 @@ def main() -> int:
                             page = context.new_page()
                             query = {
                                 "weights": args.weights,
+                                "backend": args.backend,
                                 "pkg": args.pkg,
                                 "browser": name,
                                 "browser_version": version,
@@ -104,6 +135,8 @@ def main() -> int:
                             }
                             if args.threads is not None:
                                 query["threads"] = args.threads
+                            if args.pipeline is not None:
+                                query["pipeline"] = args.pipeline
                             if args.only:
                                 query["only"] = args.only
                             page.goto(
@@ -126,7 +159,8 @@ def main() -> int:
                             medians = session["session_medians"]
                             print(
                                 f"{name} {version} session {session_index}: "
-                                f"{session['pkg']} {session['threads']} thread(s), "
+                                f"{session['target']} {session['pkg']} "
+                                f"{session['threads']} thread(s), "
                                 f"{medians['decode_tok_s']:.2f} tok/s decode, "
                                 f"{medians['prefill_tok_s']:.1f} tok/s prefill, "
                                 f"{medians['ttft_ms']:.0f} ms ttft, "

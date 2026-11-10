@@ -373,6 +373,7 @@ fn run(options: RunOptions) -> Result<i32, String> {
         model: expected.model,
         commit: env::var("GPT2_FAST_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
         started_at,
+        target: "cpu-linux".to_string(),
         host,
         worker_cmd: options.worker,
         load_ms,

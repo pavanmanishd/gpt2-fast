@@ -1,7 +1,8 @@
 # web
 
 The browser build: the same engine, compiled to WebAssembly and run in a Web
-Worker. Weights are downloaded once and kept in the browser's Cache API.
+Worker, with an optional WebGPU backend that runs the forward pass in compute
+shaders. Weights are downloaded once and kept in the browser's Cache API.
 
 ## Website
 
@@ -16,6 +17,8 @@ framework, bundler, external JavaScript, web fonts or analytics.
 | `data/milestones.json` | Generated milestone data. Do not edit by hand. |
 | `dev.html` | The old development page, driven by `main.js`. |
 | `worker.js` | Shared Web Worker: loads weights, encodes text, generates and streams tokens. Used by the site, the dev page and the benchmark. |
+| `gpu/engine.js` | The WebGPU backend: buffers, pipelines, weight upload, decode loop and readback. |
+| `gpu/shaders.js` | WGSL compute shaders for embeddings, layer norm, linear layers, attention, residual adds, the tied head and argmax. |
 | `thread.js` | The pool worker for the threaded build: joins the engine's shared memory and runs its worker loop. |
 | `bench.html`, `bench.js` | The browser benchmark page. |
 | `serve.py` | Development server that sends the COOP/COEP headers `SharedArrayBuffer` requires. |
@@ -103,6 +106,38 @@ the threaded build. The site only picks the threaded package when
 `crossOriginIsolated` is true and the worker falls back to `pkg` when the
 threaded build or shared memory is unavailable, so both pages keep working
 under a plain static server without the headers.
+
+## WebGPU
+
+Add `?backend=webgpu` to the worker or benchmark URL to run the forward pass
+with WGSL compute shaders instead of WebAssembly. The worker still uses the
+WebAssembly engine to parse the safetensors file and to tokenize; the weights
+are uploaded to storage buffers once. Every layer runs on the GPU: the KV cache,
+activations and the chosen token id stay there, and only the token id is copied
+back after each step (the full logits are copied only for a `logits` request).
+
+`wte` is 154 MB at f32 and can exceed the adapter's default 128 MB storage
+binding limit, so the adapter's limits are requested and the table is split
+across two bindings when needed; `maxBufferSize` is checked as well. The decode
+loop submits up to `pipeline=4` steps before it waits for the first token, so
+the argmax pass can feed the next step's embedding without a round trip. Use
+`pipeline=1` for the simple wait-after-each-step version.
+
+If `navigator.gpu` is missing, no adapter is returned, the adapter is a
+software fallback, or the limits are too small, the worker builds the usual
+CPU engine and the ready message reports `backend: "cpu"` with a `fallback`
+reason. The benchmark session then records that the requested backend was
+WebGPU but the CPU one ran.
+
+```sh
+uv run web/run_bench.py --label W4-chromium --browser chromium \
+  --backend webgpu --weights int8 --sessions 1
+uv run web/run_bench.py --label W4-chrome --browser chrome \
+  --backend webgpu --weights f32 --sessions 1
+```
+
+`--browser chrome` launches the installed Google Chrome with Playwright's
+temporary profile; `--pipeline` overrides the number of steps in flight.
 
 ## Benchmark sessions
 
