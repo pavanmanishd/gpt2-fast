@@ -27,7 +27,7 @@ pub fn write_int8(model_dir: &Path, out: &Path) -> Result<(), Error> {
         let prefix = format!("h.{layer}");
         writer.f32_vector(&mut tensors, &format!("{prefix}.ln_1.weight"), n_embd)?;
         writer.f32_vector(&mut tensors, &format!("{prefix}.ln_1.bias"), n_embd)?;
-        writer.int8_columns(
+        writer.int8_output_rows(
             &mut tensors,
             &format!("{prefix}.attn.c_attn.weight"),
             n_embd,
@@ -38,7 +38,7 @@ pub fn write_int8(model_dir: &Path, out: &Path) -> Result<(), Error> {
             &format!("{prefix}.attn.c_attn.bias"),
             3 * n_embd,
         )?;
-        writer.int8_columns(
+        writer.int8_output_rows(
             &mut tensors,
             &format!("{prefix}.attn.c_proj.weight"),
             n_embd,
@@ -47,14 +47,14 @@ pub fn write_int8(model_dir: &Path, out: &Path) -> Result<(), Error> {
         writer.f32_vector(&mut tensors, &format!("{prefix}.attn.c_proj.bias"), n_embd)?;
         writer.f32_vector(&mut tensors, &format!("{prefix}.ln_2.weight"), n_embd)?;
         writer.f32_vector(&mut tensors, &format!("{prefix}.ln_2.bias"), n_embd)?;
-        writer.int8_columns(
+        writer.int8_output_rows(
             &mut tensors,
             &format!("{prefix}.mlp.c_fc.weight"),
             n_embd,
             n_inner,
         )?;
         writer.f32_vector(&mut tensors, &format!("{prefix}.mlp.c_fc.bias"), n_inner)?;
-        writer.int8_columns(
+        writer.int8_output_rows(
             &mut tensors,
             &format!("{prefix}.mlp.c_proj.weight"),
             n_inner,
@@ -101,17 +101,17 @@ impl Writer {
         Ok(())
     }
 
-    fn int8_columns(
+    fn int8_output_rows(
         &mut self,
         tensors: &mut SafeTensors,
         name: &str,
         n_in: usize,
         n_out: usize,
     ) -> Result<(), Error> {
-        let (data, scale) = tensors.quantize_columns(name, n_in, n_out)?;
-        self.int8(name, &[n_in, n_out], &data);
+        let (data, scale) = tensors.quantize_transposed(name, n_in, n_out)?;
+        self.int8(name, &[n_out, n_in], &data);
         let groups = n_in.div_ceil(GROUP_SIZE);
-        self.f32(&format!("{name}.scales"), &[groups, n_out], &scale);
+        self.f32(&format!("{name}.scales"), &[n_out, groups], &scale);
         Ok(())
     }
 

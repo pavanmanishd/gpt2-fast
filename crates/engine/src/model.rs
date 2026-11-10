@@ -1,16 +1,14 @@
 use std::cell::RefCell;
+use std::ops::Range;
 use std::path::Path;
 
 use crate::parallel::Threads;
 use crate::quantize::GROUP_SIZE;
 use crate::safetensors::SafeTensors;
 use crate::simd::{
-    dot, int8_dot, int8_linear_columns, int8_linear_rows, linear_columns, linear_rows,
-    weighted_sum, Epilogue,
+    dot, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum, Epilogue,
 };
 use crate::{argmax, Config, Error};
-
-const COLUMN_ALIGN: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Weights {
@@ -41,19 +39,20 @@ enum Matrix {
 }
 
 impl Matrix {
-    fn row_dot(&self, x: &[f32], row: usize, len: usize) -> f32 {
-        let start = row * len;
+    fn outputs(&self, x: &[f32], n_in: usize, outputs: Range<usize>, y: &mut [f32]) {
         match self {
-            Matrix::F32(data) => dot(x, &data[start..start + len]),
-            Matrix::Int8 { data, scale } => {
-                let groups = len.div_ceil(GROUP_SIZE);
-                int8_dot(
-                    x,
-                    &data[start..start + len],
-                    &scale[row * groups..(row + 1) * groups],
-                    GROUP_SIZE,
-                )
-            }
+            Matrix::F32(data) => linear_outputs(x, data, None, n_in, outputs, y, Epilogue::Store),
+            Matrix::Int8 { data, scale } => int8_linear_outputs(
+                x,
+                data,
+                scale,
+                None,
+                n_in,
+                outputs,
+                y,
+                Epilogue::Store,
+                GROUP_SIZE,
+            ),
         }
     }
 
@@ -84,15 +83,17 @@ fn load_matrix(
     weights: Weights,
 ) -> Result<Matrix, Error> {
     match weights {
-        Weights::F32 => Ok(Matrix::F32(tensors.load_matrix(name, n_in, n_out)?)),
+        Weights::F32 => Ok(Matrix::F32(
+            tensors.load_matrix_transposed(name, n_in, n_out)?,
+        )),
         Weights::Int8 => {
-            let (data, scale) = match tensors.load_int8(name, n_in, n_out)? {
+            let groups = n_in.div_ceil(GROUP_SIZE);
+            let (data, scale) = match tensors.load_int8(name, n_out, n_in)? {
                 Some(data) => {
-                    let groups = n_in.div_ceil(GROUP_SIZE);
-                    let scale = tensors.load_matrix(&format!("{name}.scales"), groups, n_out)?;
+                    let scale = tensors.load_matrix(&format!("{name}.scales"), n_out, groups)?;
                     (data, scale)
                 }
-                None => tensors.quantize_columns(name, n_in, n_out)?,
+                None => tensors.quantize_transposed(name, n_in, n_out)?,
             };
             Ok(Matrix::Int8 { data, scale })
         }
@@ -398,9 +399,7 @@ impl Model {
 
         let wte = &self.wte;
         self.threads.run(&mut workspace.logits, 1, |start, part| {
-            for (offset, logit) in part.iter_mut().enumerate() {
-                *logit = wte.row_dot(hidden, start + offset, n_embd);
-            }
+            wte.outputs(hidden, n_embd, start..start + part.len(), part);
         });
         &workspace.logits
     }
@@ -479,13 +478,12 @@ fn linear_f32(
     epilogue: Epilogue,
 ) {
     if rows == 1 {
-        threads.run(y, COLUMN_ALIGN, |start, part| {
-            linear_columns(
+        threads.run(y, 1, |start, part| {
+            linear_outputs(
                 x,
                 weight,
-                bias,
+                Some(&bias[start..start + part.len()]),
                 n_in,
-                n_out,
                 start..start + part.len(),
                 part,
                 epilogue,
@@ -523,14 +521,13 @@ fn linear_int8(
     epilogue: Epilogue,
 ) {
     if rows == 1 {
-        threads.run(y, COLUMN_ALIGN, |start, part| {
-            int8_linear_columns(
+        threads.run(y, 1, |start, part| {
+            int8_linear_outputs(
                 x,
                 weight,
                 scale,
-                bias,
+                Some(&bias[start..start + part.len()]),
                 n_in,
-                n_out,
                 start..start + part.len(),
                 part,
                 epilogue,

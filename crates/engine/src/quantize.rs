@@ -1,54 +1,5 @@
 pub(crate) const GROUP_SIZE: usize = 64;
 
-pub(crate) struct Columns {
-    group: usize,
-    n_out: usize,
-    scale: Vec<f32>,
-    data: Vec<i8>,
-}
-
-impl Columns {
-    pub(crate) fn new(n_in: usize, n_out: usize, group: usize) -> Columns {
-        let groups = n_in.div_ceil(group);
-        Columns {
-            group,
-            n_out,
-            scale: vec![0.0; groups * n_out],
-            data: Vec::with_capacity(n_in * n_out),
-        }
-    }
-
-    pub(crate) fn observe(&mut self, row: usize, values: &[f32]) {
-        let offset = row / self.group * self.n_out;
-        for (scale, &value) in self.scale[offset..offset + self.n_out]
-            .iter_mut()
-            .zip(values)
-        {
-            *scale = scale.max(value.abs());
-        }
-    }
-
-    pub(crate) fn finish(&mut self) {
-        for scale in &mut self.scale {
-            *scale /= 127.0;
-        }
-    }
-
-    pub(crate) fn push(&mut self, row: usize, values: &[f32]) {
-        let offset = row / self.group * self.n_out;
-        self.data.extend(
-            values
-                .iter()
-                .zip(&self.scale[offset..offset + self.n_out])
-                .map(|(&value, &scale)| round(value, scale)),
-        );
-    }
-
-    pub(crate) fn into_parts(self) -> (Vec<i8>, Vec<f32>) {
-        (self.data, self.scale)
-    }
-}
-
 pub(crate) struct Rows {
     group: usize,
     scale: Vec<f32>,
@@ -91,7 +42,7 @@ fn round(value: f32, scale: f32) -> i8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Columns, Rows};
+    use super::Rows;
 
     fn check_round_trip(
         data: &[i8],
@@ -110,37 +61,6 @@ mod tests {
                 scale[group]
             );
         }
-    }
-
-    #[test]
-    fn columns_keep_one_scale_per_group_and_output_channel_within_half_a_scale() {
-        let (rows, cols, group) = (9, 7, 4);
-        let values: Vec<f32> = (0..rows * cols)
-            .map(|i| ((i * 37 + 11) % 101) as f32 / 23.0 - 2.0)
-            .collect();
-        let mut quantizer = Columns::new(rows, cols, group);
-        for (row, values) in values.chunks(cols).enumerate() {
-            quantizer.observe(row, values);
-        }
-        quantizer.finish();
-        for (row, values) in values.chunks(cols).enumerate() {
-            quantizer.push(row, values);
-        }
-        let (data, scale) = quantizer.into_parts();
-
-        let groups = rows.div_ceil(group);
-        assert_eq!(scale.len(), groups * cols);
-        for g in 0..groups {
-            for column in 0..cols {
-                let max = (g * group..rows.min((g + 1) * group))
-                    .map(|row| values[row * cols + column].abs())
-                    .fold(0.0f32, f32::max);
-                assert_eq!(scale[g * cols + column], max / 127.0);
-            }
-        }
-        check_round_trip(&data, &scale, &values, |index| {
-            index / cols / group * cols + index % cols
-        });
     }
 
     #[test]

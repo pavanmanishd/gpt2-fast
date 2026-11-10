@@ -50,7 +50,7 @@ PyTorch perplexities are the reference values (`reference/perplexity-*.json`); x
 
 ## Measurement notes
 
-- gpt2-xl's later sessions were slower: f32 session medians 7.8, 7.8, 7.8, 7.9, 6.4; int8 16.0, 15.1, 15.3, 13.3, 10.7. No other container ran; we don't know the cause (possibly heat after hours of load). The median absorbs it, but treat xl's int8 number as ±10%.
+- gpt2-xl's later sessions were slower: f32 session medians 7.8, 7.8, 7.8, 7.9, 6.4; int8 16.0, 15.1, 15.3, 13.3, 10.7. No other container ran. The macOS power log (`pmset -g log`) shows the Mac was unplugged at 11:43, during the xl runs, so the last sessions ran on battery with the power management that comes with it. The median absorbs most of it; xl will be re-measured on AC power.
 - The first attempt at this run stopped when the Mac went to sleep and the Docker VM hung. All N8 numbers come from the second run, which kept the machine awake.
 
 ## Post draft

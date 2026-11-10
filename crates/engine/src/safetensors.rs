@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::quantize::{Columns, Rows, GROUP_SIZE};
+use crate::quantize::{Rows, GROUP_SIZE};
 use crate::Error;
 
 const MAX_HEADER_BYTES: u64 = 64 * 1024 * 1024;
@@ -85,6 +85,22 @@ impl<'a> SafeTensors<'a> {
             )));
         }
         Ok(data)
+    }
+
+    pub(crate) fn load_matrix_transposed(
+        &mut self,
+        name: &str,
+        n_in: usize,
+        n_out: usize,
+    ) -> Result<Vec<f32>, Error> {
+        let input_major = self.load_matrix(name, n_in, n_out)?;
+        let mut output_major = vec![0.0; n_in * n_out];
+        for p in 0..n_in {
+            for j in 0..n_out {
+                output_major[j * n_in + p] = input_major[p * n_out + j];
+            }
+        }
+        Ok(output_major)
     }
 
     pub(crate) fn load_int8(
@@ -179,18 +195,17 @@ impl<'a> SafeTensors<'a> {
         Ok(())
     }
 
-    pub(crate) fn quantize_columns(
+    pub(crate) fn quantize_transposed(
         &mut self,
         name: &str,
-        rows: usize,
-        cols: usize,
+        n_in: usize,
+        n_out: usize,
     ) -> Result<(Vec<i8>, Vec<f32>), Error> {
-        let mut quantizer = Columns::new(rows, cols, GROUP_SIZE);
-        self.for_each_row(name, rows, cols, |row, values| {
-            quantizer.observe(row, values)
-        })?;
-        quantizer.finish();
-        self.for_each_row(name, rows, cols, |row, values| quantizer.push(row, values))?;
+        let values = self.load_matrix_transposed(name, n_in, n_out)?;
+        let mut quantizer = Rows::new(n_out, n_in, GROUP_SIZE);
+        for row in values.chunks(n_in) {
+            quantizer.push(row);
+        }
         Ok(quantizer.into_parts())
     }
 
@@ -401,6 +416,18 @@ mod tests {
         assert_eq!(
             tensors.load_int8("quantized", 2, 2).expect("int8 matrix"),
             Some(vec![-1, 2, -3, 4])
+        );
+    }
+
+    #[test]
+    fn transposes_an_input_major_matrix() {
+        let bytes = sample();
+        let mut tensors = SafeTensors::from_bytes(&bytes).expect("parse");
+        assert_eq!(
+            tensors
+                .load_matrix_transposed("weight", 2, 2)
+                .expect("transposed f32 matrix"),
+            vec![1.0, 3.5, -2.0, 4.25]
         );
     }
 
