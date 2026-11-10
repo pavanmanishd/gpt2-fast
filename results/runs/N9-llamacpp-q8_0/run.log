@@ -1,0 +1,2 @@
+summary written to results/runs/N9-llamacpp-q8_0/summary.json
+{"date":"<date>","milestone":"N9-llamacpp-q8_0","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":541.099,"prefill_tok_s":3041.168,"ttft_ms":22.095,"peak_mb":281.398,"matches_reference":false,"token_match_rate":0.284375,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}

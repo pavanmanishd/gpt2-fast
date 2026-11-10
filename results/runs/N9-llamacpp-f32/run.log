@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N9-llamacpp-f32","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":310.01,"prefill_tok_s":895.033,"ttft_ms":71.12,"peak_mb":542.957,"matches_reference":false,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N9-llamacpp-f32/summary.json

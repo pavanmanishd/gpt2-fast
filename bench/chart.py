@@ -27,16 +27,29 @@ FAINT = "#8b8a85"
 GRID = "#e6e5e0"
 BG = "#fcfcfb"
 BLUE = "#2a78d6"
+ORANGE = "#eb6834"
 GRAY = "#a3a29c"
+DEFAULT_ENGINE = "gpt2-fast"
 
 FIGSIZE = (8, 4.5)
 
 
-def load_rows():
-    rows = [json.loads(line) for line in LOG.read_text().splitlines() if line.strip()]
+def display_path(path):
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def load_rows(path):
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if not rows:
-        raise SystemExit(f"no results in {LOG.relative_to(ROOT)}")
+        raise SystemExit(f"no results in {display_path(path)}")
     return rows
+
+
+def engine(row):
+    return row.get("engine") or DEFAULT_ENGINE
 
 
 def fmt_value(value):
@@ -72,14 +85,16 @@ def new_figure():
     return plt.figure(figsize=FIGSIZE, dpi=200, facecolor=BG)
 
 
-def finish(fig, path):
-    OUT.mkdir(parents=True, exist_ok=True)
+def finish(fig, out_dir, name):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / name
     fig.savefig(path, dpi=200, facecolor=BG)
     plt.close(fig)
     print(path)
 
 
-def header(fig, title, subtitle, headline=None, title_size=13):
+def header(fig, title, subtitle, headline=None, title_size=13,
+           source="Source: results/log.jsonl"):
     fig.text(0.055, 0.975, title, va="top", ha="left", fontsize=title_size,
              color=INK)
     y = 0.915
@@ -89,7 +104,7 @@ def header(fig, title, subtitle, headline=None, title_size=13):
         y = 0.79
     fig.text(0.055, y, subtitle, va="top", ha="left", fontsize=9, color=TEXT,
              linespacing=1.45)
-    fig.text(0.055, 0.03, "Source: results/log.jsonl", va="bottom", ha="left",
+    fig.text(0.055, 0.03, source, va="bottom", ha="left",
              fontsize=8, color=FAINT)
 
 
@@ -103,9 +118,13 @@ def style_axis(ax):
     ax.tick_params(axis="both", length=0, colors=TEXT, labelsize=8.5)
 
 
-def progress():
-    all_rows = load_rows()
-    rows = [row for row in all_rows if "-threads" not in row["milestone"]]
+def progress(log_path, out_dir):
+    all_rows = load_rows(log_path)
+    rows = [
+        row for row in all_rows
+        if "-threads" not in row["milestone"]
+        and (engine(row) == DEFAULT_ENGINE or row["milestone"].startswith("R0"))
+    ]
     values = [row["decode_tok_s"] for row in rows]
     lo, hi = min(values) / 2, max(values) * 2.2
 
@@ -149,7 +168,7 @@ def progress():
         "GPT-2 124M decode speed, tokens per second",
         f"{last['host']} · median of session medians",
     )
-    finish(fig, OUT / "progress.png")
+    finish(fig, out_dir, "progress.png")
 
 
 def previous_label(row):
@@ -157,16 +176,17 @@ def previous_label(row):
     return labels.get(row["milestone"], row["milestone"])
 
 
-def step(name):
-    rows = load_rows()
+def step(name, log_path, out_dir):
+    rows = load_rows(log_path)
     current = next((row for row in rows if row["milestone"] == name), None)
     if current is None:
-        raise SystemExit(f"milestone {name!r} not found in {LOG.relative_to(ROOT)}")
+        raise SystemExit(f"milestone {name!r} not found in {display_path(log_path)}")
 
     index = rows.index(current)
     previous = next(
         (row for row in reversed(rows[:index])
-         if row["milestone"].startswith("N") and "-threads" not in row["milestone"]),
+         if engine(row) == DEFAULT_ENGINE and row["milestone"].startswith("N")
+         and "-threads" not in row["milestone"]),
         None,
     )
     if previous is None:
@@ -224,21 +244,118 @@ def step(name):
                     fontsize=8.5, color=TEXT)
         style_axis(ax)
 
-    finish(fig, OUT / f"step-{name}.png")
+    finish(fig, out_dir, f"step-{name}.png")
+
+
+def race(log_path, out_dir):
+    rows = load_rows(log_path)
+    by_milestone = {row["milestone"]: row for row in rows}
+    ours = [
+        row for row in rows
+        if engine(row) == DEFAULT_ENGINE and not row["milestone"].startswith("R0")
+    ]
+    exact = next(
+        (row for row in reversed(ours) if row["token_match_rate"] == 1.0), None
+    )
+    approx = next(
+        (row for row in reversed(ours) if row["token_match_rate"] < 1.0), None
+    )
+
+    entries = []
+    for row, name, color in (
+        (by_milestone.get("R0-torch"), "PyTorch", GRAY),
+        (by_milestone.get("R0-numpy"), "NumPy", GRAY),
+        (by_milestone.get("N9-llamacpp-f32"), "llama.cpp f32", ORANGE),
+        (exact, "gpt2-fast f32", BLUE),
+        (by_milestone.get("N9-llamacpp-f16"), "llama.cpp f16", ORANGE),
+        (by_milestone.get("N9-llamacpp-q8_0"), "llama.cpp q8_0", ORANGE),
+        (approx, "gpt2-fast int8", BLUE),
+    ):
+        if row is None:
+            continue
+        display = f"{name} ({row['milestone']})" if name.startswith("gpt2-fast") else name
+        entries.append({"label": display, "name": name, "row": row, "color": color})
+
+    if not entries:
+        raise SystemExit(f"no race results in {display_path(log_path)}")
+
+    fig = new_figure()
+    labels = [entry["label"] for entry in entries]
+    gutter = max(len(text) for text in labels) * 8.5 * 0.62 / 72 + 0.2
+    left = min(gutter / 8, 0.30)
+    gap = 0.075
+    width = (0.955 - left - gap) / 2
+    y = list(range(len(entries)))
+
+    for column, (panel_title, field) in enumerate((
+        ("Decode, tokens/s", "decode_tok_s"),
+        ("Prompt processing, tokens/s", "prefill_tok_s"),
+    )):
+        ax = fig.add_axes((left + column * (width + gap), 0.17, width, 0.595))
+        values = [entry["row"][field] for entry in entries]
+        bars = ax.barh(y, values, height=0.6,
+                       color=[entry["color"] for entry in entries],
+                       edgecolor=TEXT, linewidth=0)
+        for bar, entry in zip(bars, entries):
+            if entry["row"]["token_match_rate"] < 1.0:
+                bar.set_hatch("////")
+        for yi, value in zip(y, values):
+            ax.annotate(fmt_value(value), (value, yi), xytext=(5, 0),
+                        textcoords="offset points", va="center", ha="left",
+                        fontsize=8.5, color=TEXT)
+        ax.set_xlim(0, max(values) * 1.28)
+        ax.set_ylim(len(entries) - 0.5, -0.5)
+        if column == 0:
+            ax.set_yticks(y, labels)
+        else:
+            ax.set_yticks([])
+        ax.xaxis.set_major_locator(MaxNLocator(4))
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+        ax.grid(axis="x", color=GRID, linewidth=0.6)
+        ax.grid(axis="y", visible=False)
+        ax.set_axisbelow(True)
+        ax.set_title(panel_title, loc="left", fontsize=9.5, color=INK, pad=9)
+        style_axis(ax)
+
+    host = next((row["host"] for row in reversed(rows) if row.get("host")), "")
+    source = "Source: results/log.jsonl"
+    quantized = [
+        entry for entry in entries if entry["row"]["token_match_rate"] < 1.0
+    ]
+    if quantized:
+        agreement = ", ".join(
+            f"{entry['name']} {entry['row']['token_match_rate'] * 100:.1f}%"
+            for entry in quantized
+        )
+        source = f"{source} · token agreement: {agreement}"
+    header(
+        fig,
+        "GPT-2 124M on 4 CPU cores",
+        f"{host} ·\nexact-match rows first, then 16-bit and 8-bit rows",
+        source=source,
+    )
+    finish(fig, out_dir, "race.png")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Chart GPT-2 decode results.")
+    parser.add_argument("--log", type=Path, default=LOG,
+                        help="results log to read (default: results/log.jsonl)")
+    parser.add_argument("--out", type=Path, default=OUT,
+                        help="directory for the rendered charts (default: results/charts)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("progress", help="one bar per milestone")
     step_parser = sub.add_parser("step", help="before/after card for one milestone")
     step_parser.add_argument("milestone")
+    sub.add_parser("race", help="gpt2-fast against llama.cpp and the references")
     args = parser.parse_args()
 
     if args.command == "progress":
-        progress()
+        progress(args.log, args.out)
+    elif args.command == "step":
+        step(args.milestone, args.log, args.out)
     else:
-        step(args.milestone)
+        race(args.log, args.out)
 
 
 if __name__ == "__main__":

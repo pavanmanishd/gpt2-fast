@@ -1,0 +1,13 @@
+{
+  "label": "N9-llamacpp-f16",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 393.3158175656919,
+  "prefill_tok_s": 839.1563240786841,
+  "ttft_ms": 75.774064,
+  "peak_mb": 308.7578125,
+  "matches_reference": false,
+  "near_tie_mismatch": false,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}
