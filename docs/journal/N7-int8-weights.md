@@ -29,7 +29,7 @@ Token agreement per prompt: two prompts (p032, p128) match all 128 tokens; p064 
 
 ## Why decode got faster but prefill didn't
 
-- **Decode** reads every weight once per token, so its speed tracks bytes moved. Weights went from 474 MB to 119 MB (plus 7 MB of scales), about 3.8× fewer bytes, and decode got 1.9× faster. It doesn't get the full 3.8×: in host tests, int8 on one thread was only 1.2-1.3× faster than f32, because widening int8 to f32 costs about five instructions per eight weights. One core can't do that conversion fast enough to use the bandwidth saved. With four cores sharing the work, the bandwidth saving shows.
+- **Decode** reads every weight once per token, so its speed tracks bytes moved. Weights went from 474 MB to 119 MB (plus 7 MB of scales), about 3.8× fewer bytes, and decode got 1.9× faster. It doesn't get the full 3.8×: in host tests, int8 on one thread was only 1.2-1.3× faster than f32, because widening int8 to f32 costs about five instructions per eight weights. One core can't do that conversion fast enough to use the bandwidth saved. With four cores sharing the work, the bandwidth saving shows. The flame graph (`results/runs/N7/flame.svg`) shows the shift: in N6, 44% of samples sat on vector loads of weights; in N7, loads are 5% and the int8 matrix kernels, where the widening happens, are 54%.
 - **Prefill** reuses each weight for every prompt token, so it was never waiting on memory, and the widening is now extra arithmetic: 13% slower.
 
 ## The first attempt lost too much quality
