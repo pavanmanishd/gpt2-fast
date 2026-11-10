@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N3-quiet","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":43.294,"prefill_tok_s":190.394,"ttft_ms":332.221,"peak_mb":559.934,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N3-quiet/summary.json

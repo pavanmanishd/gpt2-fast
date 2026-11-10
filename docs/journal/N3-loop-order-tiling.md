@@ -59,7 +59,7 @@ Swapping the loops is a 10× gain on its own; tiling adds another 20-25%.
 
 ## Noise in this run
 
-Some individual runs were about half the speed of the rest: on the 255-token prompt, 4 of 25 runs decoded at 18-29 tok/s instead of about 40. The other runs in the same sessions were normal. Other development work (builds, a headless browser) was running on the host at the time. The medians absorb these runs: session medians ranged from 39.5 to 45.0 tok/s. The whole ladder will be re-measured on a quiet machine before the final comparison.
+Some individual runs were about half the speed of the rest: on the 255-token prompt, 4 of 25 runs decoded at 18-29 tok/s instead of about 40. The other runs in the same sessions were normal. Other development work (builds, a headless browser) was running on the host at the time. The medians absorb these runs: session medians ranged from 39.5 to 45.0 tok/s. A re-run of the same code on an idle machine (`results/runs/N3-quiet/`, 5 sessions) gave 43.29 tok/s decode and 190.4 tok/s prefill, within 3% of the numbers above, so they stand.
 
 ## What didn't work
 
