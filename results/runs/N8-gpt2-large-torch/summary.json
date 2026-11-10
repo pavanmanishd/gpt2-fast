@@ -1,0 +1,13 @@
+{
+  "label": "N8-gpt2-large-torch",
+  "model": "gpt2-large",
+  "target": "cpu-linux",
+  "decode_tok_s": 12.519636623686548,
+  "prefill_tok_s": 198.6273540138527,
+  "ttft_ms": 322.211411,
+  "peak_mb": 6240.5703125,
+  "matches_reference": true,
+  "near_tie_mismatch": false,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}

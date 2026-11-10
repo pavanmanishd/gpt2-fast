@@ -1,0 +1,13 @@
+{
+  "label": "N8-gpt2-large-int8",
+  "model": "gpt2-large",
+  "target": "cpu-linux",
+  "decode_tok_s": 43.911609237460354,
+  "prefill_tok_s": 136.99626886954778,
+  "ttft_ms": 464.56116,
+  "peak_mb": 1158.70703125,
+  "matches_reference": false,
+  "near_tie_mismatch": false,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}

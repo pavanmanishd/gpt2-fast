@@ -1,0 +1,13 @@
+{
+  "label": "N8-gpt2-medium-f32",
+  "model": "gpt2-medium",
+  "target": "cpu-linux",
+  "decode_tok_s": 29.55836564962057,
+  "prefill_tok_s": 123.19229212708235,
+  "ttft_ms": 507.457563,
+  "peak_mb": 1579.78515625,
+  "matches_reference": true,
+  "near_tie_mismatch": false,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}

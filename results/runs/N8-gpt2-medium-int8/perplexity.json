@@ -1,0 +1,7 @@
+{
+  "weights": "int8",
+  "tokens": 1005,
+  "perplexity": 52.92910160714287,
+  "reference_perplexity": 51.696864856161014,
+  "delta": 1.2322367509818548
+}

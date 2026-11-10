@@ -1,0 +1,13 @@
+{
+  "label": "N8-gpt2-xl-f32",
+  "model": "gpt2-xl",
+  "target": "cpu-linux",
+  "decode_tok_s": 7.792074533310883,
+  "prefill_tok_s": 37.23289268434566,
+  "ttft_ms": 1669.129765,
+  "peak_mb": 6633.359375,
+  "matches_reference": true,
+  "near_tie_mismatch": false,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}

@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N8-gpt2-xl-f32","title":"<title>","commit":"<commit>","model":"gpt2-xl","target":"cpu-linux","decode_tok_s":7.792,"prefill_tok_s":37.233,"ttft_ms":1669.13,"peak_mb":6633.359,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N8-gpt2-xl-f32/summary.json

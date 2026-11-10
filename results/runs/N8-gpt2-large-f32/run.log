@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N8-gpt2-large-f32","title":"<title>","commit":"<commit>","model":"gpt2-large","target":"cpu-linux","decode_tok_s":16.028,"prefill_tok_s":71.797,"ttft_ms":860.043,"peak_mb":3336.258,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N8-gpt2-large-f32/summary.json

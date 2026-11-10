@@ -1,0 +1,2 @@
+summary written to results/runs/N8-gpt2-large-torch/summary.json
+{"date":"<date>","milestone":"N8-gpt2-large-torch","title":"<title>","commit":"<commit>","model":"gpt2-large","target":"cpu-linux","decode_tok_s":12.52,"prefill_tok_s":198.627,"ttft_ms":322.211,"peak_mb":6240.57,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}

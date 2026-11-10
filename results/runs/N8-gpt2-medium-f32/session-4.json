@@ -1,0 +1,285 @@
+{
+  "label": "N8-gpt2-medium-f32",
+  "model": "gpt2-medium",
+  "commit": "4dc76db",
+  "started_at": "2026-11-10T04:05:31Z",
+  "host": {
+    "nproc": 4,
+    "cpu": "unknown",
+    "memory_limit": "8589934592",
+    "kernel": "7.2.9-orbstack-00391-g2b298d05fbd4"
+  },
+  "worker_cmd": [
+    "worker",
+    "--model-dir",
+    "models/gpt2-medium"
+  ],
+  "load_ms": 582.619585,
+  "peak_mb": 1579.78515625,
+  "warmup": 1,
+  "runs": 5,
+  "prompts": [
+    {
+      "id": "p016",
+      "n_prompt": 16,
+      "logit_max_abs_diff": 0.0001373291015625,
+      "matched_tokens": 768,
+      "total_tokens": 768,
+      "first_mismatch": null,
+      "near_tie": true,
+      "runs": [
+        {
+          "ttft_ms": 141.806275,
+          "prefill_tok_s": 112.8299858380738,
+          "decode_tok_s": 29.81027943617246,
+          "total_ms": 4402.0816700000005,
+          "matches": true
+        },
+        {
+          "ttft_ms": 142.488443,
+          "prefill_tok_s": 112.28980865486754,
+          "decode_tok_s": 29.616143710871942,
+          "total_ms": 4430.690217,
+          "matches": true
+        },
+        {
+          "ttft_ms": 141.69989999999999,
+          "prefill_tok_s": 112.91468801318844,
+          "decode_tok_s": 30.212163361397952,
+          "total_ms": 4345.304868,
+          "matches": true
+        },
+        {
+          "ttft_ms": 141.79435800000002,
+          "prefill_tok_s": 112.83946854923522,
+          "decode_tok_s": 29.79645253083649,
+          "total_ms": 4404.046714,
+          "matches": true
+        },
+        {
+          "ttft_ms": 141.600108,
+          "prefill_tok_s": 112.99426410042004,
+          "decode_tok_s": 30.0591849161643,
+          "total_ms": 4366.598236,
+          "matches": true
+        }
+      ],
+      "medians": {
+        "decode_tok_s": 29.81027943617246,
+        "prefill_tok_s": 112.83946854923522,
+        "ttft_ms": 141.79435800000002
+      }
+    },
+    {
+      "id": "p032",
+      "n_prompt": 32,
+      "logit_max_abs_diff": 0.00020599365234375,
+      "matched_tokens": 768,
+      "total_tokens": 768,
+      "first_mismatch": null,
+      "near_tie": true,
+      "runs": [
+        {
+          "ttft_ms": 264.456977,
+          "prefill_tok_s": 121.00266880083107,
+          "decode_tok_s": 29.72376878066285,
+          "total_ms": 4537.13185,
+          "matches": true
+        },
+        {
+          "ttft_ms": 272.890533,
+          "prefill_tok_s": 117.26313715690533,
+          "decode_tok_s": 29.79205597440698,
+          "total_ms": 4535.77189,
+          "matches": true
+        },
+        {
+          "ttft_ms": 269.87632,
+          "prefill_tok_s": 118.57283365950744,
+          "decode_tok_s": 29.46024184085113,
+          "total_ms": 4580.771006,
+          "matches": true
+        },
+        {
+          "ttft_ms": 264.250935,
+          "prefill_tok_s": 121.09701712124499,
+          "decode_tok_s": 29.367303411052017,
+          "total_ms": 4588.788269000001,
+          "matches": true
+        },
+        {
+          "ttft_ms": 264.769936,
+          "prefill_tok_s": 120.85964321870743,
+          "decode_tok_s": 29.79513453420322,
+          "total_ms": 4527.2108339999995,
+          "matches": true
+        }
+      ],
+      "medians": {
+        "decode_tok_s": 29.72376878066285,
+        "prefill_tok_s": 120.85964321870743,
+        "ttft_ms": 264.769936
+      }
+    },
+    {
+      "id": "p064",
+      "n_prompt": 64,
+      "logit_max_abs_diff": 0.000335693359375,
+      "matched_tokens": 768,
+      "total_tokens": 768,
+      "first_mismatch": null,
+      "near_tie": true,
+      "runs": [
+        {
+          "ttft_ms": 507.4182109999999,
+          "prefill_tok_s": 126.12870136030654,
+          "decode_tok_s": 29.324139409945662,
+          "total_ms": 4838.321097,
+          "matches": true
+        },
+        {
+          "ttft_ms": 504.44399799999997,
+          "prefill_tok_s": 126.8723589808675,
+          "decode_tok_s": 29.96218641844646,
+          "total_ms": 4743.119981999999,
+          "matches": true
+        },
+        {
+          "ttft_ms": 503.926747,
+          "prefill_tok_s": 127.00258595323182,
+          "decode_tok_s": 29.957760967645154,
+          "total_ms": 4743.228881,
+          "matches": true
+        },
+        {
+          "ttft_ms": 503.75157299999995,
+          "prefill_tok_s": 127.04674968826352,
+          "decode_tok_s": 29.054107890870796,
+          "total_ms": 4874.906264,
+          "matches": true
+        },
+        {
+          "ttft_ms": 506.84024400000004,
+          "prefill_tok_s": 126.27253016632987,
+          "decode_tok_s": 29.97187699134065,
+          "total_ms": 4744.14577,
+          "matches": true
+        }
+      ],
+      "medians": {
+        "decode_tok_s": 29.957760967645154,
+        "prefill_tok_s": 126.8723589808675,
+        "ttft_ms": 504.44399799999997
+      }
+    },
+    {
+      "id": "p128",
+      "n_prompt": 128,
+      "logit_max_abs_diff": 0.0002288818359375,
+      "matched_tokens": 768,
+      "total_tokens": 768,
+      "first_mismatch": null,
+      "near_tie": true,
+      "runs": [
+        {
+          "ttft_ms": 987.733906,
+          "prefill_tok_s": 129.58955769611902,
+          "decode_tok_s": 29.341637200874292,
+          "total_ms": 5316.054072,
+          "matches": true
+        },
+        {
+          "ttft_ms": 984.5781089999999,
+          "prefill_tok_s": 130.00492173242094,
+          "decode_tok_s": 29.123440840734926,
+          "total_ms": 5345.3265759999995,
+          "matches": true
+        },
+        {
+          "ttft_ms": 1016.5061589999999,
+          "prefill_tok_s": 125.92151937959876,
+          "decode_tok_s": 29.391937876607635,
+          "total_ms": 5337.418939,
+          "matches": true
+        },
+        {
+          "ttft_ms": 1024.420004,
+          "prefill_tok_s": 124.94875100076628,
+          "decode_tok_s": 29.22256398685762,
+          "total_ms": 5370.376781,
+          "matches": true
+        },
+        {
+          "ttft_ms": 1091.309525,
+          "prefill_tok_s": 117.29028022549332,
+          "decode_tok_s": 29.616286177291073,
+          "total_ms": 5379.4906710000005,
+          "matches": true
+        }
+      ],
+      "medians": {
+        "decode_tok_s": 29.341637200874292,
+        "prefill_tok_s": 125.92151937959876,
+        "ttft_ms": 1016.5061589999999
+      }
+    },
+    {
+      "id": "p256",
+      "n_prompt": 255,
+      "logit_max_abs_diff": 0.00012969970703125,
+      "matched_tokens": 768,
+      "total_tokens": 768,
+      "first_mismatch": null,
+      "near_tie": true,
+      "runs": [
+        {
+          "ttft_ms": 2045.077586,
+          "prefill_tok_s": 124.68964588221739,
+          "decode_tok_s": 28.931698374749157,
+          "total_ms": 6434.726557,
+          "matches": true
+        },
+        {
+          "ttft_ms": 2061.313403,
+          "prefill_tok_s": 123.70753502542475,
+          "decode_tok_s": 29.322964467728568,
+          "total_ms": 6392.389824000001,
+          "matches": true
+        },
+        {
+          "ttft_ms": 2044.6258359999997,
+          "prefill_tok_s": 124.71719544484912,
+          "decode_tok_s": 27.7218637850477,
+          "total_ms": 6625.847394,
+          "matches": true
+        },
+        {
+          "ttft_ms": 2043.382417,
+          "prefill_tok_s": 124.79308712775322,
+          "decode_tok_s": 29.265129436611943,
+          "total_ms": 6383.018101000001,
+          "matches": true
+        },
+        {
+          "ttft_ms": 2043.722085,
+          "prefill_tok_s": 124.77234643182905,
+          "decode_tok_s": 29.334012243408317,
+          "total_ms": 6373.1673359999995,
+          "matches": true
+        }
+      ],
+      "medians": {
+        "decode_tok_s": 29.265129436611943,
+        "prefill_tok_s": 124.71719544484912,
+        "ttft_ms": 2044.6258359999997
+      }
+    }
+  ],
+  "session_medians": {
+    "decode_tok_s": 29.46024184085113,
+    "prefill_tok_s": 124.68964588221739,
+    "ttft_ms": 504.44399799999997
+  },
+  "matches_reference": true,
+  "near_tie_mismatch": false
+}

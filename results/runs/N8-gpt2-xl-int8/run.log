@@ -1,0 +1,2 @@
+summary written to results/runs/N8-gpt2-xl-int8/summary.json
+{"date":"<date>","milestone":"N8-gpt2-xl-int8","title":"<title>","commit":"<commit>","model":"gpt2-xl","target":"cpu-linux","decode_tok_s":15.084,"prefill_tok_s":42.592,"ttft_ms":1437.545,"peak_mb":2195.223,"matches_reference":false,"token_match_rate":0.996875,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
