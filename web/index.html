@@ -4,153 +4,254 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>gpt2-fast: GPT-2 in your browser</title>
-    <style>
-      :root {
-        color-scheme: light dark;
-        --ink: #16181d;
-        --muted: #6b7280;
-        --line: #d8dbe2;
-        --paper: #ffffff;
-        --panel: #f5f6f8;
-        --accent: #0b6bcb;
-      }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --ink: #eceef2;
-          --muted: #9aa1ad;
-          --line: #30343c;
-          --paper: #121317;
-          --panel: #1a1c21;
-          --accent: #6aa9ff;
-        }
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        margin: 0;
-        background: var(--paper);
-        color: var(--ink);
-        font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI",
-          sans-serif;
-      }
-      main {
-        max-width: 46rem;
-        margin: 0 auto;
-        padding: 4rem 1.25rem 5rem;
-      }
-      h1 {
-        margin: 0 0 0.5rem;
-        font-size: 1.75rem;
-        letter-spacing: -0.02em;
-      }
-      .lede {
-        margin: 0 0 1.5rem;
-        color: var(--muted);
-      }
-      .status {
-        margin: 0 0 1.5rem;
-        padding: 0.6rem 0.8rem;
-        border: 1px solid var(--line);
-        border-radius: 0.5rem;
-        background: var(--panel);
-        color: var(--muted);
-        font-size: 0.9rem;
-      }
-      label {
-        display: block;
-        margin-bottom: 0.4rem;
-        font-size: 0.85rem;
-        font-weight: 600;
-      }
-      textarea {
-        width: 100%;
-        resize: vertical;
-        padding: 0.7rem 0.8rem;
-        border: 1px solid var(--line);
-        border-radius: 0.5rem;
-        background: var(--paper);
-        color: var(--ink);
-        font: inherit;
-      }
-      .controls {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 1rem;
-        margin: 0.9rem 0 1.5rem;
-      }
-      button {
-        padding: 0.55rem 1.1rem;
-        border: 1px solid transparent;
-        border-radius: 0.45rem;
-        background: var(--accent);
-        color: #fff;
-        font: inherit;
-        font-weight: 600;
-        cursor: pointer;
-      }
-      button:disabled {
-        opacity: 0.5;
-        cursor: default;
-      }
-      .stats {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 0.35rem 1.1rem;
-        color: var(--muted);
-        font-size: 0.85rem;
-      }
-      .stats b {
-        color: var(--ink);
-        font-variant-numeric: tabular-nums;
-      }
-      pre {
-        min-height: 12rem;
-        margin: 0;
-        padding: 1rem;
-        border: 1px solid var(--line);
-        border-radius: 0.5rem;
-        background: var(--panel);
-        white-space: pre-wrap;
-        overflow-wrap: anywhere;
-        font: 0.95rem/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas,
-          monospace;
-      }
-      .note {
-        margin-top: 1.5rem;
-        color: var(--muted);
-        font-size: 0.8rem;
-      }
-    </style>
+    <meta
+      name="description"
+      content="GPT-2 written from scratch in Rust, measured one step at a time, and running in your browser."
+    />
+    <link rel="stylesheet" href="./site.css" />
   </head>
   <body>
+    <a class="skip-link" href="#demo">Skip to the demo</a>
     <main>
-      <h1>GPT-2, in your browser</h1>
-      <p class="lede">
-        The 124M-parameter model runs on this device. The weights download once
-        and stay in your browser's storage. Nothing you type leaves the device.
-      </p>
-      <p id="status" class="status">Starting the worker.</p>
+      <header class="hero">
+        <p class="eyebrow">gpt2-fast</p>
+        <h1>GPT-2, one measured step at a time</h1>
+        <p class="lede">
+          GPT-2 written from scratch in Rust, made faster one measured step at a
+          time, and compiled to WebAssembly to run in this browser; nothing you
+          type is sent to a server.
+        </p>
+      </header>
 
-      <label for="prompt">Prompt</label>
-      <textarea id="prompt" rows="4">When I wrote the following pages, or rather the bulk of them, I lived alone, in the woods, a mile from any neighbor, in a house which I had built myself, on the shore of Walden Pond, in Concord, Massachusetts, and earned my living by the labor of my hands only. I lived</textarea>
+      <section id="demo" aria-labelledby="demo-title">
+        <div class="section-head">
+          <h2 id="demo-title">Try it</h2>
+          <p class="section-note">
+            The model runs in a Web Worker on this device. The weights download
+            once and stay in the browser's cache.
+          </p>
+        </div>
 
-      <div class="controls">
-        <button id="generate" disabled>Generate</button>
-        <span class="stats">
-          <span>first token <b id="ttft">&ndash;</b></span>
-          <span><b id="speed">&ndash;</b> tokens/s</span>
-          <span><b id="tokens">0</b> tokens</span>
-        </span>
-      </div>
+        <noscript>
+          <p class="status">This page needs JavaScript and WebAssembly.</p>
+        </noscript>
 
-      <pre id="output" aria-live="polite"></pre>
-      <p class="note">
-        Greedy sampling, 128 new tokens. Speed is this machine's, measured in
-        this tab.
-      </p>
+        <div id="load-panel" class="load-panel">
+          <button id="load-model" type="button" hidden>Load the model (135 MB, cached after the first time)</button>
+          <p id="load-status" class="load-status" role="status" aria-live="polite">
+            Checking browser storage.
+          </p>
+          <div id="progress-wrap" class="progress-wrap" hidden>
+            <div
+              id="progress"
+              class="progress"
+              role="progressbar"
+              aria-label="Model download"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            >
+              <span id="progress-fill"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="prompt-block">
+          <label for="prompt">Prompt</label>
+          <textarea id="prompt" rows="5" spellcheck="false">When I wrote the following pages, or rather the bulk of them, I lived alone, in the woods, a mile from any neighbor, in a house which I had built myself, on the shore of Walden Pond, in Concord, Massachusetts, and earned my living by the labor of my hands only. I lived</textarea>
+        </div>
+
+        <div class="demo-controls">
+          <button id="generate" type="button" disabled>Generate</button>
+          <button id="stop" type="button" class="secondary" disabled>Stop</button>
+          <label class="select-label" for="max-tokens">
+            New tokens
+            <select id="max-tokens">
+              <option value="32">32</option>
+              <option value="64">64</option>
+              <option value="128" selected>128</option>
+              <option value="256">256</option>
+            </select>
+          </label>
+        </div>
+
+        <dl class="meter" aria-label="Live generation meter">
+          <div class="meter-cell">
+            <dt>tokens/s</dt>
+            <dd id="meter-speed">&ndash;</dd>
+          </div>
+          <div class="meter-cell">
+            <dt>first token</dt>
+            <dd id="meter-ttft">&ndash;</dd>
+          </div>
+          <div class="meter-cell">
+            <dt>tokens</dt>
+            <dd id="meter-tokens">0</dd>
+          </div>
+        </dl>
+
+        <pre id="output" class="output" tabindex="0" aria-label="Generated text"></pre>
+
+        <p id="demo-status" class="status" role="status" aria-live="polite">
+          Load the model to start.
+        </p>
+
+        <dl class="specs">
+          <div><dt>Weights</dt><dd>int8</dd></div>
+          <div><dt>WebAssembly SIMD</dt><dd id="simd-state">not loaded</dd></div>
+        </dl>
+
+        <p class="fine">
+          Greedy decoding: the same prompt always gives the same text. Stop ends
+          the worker; the next load comes from the browser's cache.
+        </p>
+      </section>
+
+      <section id="device" aria-labelledby="device-title">
+        <div class="section-head">
+          <h2 id="device-title">Your device</h2>
+          <p id="device-copy" class="section-note">
+            Checking the benchmark configuration.
+          </p>
+        </div>
+
+        <button id="run-bench" type="button" disabled>Run the benchmark</button>
+        <p id="bench-status" class="status" role="status" aria-live="polite">
+          Load the model above first.
+        </p>
+
+        <table id="bench-result" class="compare" hidden>
+          <caption class="sr-only">Benchmark comparison</caption>
+          <thead>
+            <tr>
+              <th scope="col"><span class="sr-only">Metric</span></th>
+              <th scope="col">This device</th>
+              <th scope="col">Project</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">Decode, tok/s</th>
+              <td id="device-decode">&ndash;</td>
+              <td id="project-decode">&ndash;</td>
+            </tr>
+            <tr>
+              <th scope="row">Prefill, tok/s</th>
+              <td id="device-prefill">&ndash;</td>
+              <td id="project-prefill">&ndash;</td>
+            </tr>
+            <tr>
+              <th scope="row">First token</th>
+              <td id="device-ttft">&ndash;</td>
+              <td id="project-ttft">&ndash;</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <p id="project-note" class="fine"></p>
+        <p class="fine">Results stay in this tab. Nothing is sent anywhere.</p>
+      </section>
+
+      <section id="story" aria-labelledby="story-title">
+        <div class="section-head">
+          <h2 id="story-title">The story</h2>
+          <p id="story-intro" class="section-note">
+            Every measured milestone, in order. The chart shows decode speed;
+            the cards show what changed, what it cost, and the journal note for
+            each step.
+          </p>
+        </div>
+
+        <figure class="chart-figure">
+          <div id="chart" class="chart" aria-hidden="true"></div>
+          <div class="legend" aria-hidden="true">
+            <span><span class="swatch swatch-ref"></span>Reference and comparison engines</span>
+            <span><span class="swatch swatch-ours"></span>gpt2-fast</span>
+            <span>
+              <svg class="swatch-hatch" width="14" height="10" viewBox="0 0 14 10" aria-hidden="true">
+                <rect class="legend-hatch-bg" width="14" height="10" />
+                <path class="legend-hatch-line" d="M-2 10 L8 -2 M3 12 L13 2" />
+                <rect class="legend-hatch-edge" x="0.5" y="0.5" width="13" height="9" />
+              </svg>
+              int8
+            </span>
+          </div>
+          <figcaption>
+            Decode speed in tokens per second, on a log scale. The N5 thread
+            runs are in the N5 card.
+          </figcaption>
+        </figure>
+
+        <div id="milestones" class="milestones">
+          <p class="status">Loading the milestone data.</p>
+        </div>
+        <p id="story-note" class="fine"></p>
+      </section>
+
+      <section id="method" aria-labelledby="method-title">
+        <div class="section-head">
+          <h2 id="method-title">How it's measured</h2>
+        </div>
+        <div class="method-copy">
+          <p>
+            The project numbers on this page come from
+            <a data-repo="results/log.jsonl">results/log.jsonl</a>. Native runs
+            use a Linux container limited to
+            <span data-protocol="cores"></span> cores and
+            <span data-protocol="memory_gb"></span> GB.
+          </p>
+          <p>
+            Every milestone except N1 runs in
+            <span data-protocol="sessions"></span> fresh sessions. Each session
+            gives every prompt <span data-protocol="warmups"></span> warm-up and
+            <span data-protocol="timed_runs"></span> timed runs of
+            <span data-protocol="max_new_tokens"></span> tokens. The reported
+            number is the median of the session medians.
+          </p>
+          <p>
+            Decode speed counts tokens after the first. Prefill speed is prompt
+            tokens divided by time to first token. Time to first token is
+            measured from the start of generation.
+          </p>
+          <p>
+            Every run's output is compared with the PyTorch reference. A
+            milestone must match all
+            <span data-protocol="tokens_checked"></span> tokens and pass the
+            logit check; quantized weights are judged by token agreement and
+            perplexity and are shown separately.
+          </p>
+          <p>
+            Prompts were kept only if the winning token leads the runner-up by
+            at least <span data-protocol="near_tie_min"></span> logit at every
+            step, which leaves room for rounding differences. The closest margin
+            in the set is <span data-protocol="closest_gap"></span>.
+          </p>
+          <p class="fine">
+            Raw sessions and flame graphs are in
+            <a data-tree="results/runs">results/runs/</a>. The
+            <a data-repo="SPEC.md">spec</a> defines the protocol.
+          </p>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <p class="footer-links">
+          <a data-repo="SPEC.md">Spec</a>
+          <a data-repo="results/log.jsonl">Results log</a>
+          <a data-tree="docs/journal">Journals</a>
+          <a data-tree="web">Website source</a>
+          <a data-repo="web/README.md">README</a>
+        </p>
+        <p class="fine">
+          No analytics, no tracking, no cookies. This page makes no external
+          requests: its files and the model weights come from this origin.
+        </p>
+        <p class="fine">
+          GPT-2 is OpenAI's model. The engine is written from scratch in Rust;
+          the browser build is compiled to WebAssembly.
+        </p>
+      </footer>
     </main>
-    <script type="module" src="./main.js"></script>
+    <script type="module" src="./site.js"></script>
   </body>
 </html>

@@ -14,6 +14,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
+from matplotlib.patches import Patch
 from matplotlib.textpath import TextPath
 from matplotlib.ticker import FuncFormatter, MaxNLocator, NullLocator
 
@@ -50,6 +51,14 @@ def load_rows(path):
 
 def engine(row):
     return row.get("engine") or DEFAULT_ENGINE
+
+
+def model_name(row):
+    return row.get("model") or "gpt2-124m"
+
+
+def is_124m(row):
+    return model_name(row) == "gpt2-124m"
 
 
 def fmt_value(value):
@@ -120,8 +129,11 @@ def style_axis(ax):
 
 def progress(log_path, out_dir):
     all_rows = load_rows(log_path)
+    rows_124m = [row for row in all_rows if is_124m(row)]
+    if not rows_124m:
+        raise SystemExit(f"no gpt2-124m results in {display_path(log_path)}")
     rows = [
-        row for row in all_rows
+        row for row in rows_124m
         if "-threads" not in row["milestone"]
         and (engine(row) == DEFAULT_ENGINE or row["milestone"].startswith("R0"))
     ]
@@ -162,7 +174,7 @@ def progress(log_path, out_dir):
     style_axis(ax)
     ax.tick_params(axis="y", labelsize=tick_size)
 
-    last = all_rows[-1]
+    last = rows_124m[-1]
     header(
         fig,
         "GPT-2 124M decode speed, tokens per second",
@@ -177,7 +189,7 @@ def previous_label(row):
 
 
 def step(name, log_path, out_dir):
-    rows = load_rows(log_path)
+    rows = [row for row in load_rows(log_path) if is_124m(row)]
     current = next((row for row in rows if row["milestone"] == name), None)
     if current is None:
         raise SystemExit(f"milestone {name!r} not found in {display_path(log_path)}")
@@ -248,7 +260,7 @@ def step(name, log_path, out_dir):
 
 
 def race(log_path, out_dir):
-    rows = load_rows(log_path)
+    rows = [row for row in load_rows(log_path) if is_124m(row)]
     by_milestone = {row["milestone"]: row for row in rows}
     ours = [
         row for row in rows
@@ -337,6 +349,118 @@ def race(log_path, out_dir):
     finish(fig, out_dir, "race.png")
 
 
+def sizes(log_path, out_dir):
+    rows = load_rows(log_path)
+    by_milestone = {row["milestone"]: row for row in rows}
+    groups = [
+        ("124M", "124M", "R0-torch", "N6", "N7"),
+        ("355M (medium)", "355M", "N8-gpt2-medium-torch",
+         "N8-gpt2-medium-f32", "N8-gpt2-medium-int8"),
+        ("774M (large)", "774M", "N8-gpt2-large-torch",
+         "N8-gpt2-large-f32", "N8-gpt2-large-int8"),
+        ("1.5B (xl)", "1.5B", "N8-gpt2-xl-torch",
+         "N8-gpt2-xl-f32", "N8-gpt2-xl-int8"),
+    ]
+    engines = [
+        ("PyTorch", GRAY, False),
+        ("gpt2-fast f32", BLUE, False),
+        ("gpt2-fast int8", BLUE, True),
+    ]
+    offsets = (-0.27, 0.0, 0.27)
+    bar_width = 0.24
+
+    values = []
+    for _, _, torch_name, f32_name, int8_name in groups:
+        for name in (torch_name, f32_name, int8_name):
+            row = by_milestone.get(name)
+            value = row.get("decode_tok_s") if row else None
+            if value is not None:
+                values.append(value)
+    if not values:
+        raise SystemExit(f"no size results in {display_path(log_path)}")
+
+    fig = new_figure()
+    ax = fig.add_axes((0.075, 0.13, 0.90, 0.62))
+    top = max(values) * 1.18
+
+    for index, (_, _, torch_name, f32_name, int8_name) in enumerate(groups):
+        names = (torch_name, f32_name, int8_name)
+        for offset, name, (_, color, hatched) in zip(offsets, names, engines):
+            row = by_milestone.get(name)
+            value = row.get("decode_tok_s") if row else None
+            x = index + offset
+            if value is None:
+                text = "not measured"
+                if row is not None and row.get("status") == "oom":
+                    text = "did not fit in 8 GB"
+                ax.text(x, top * 0.02, text, rotation=90, ha="center",
+                        va="bottom", fontsize=6.5, color=FAINT)
+                continue
+            bars = ax.bar(x, value, width=bar_width, color=color,
+                          edgecolor=TEXT, linewidth=0, zorder=3)
+            if hatched:
+                bars[0].set_hatch("////")
+            ax.annotate(fmt_value(value), (x, value), xytext=(0, 4),
+                        textcoords="offset points", ha="center", va="bottom",
+                        fontsize=8, color=TEXT)
+
+    ax.set_xlim(-0.55, len(groups) - 0.45)
+    ax.set_ylim(0, top)
+    ax.set_xticks(
+        range(len(groups)), [group[0] for group in groups]
+    )
+    ax.yaxis.set_major_locator(MaxNLocator(6))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax.grid(axis="y", color=GRID, linewidth=0.6)
+    ax.grid(axis="x", visible=False)
+    ax.set_axisbelow(True)
+    style_axis(ax)
+    ax.tick_params(axis="x", labelsize=9.5)
+
+    handles = [
+        Patch(facecolor=color, edgecolor=TEXT, linewidth=0, hatch="////"
+              if hatched else None, label=label)
+        for label, color, hatched in engines
+    ]
+    legend = ax.legend(
+        handles=handles, loc="upper right", bbox_to_anchor=(1.0, 1.13),
+        ncol=3, frameon=False, fontsize=8, handlelength=1.2,
+        handleheight=0.9, columnspacing=1.6, handletextpad=0.5,
+    )
+    for text in legend.get_texts():
+        text.set_color(TEXT)
+
+    host = next((row["host"] for row in reversed(rows) if row.get("host")), "")
+    subtitle = "median of session medians"
+    if host:
+        subtitle = f"{host} · {subtitle}"
+
+    source = "Source: results/log.jsonl"
+    perplexity = []
+    for _, short, _, f32_name, int8_name in groups:
+        f32_row = by_milestone.get(f32_name)
+        int8_row = by_milestone.get(int8_name)
+        if f32_row is None or int8_row is None:
+            continue
+        f32_ppl = f32_row.get("perplexity")
+        int8_ppl = int8_row.get("perplexity")
+        if f32_ppl is None or int8_ppl is None:
+            continue
+        perplexity.append(
+            f"{short} {float(f32_ppl):.2f}→{float(int8_ppl):.2f}"
+        )
+    if perplexity:
+        source = f"{source} · perplexity f32 → int8: " + ", ".join(perplexity)
+
+    header(
+        fig,
+        "GPT-2 at four sizes on 4 CPU cores, decode tokens/s",
+        subtitle,
+        source=source,
+    )
+    finish(fig, out_dir, "sizes.png")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Chart GPT-2 decode results.")
     parser.add_argument("--log", type=Path, default=LOG,
@@ -348,12 +472,15 @@ def main():
     step_parser = sub.add_parser("step", help="before/after card for one milestone")
     step_parser.add_argument("milestone")
     sub.add_parser("race", help="gpt2-fast against llama.cpp and the references")
+    sub.add_parser("sizes", help="decode speed at four model sizes")
     args = parser.parse_args()
 
     if args.command == "progress":
         progress(args.log, args.out)
     elif args.command == "step":
         step(args.milestone, args.log, args.out)
+    elif args.command == "sizes":
+        sizes(args.log, args.out)
     else:
         race(args.log, args.out)
 

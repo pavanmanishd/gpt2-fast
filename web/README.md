@@ -3,6 +3,51 @@
 The browser build: the same engine, compiled to WebAssembly and run in a Web
 Worker. Weights are downloaded once and kept in the browser's Cache API.
 
+## Website
+
+`index.html` is the public site. It uses plain HTML, CSS and ES modules: no
+framework, bundler, external JavaScript, web fonts or analytics.
+
+| File | Purpose |
+|---|---|
+| `index.html` | The site: hero and live demo, the device benchmark, the milestone chart and cards, the measurement notes, and the footer. |
+| `site.css` | Site styles, including the light and dark palettes. |
+| `site.js` | Site behaviour: worker lifecycle, streaming meter, device benchmark, chart and story rendering. |
+| `data/milestones.json` | Generated milestone data. Do not edit by hand. |
+| `dev.html` | The old development page, driven by `main.js`. |
+| `worker.js` | Shared Web Worker: loads weights, encodes text, generates and streams tokens. Used by the site, the dev page and the benchmark. |
+| `bench.html`, `bench.js` | The browser benchmark page. |
+| `sync_data.py` | Builds `data/milestones.json` from the repository. |
+
+The site never downloads the model on page load. On a first visit it shows a
+load button; after that the four model files are in the Cache API and later
+visits load them from cache without showing the button. The device section runs prompt
+`p064` for 64 new tokens, one warm-up and one timed run. Nothing from the page is
+sent anywhere.
+
+All data comes from the same origin: `data/milestones.json`, the worker, the
+WebAssembly package and `/models/gpt2/`. The journal links use the `REPO_URL`
+constant at the top of `site.js`.
+
+## Refreshing the site data
+
+After appending a milestone to `results/log.jsonl`:
+
+```sh
+python3 web/sync_data.py
+```
+
+The script uses only the Python standard library. It reads the `gpt2-124m`
+entries in `results/log.jsonl`, `bench/prompts.json` and
+`reference/expected.json`, and writes `web/data/milestones.json` in log order.
+The output contains:
+
+- `protocol`: host, cores, memory, sessions, runs per prompt, checked token
+  count, and the near-tie margin.
+- `device_bench`: the `p064` prompt text and the 64-token run parameters.
+- `milestones`: the fields the page renders, including perplexity fields when a
+  quantized run recorded them.
+
 ## Build
 
 `web/build.sh` builds the module and runs `wasm-bindgen`:
@@ -37,7 +82,8 @@ Serve the repository root so `models/gpt2/` is reachable:
 python3 -m http.server 8000
 ```
 
-Open <http://localhost:8000/web/>. The benchmark page is
+Open <http://localhost:8000/web/> for the site. The dev page is
+<http://localhost:8000/web/dev.html>. The benchmark page is
 <http://localhost:8000/web/bench.html>; add `?weights=f32` to load
 `model.safetensors` and compare against the reference exactly, and
 `?pkg=pkg-nosimd` to load the scalar build.

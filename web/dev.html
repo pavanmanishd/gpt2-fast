@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>gpt2-fast: dev page</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --ink: #16181d;
+        --muted: #6b7280;
+        --line: #d8dbe2;
+        --paper: #ffffff;
+        --panel: #f5f6f8;
+        --accent: #0b6bcb;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --ink: #eceef2;
+          --muted: #9aa1ad;
+          --line: #30343c;
+          --paper: #121317;
+          --panel: #1a1c21;
+          --accent: #6aa9ff;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+          sans-serif;
+      }
+      main {
+        max-width: 46rem;
+        margin: 0 auto;
+        padding: 4rem 1.25rem 5rem;
+      }
+      h1 {
+        margin: 0 0 0.5rem;
+        font-size: 1.75rem;
+        letter-spacing: -0.02em;
+      }
+      .lede {
+        margin: 0 0 1.5rem;
+        color: var(--muted);
+      }
+      .status {
+        margin: 0 0 1.5rem;
+        padding: 0.6rem 0.8rem;
+        border: 1px solid var(--line);
+        border-radius: 0.5rem;
+        background: var(--panel);
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+      label {
+        display: block;
+        margin-bottom: 0.4rem;
+        font-size: 0.85rem;
+        font-weight: 600;
+      }
+      textarea {
+        width: 100%;
+        resize: vertical;
+        padding: 0.7rem 0.8rem;
+        border: 1px solid var(--line);
+        border-radius: 0.5rem;
+        background: var(--paper);
+        color: var(--ink);
+        font: inherit;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 1rem;
+        margin: 0.9rem 0 1.5rem;
+      }
+      button {
+        padding: 0.55rem 1.1rem;
+        border: 1px solid transparent;
+        border-radius: 0.45rem;
+        background: var(--accent);
+        color: #fff;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .stats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem 1.1rem;
+        color: var(--muted);
+        font-size: 0.85rem;
+      }
+      .stats b {
+        color: var(--ink);
+        font-variant-numeric: tabular-nums;
+      }
+      pre {
+        min-height: 12rem;
+        margin: 0;
+        padding: 1rem;
+        border: 1px solid var(--line);
+        border-radius: 0.5rem;
+        background: var(--panel);
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font: 0.95rem/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas,
+          monospace;
+      }
+      .note {
+        margin-top: 1.5rem;
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>GPT-2, in your browser</h1>
+      <p class="lede">
+        The 124M-parameter model runs on this device. The weights download once
+        and stay in your browser's storage. Nothing you type leaves the device.
+      </p>
+      <p id="status" class="status">Starting the worker.</p>
+
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt" rows="4">When I wrote the following pages, or rather the bulk of them, I lived alone, in the woods, a mile from any neighbor, in a house which I had built myself, on the shore of Walden Pond, in Concord, Massachusetts, and earned my living by the labor of my hands only. I lived</textarea>
+
+      <div class="controls">
+        <button id="generate" disabled>Generate</button>
+        <span class="stats">
+          <span>first token <b id="ttft">&ndash;</b></span>
+          <span><b id="speed">&ndash;</b> tokens/s</span>
+          <span><b id="tokens">0</b> tokens</span>
+        </span>
+      </div>
+
+      <pre id="output" aria-live="polite"></pre>
+      <p class="note">
+        Greedy sampling, 128 new tokens. Speed is this machine's, measured in
+        this tab.
+      </p>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
