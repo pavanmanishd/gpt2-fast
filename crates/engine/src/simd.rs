@@ -22,6 +22,8 @@ mod neon {
     const INT8_DECODE_ACCUMULATORS: usize = 4;
     const PREFILL_TOKENS: usize = 4;
     const PREFILL_OUTPUTS: usize = 4;
+    // A block of output rows stays in cache while every prompt row passes over it.
+    const PREFILL_OUTPUT_BLOCK: usize = 16;
 
     #[inline]
     fn finish(sum: f32, bias: Option<f32>, with_gelu: bool) -> f32 {
@@ -298,32 +300,39 @@ mod neon {
         with_gelu: bool,
         y: &mut [f32],
     ) {
-        let mut i = 0;
-        while i + PREFILL_TOKENS <= rows {
-            let mut j = 0;
-            while j + PREFILL_OUTPUTS <= n_out {
-                f32_tile::<PREFILL_TOKENS, PREFILL_OUTPUTS>(
-                    x, weight, bias, n_in, n_out, i, j, with_gelu, y,
-                );
-                j += PREFILL_OUTPUTS;
+        let mut block = 0;
+        while block < n_out {
+            let end = (block + PREFILL_OUTPUT_BLOCK).min(n_out);
+            let mut i = 0;
+            while i + PREFILL_TOKENS <= rows {
+                let mut j = block;
+                while j + PREFILL_OUTPUTS <= end {
+                    f32_tile::<PREFILL_TOKENS, PREFILL_OUTPUTS>(
+                        x, weight, bias, n_in, n_out, i, j, with_gelu, y,
+                    );
+                    j += PREFILL_OUTPUTS;
+                }
+                while j < end {
+                    f32_tile::<PREFILL_TOKENS, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
+                    j += 1;
+                }
+                i += PREFILL_TOKENS;
             }
-            while j < n_out {
-                f32_tile::<PREFILL_TOKENS, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
-                j += 1;
+            while i < rows {
+                let mut j = block;
+                while j + PREFILL_OUTPUTS <= end {
+                    f32_tile::<1, PREFILL_OUTPUTS>(
+                        x, weight, bias, n_in, n_out, i, j, with_gelu, y,
+                    );
+                    j += PREFILL_OUTPUTS;
+                }
+                while j < end {
+                    f32_tile::<1, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
+                    j += 1;
+                }
+                i += 1;
             }
-            i += PREFILL_TOKENS;
-        }
-        while i < rows {
-            let mut j = 0;
-            while j + PREFILL_OUTPUTS <= n_out {
-                f32_tile::<1, PREFILL_OUTPUTS>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
-                j += PREFILL_OUTPUTS;
-            }
-            while j < n_out {
-                f32_tile::<1, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
-                j += 1;
-            }
-            i += 1;
+            block = end;
         }
     }
 
@@ -412,38 +421,43 @@ mod neon {
         with_gelu: bool,
         y: &mut [f32],
     ) {
-        let mut i = 0;
-        while i + PREFILL_TOKENS <= rows {
-            let mut j = 0;
-            while j + PREFILL_OUTPUTS <= n_out {
-                int8_tile::<PREFILL_TOKENS, PREFILL_OUTPUTS>(
-                    x, weight, scale, bias, group, n_in, n_out, i, j, with_gelu, y,
-                );
-                j += PREFILL_OUTPUTS;
+        let mut block = 0;
+        while block < n_out {
+            let end = (block + PREFILL_OUTPUT_BLOCK).min(n_out);
+            let mut i = 0;
+            while i + PREFILL_TOKENS <= rows {
+                let mut j = block;
+                while j + PREFILL_OUTPUTS <= end {
+                    int8_tile::<PREFILL_TOKENS, PREFILL_OUTPUTS>(
+                        x, weight, scale, bias, group, n_in, n_out, i, j, with_gelu, y,
+                    );
+                    j += PREFILL_OUTPUTS;
+                }
+                while j < end {
+                    int8_tile::<PREFILL_TOKENS, 1>(
+                        x, weight, scale, bias, group, n_in, n_out, i, j, with_gelu, y,
+                    );
+                    j += 1;
+                }
+                i += PREFILL_TOKENS;
             }
-            while j < n_out {
-                int8_tile::<PREFILL_TOKENS, 1>(
-                    x, weight, scale, bias, group, n_in, n_out, i, j, with_gelu, y,
-                );
-                j += 1;
+            while i < rows {
+                let mut j = block;
+                while j + PREFILL_OUTPUTS <= end {
+                    int8_tile::<1, PREFILL_OUTPUTS>(
+                        x, weight, scale, bias, group, n_in, n_out, i, j, with_gelu, y,
+                    );
+                    j += PREFILL_OUTPUTS;
+                }
+                while j < end {
+                    int8_tile::<1, 1>(
+                        x, weight, scale, bias, group, n_in, n_out, i, j, with_gelu, y,
+                    );
+                    j += 1;
+                }
+                i += 1;
             }
-            i += PREFILL_TOKENS;
-        }
-        while i < rows {
-            let mut j = 0;
-            while j + PREFILL_OUTPUTS <= n_out {
-                int8_tile::<1, PREFILL_OUTPUTS>(
-                    x, weight, scale, bias, group, n_in, n_out, i, j, with_gelu, y,
-                );
-                j += PREFILL_OUTPUTS;
-            }
-            while j < n_out {
-                int8_tile::<1, 1>(
-                    x, weight, scale, bias, group, n_in, n_out, i, j, with_gelu, y,
-                );
-                j += 1;
-            }
-            i += 1;
+            block = end;
         }
     }
 
