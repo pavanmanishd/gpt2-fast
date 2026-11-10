@@ -31,6 +31,7 @@ BLUE = "#2a78d6"
 ORANGE = "#eb6834"
 GRAY = "#a3a29c"
 DEFAULT_ENGINE = "gpt2-fast"
+WEB_TARGETS = {"wasm", "wasm-simd", "wasm-threads", "webgpu"}
 
 FIGSIZE = (8, 4.5)
 
@@ -55,6 +56,14 @@ def engine(row):
 
 def model_name(row):
     return row.get("model") or "gpt2-124m"
+
+
+def is_native(row):
+    return (row.get("target") or "cpu-linux") == "cpu-linux"
+
+
+def is_browser(row):
+    return row.get("target") in WEB_TARGETS
 
 
 def is_124m(row):
@@ -87,15 +96,9 @@ def quantized(row):
     return row["milestone"].endswith("-int8") or row["token_match_rate"] < 1.0
 
 
-def names_int8(row):
-    # shortening can cut a parenthetical short ("8-bit weights (int8"); don't count that
-    title = re.sub(r"\([^)]*$", "", short_title(row["title"])).lower()
-    return row["milestone"].endswith("-int8") or "int8" in title
-
-
 def label(row):
     text = f"{row['milestone']} · {short_title(row['title'])}"
-    if quantized(row) and not names_int8(row):
+    if quantized(row) and "int8" not in text.lower():
         text += " (int8)"
     return text
 
@@ -138,7 +141,7 @@ def style_axis(ax):
 
 
 def progress(log_path, out_dir):
-    all_rows = load_rows(log_path)
+    all_rows = [row for row in load_rows(log_path) if is_native(row)]
     rows_124m = [row for row in all_rows if is_124m(row)]
     if not rows_124m:
         raise SystemExit(f"no gpt2-124m results in {display_path(log_path)}")
@@ -199,7 +202,7 @@ def previous_label(row):
 
 
 def step(name, log_path, out_dir):
-    rows = [row for row in load_rows(log_path) if is_124m(row)]
+    rows = load_rows(log_path)
     current = next((row for row in rows if row["milestone"] == name), None)
     if current is None:
         raise SystemExit(f"milestone {name!r} not found in {display_path(log_path)}")
@@ -213,16 +216,25 @@ def step(name, log_path, out_dir):
                 f"{display_path(log_path)}"
             )
     else:
-        index = rows.index(current)
+        if not is_native(current):
+            raise SystemExit(
+                f"browser milestone {name!r} has no baseline in "
+                f"{display_path(log_path)}"
+            )
+        native = [row for row in rows if is_native(row)]
+        index = native.index(current)
         previous = next(
-            (row for row in reversed(rows[:index])
-             if engine(row) == DEFAULT_ENGINE and row["milestone"].startswith("N")
+            (row for row in reversed(native[:index])
+             if model_name(row) == model_name(current)
+             and engine(row) == DEFAULT_ENGINE
+             and row["milestone"].startswith("N")
              and "-threads" not in row["milestone"]),
             None,
         )
-        if previous is None:
+        if previous is None and is_124m(current):
             previous = next(
-                (row for row in rows[:index] if row["milestone"] == "R0-torch"), None
+                (row for row in native[:index] if row["milestone"] == "R0-torch"),
+                None,
             )
         if previous is None:
             raise SystemExit(f"no earlier milestone to compare with {name}")
@@ -237,12 +249,19 @@ def step(name, log_path, out_dir):
         headline = f"{amount}× slower than {previous_label(previous)}"
 
     comparison = f"compared with {previous['milestone']}"
+    if is_native(current):
+        subtitle = f"{current['host']} · commit {current['commit']}\n{comparison}"
+    else:
+        place = " · ".join(
+            part for part in (current.get("browser"), current.get("host")) if part
+        )
+        subtitle = f"{place} · browser measurement\n{comparison}"
     title = f"{name}: {current['title']}"
     fig = new_figure()
     header(
         fig,
         title,
-        f"{current['host']} · commit {current['commit']}\n{comparison}",
+        subtitle,
         headline=headline,
         title_size=fit_size(title, 13),
     )
@@ -280,7 +299,10 @@ def step(name, log_path, out_dir):
 
 def race(log_path, out_dir, f32="N6", int8="N7", llamacpp="N9-llamacpp",
          name="race"):
-    rows = [row for row in load_rows(log_path) if is_124m(row)]
+    rows = [
+        row for row in load_rows(log_path)
+        if is_native(row) and is_124m(row)
+    ]
     by_milestone = {row["milestone"]: row for row in rows}
 
     def pick(milestone):
@@ -372,17 +394,119 @@ def race(log_path, out_dir, f32="N6", int8="N7", llamacpp="N9-llamacpp",
     finish(fig, out_dir, f"{name}.png")
 
 
-def sizes(log_path, out_dir):
-    rows = load_rows(log_path)
+WEB_STEPS = (
+    ("W1", "WebAssembly"),
+    ("W2", "+ SIMD"),
+    ("W3", "+ threads"),
+    ("W4", "WebGPU"),
+)
+
+
+def web(log_path, out_dir):
+    by_milestone = {
+        row["milestone"]: row
+        for row in load_rows(log_path)
+        if is_browser(row)
+    }
+    entries = []
+    for milestone, caption in WEB_STEPS:
+        row = by_milestone.get(milestone)
+        if row is None or row.get("decode_tok_s") is None:
+            continue
+        if milestone == "W3" and row.get("threads") is not None:
+            caption = f"+ threads ({row['threads']})"
+        variant = by_milestone.get(f"{milestone}-f32")
+        if variant is not None and variant.get("decode_tok_s") is None:
+            variant = None
+        entries.append((row, f"{milestone} · {caption}", variant))
+    if not entries:
+        raise SystemExit(f"no browser results in {display_path(log_path)}")
+
+    values = [row["decode_tok_s"] for row, _, _ in entries]
+    values += [variant["decode_tok_s"] for _, _, variant in entries if variant]
+
+    fig = new_figure()
+    ticks = []
+    labels = []
+    variant_ticks = []
+    for index, (_, text, variant) in enumerate(entries):
+        ticks.append(index)
+        labels.append(text)
+        variant_ticks.append(False)
+        if variant is not None:
+            ticks.append(index + 0.34)
+            labels.append("f32")
+            variant_ticks.append(True)
+    tick_size = 8.5
+    gutter = max(len(text) for text in labels) * tick_size * 0.62 / 72 + 0.2
+    left = min(gutter / 8, 0.30)
+    ax = fig.add_axes((left, 0.115, 0.955 - left, 0.735))
+
+    for index, (row, _, variant) in enumerate(entries):
+        value = row["decode_tok_s"]
+        bars = ax.barh([index], [value], height=0.5, color=BLUE,
+                       edgecolor=TEXT, linewidth=0)
+        if row.get("weights") == "int8":
+            bars[0].set_hatch("////")
+        ax.annotate(fmt_value(value), (value, index), xytext=(5, 0),
+                    textcoords="offset points", va="center", ha="left",
+                    fontsize=8.5, color=TEXT)
+        if variant is not None:
+            other = variant["decode_tok_s"]
+            ax.barh([index + 0.34], [other], height=0.2, color=BLUE,
+                    edgecolor=TEXT, linewidth=0)
+            ax.annotate(fmt_value(other), (other, index + 0.34), xytext=(5, 0),
+                        textcoords="offset points", va="center", ha="left",
+                        fontsize=7.5, color=TEXT)
+
+    if max(values) / min(values) > 20:
+        ax.set_xscale("log")
+        ax.set_xlim(min(values) / 2, max(values) * 2.2)
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+        ax.xaxis.set_minor_locator(NullLocator())
+    else:
+        ax.set_xlim(0, max(values) * 1.18)
+        ax.xaxis.set_major_locator(MaxNLocator(4))
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax.set_ylim(len(entries) - 0.45, -0.55)
+    ax.set_yticks(ticks, labels)
+    ax.grid(axis="x", color=GRID, linewidth=0.6)
+    ax.grid(axis="y", visible=False)
+    ax.set_axisbelow(True)
+    style_axis(ax)
+    ax.tick_params(axis="y", labelsize=tick_size)
+    for text, variant_tick in zip(ax.get_yticklabels(), variant_ticks):
+        if variant_tick:
+            text.set_color(FAINT)
+
+    first = entries[0][0]
+    place = " · ".join(
+        part for part in (first.get("browser"), first.get("host")) if part
+    )
+    header(
+        fig,
+        "GPT-2 124M in the browser, decode tokens/s",
+        f"{place} · median of session medians",
+        source=(
+            "Source: results/log.jsonl · browser measurements on the "
+            "development laptop, not the 4-core container"
+        ),
+    )
+    finish(fig, out_dir, "web.png")
+
+
+def sizes(log_path, out_dir, stage="N8", name="sizes"):
+    rows = [row for row in load_rows(log_path) if is_native(row)]
     by_milestone = {row["milestone"]: row for row in rows}
+    fast_124m = ("N6", "N7") if stage == "N8" else (stage, f"{stage}-int8")
     groups = [
-        ("124M", "124M", "R0-torch", "N6", "N7"),
+        ("124M", "124M", "R0-torch", fast_124m[0], fast_124m[1]),
         ("355M (medium)", "355M", "N8-gpt2-medium-torch",
-         "N8-gpt2-medium-f32", "N8-gpt2-medium-int8"),
+         f"{stage}-gpt2-medium-f32", f"{stage}-gpt2-medium-int8"),
         ("774M (large)", "774M", "N8-gpt2-large-torch",
-         "N8-gpt2-large-f32", "N8-gpt2-large-int8"),
+         f"{stage}-gpt2-large-f32", f"{stage}-gpt2-large-int8"),
         ("1.5B (xl)", "1.5B", "N8-gpt2-xl-torch",
-         "N8-gpt2-xl-f32", "N8-gpt2-xl-int8"),
+         f"{stage}-gpt2-xl-f32", f"{stage}-gpt2-xl-int8"),
     ]
     engines = [
         ("PyTorch", GRAY, False),
@@ -394,8 +518,8 @@ def sizes(log_path, out_dir):
 
     values = []
     for _, _, torch_name, f32_name, int8_name in groups:
-        for name in (torch_name, f32_name, int8_name):
-            row = by_milestone.get(name)
+        for milestone in (torch_name, f32_name, int8_name):
+            row = by_milestone.get(milestone)
             value = row.get("decode_tok_s") if row else None
             if value is not None:
                 values.append(value)
@@ -408,8 +532,8 @@ def sizes(log_path, out_dir):
 
     for index, (_, _, torch_name, f32_name, int8_name) in enumerate(groups):
         names = (torch_name, f32_name, int8_name)
-        for offset, name, (_, color, hatched) in zip(offsets, names, engines):
-            row = by_milestone.get(name)
+        for offset, milestone, (_, color, hatched) in zip(offsets, names, engines):
+            row = by_milestone.get(milestone)
             value = row.get("decode_tok_s") if row else None
             x = index + offset
             if value is None:
@@ -475,13 +599,16 @@ def sizes(log_path, out_dir):
     if perplexity:
         source = f"{source} · perplexity f32 → int8: " + ", ".join(perplexity)
 
+    title = "GPT-2 at four sizes on 4 CPU cores, decode tokens/s"
+    if stage != "N8":
+        title = f"{title} ({stage})"
     header(
         fig,
-        "GPT-2 at four sizes on 4 CPU cores, decode tokens/s",
+        title,
         subtitle,
         source=source,
     )
-    finish(fig, out_dir, "sizes.png")
+    finish(fig, out_dir, f"{name}.png")
 
 
 def main():
@@ -506,7 +633,14 @@ def main():
                              help="llama.cpp milestone prefix (default: N9-llamacpp)")
     race_parser.add_argument("--name", default="race", metavar="STEM",
                              help="output file stem (default: race)")
-    sub.add_parser("sizes", help="decode speed at four model sizes")
+    sub.add_parser("web", help="browser decode speed for the W1 to W4 steps")
+    sizes_parser = sub.add_parser("sizes",
+                                  help="decode speed at four model sizes")
+    sizes_parser.add_argument("--stage", default="N8", metavar="PREFIX",
+                              help="milestone prefix for gpt2-fast rows "
+                                   "(default: N8)")
+    sizes_parser.add_argument("--name", default="sizes", metavar="STEM",
+                              help="output file stem (default: sizes)")
     args = parser.parse_args()
 
     if args.command == "progress":
@@ -514,7 +648,9 @@ def main():
     elif args.command == "step":
         step(args.milestone, args.log, args.out)
     elif args.command == "sizes":
-        sizes(args.log, args.out)
+        sizes(args.log, args.out, stage=args.stage, name=args.name)
+    elif args.command == "web":
+        web(args.log, args.out)
     else:
         race(args.log, args.out, f32=args.f32, int8=args.int8,
              llamacpp=args.llamacpp, name=args.name)

@@ -196,7 +196,7 @@
     },
     {
       "milestone": "N7",
-      "title": "8-bit weights (int8, a scale per 64 weights)",
+      "title": "8-bit weights: int8 with a scale per 64 weights",
       "date": "2026-11-10",
       "commit": "15e5389",
       "model": "gpt2-124m",
