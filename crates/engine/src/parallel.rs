@@ -1,8 +1,6 @@
+use crate::Error;
 use std::cell::Cell;
 use std::marker::PhantomData;
-use std::ops::Range;
-
-use crate::Error;
 
 // Waking a parked worker costs more than the gap between the small parallel
 // regions inside one token, so workers spin briefly before parking.
@@ -47,6 +45,13 @@ impl Threads {
         })
     }
 
+    pub(crate) fn count(&self) -> usize {
+        match &self.pool {
+            Some(pool) => pool.count(),
+            None => 1,
+        }
+    }
+
     pub(crate) fn run(
         &self,
         output: &mut [f32],
@@ -55,6 +60,28 @@ impl Threads {
     ) {
         match &self.pool {
             Some(pool) => pool.run(output, align, &task),
+            None => task(0, output),
+        }
+    }
+
+    // Some work grows with the index of the row it sits on, so equal row counts
+    // are not equal work; the caller passes the boundaries it wants.
+    pub(crate) fn run_at(
+        &self,
+        output: &mut [f32],
+        starts: &[usize],
+        task: impl Fn(usize, &mut [f32]) + Sync,
+    ) {
+        assert!(
+            starts.len() >= 2 && starts[0] == 0 && starts[starts.len() - 1] == output.len(),
+            "split starts must cover the output"
+        );
+        assert!(
+            starts.windows(2).all(|pair| pair[0] <= pair[1]),
+            "split starts must ascend"
+        );
+        match &self.pool {
+            Some(pool) => pool.run_at(output, starts, &task),
             None => task(0, output),
         }
     }
@@ -72,7 +99,7 @@ mod backend {
     use std::sync::Arc;
     use std::thread::{self, JoinHandle};
 
-    use super::{boundary, bounds, Job, SPIN_ROUNDS};
+    use super::{boundary, Job, SPIN_ROUNDS};
     use crate::Error;
 
     pub(super) struct Pool {
@@ -119,15 +146,45 @@ mod backend {
             Ok(Pool { shared, workers })
         }
 
+        pub(super) fn count(&self) -> usize {
+            self.workers.len() + 1
+        }
+
         pub(super) fn run(
             &self,
             output: &mut [f32],
             align: usize,
             task: &(dyn Fn(usize, &mut [f32]) + Sync),
         ) {
-            let count = self.workers.len() + 1;
+            let count = self.count();
             let len = output.len();
-            let (mine, mut rest) = output.split_at_mut(boundary(1, len, count, align));
+            self.split(
+                output,
+                count,
+                |index| boundary(index, len, count, align),
+                task,
+            );
+        }
+
+        pub(super) fn run_at(
+            &self,
+            output: &mut [f32],
+            starts: &[usize],
+            task: &(dyn Fn(usize, &mut [f32]) + Sync),
+        ) {
+            let count = self.count();
+            assert_eq!(starts.len(), count + 1, "one start per thread");
+            self.split(output, count, |index| starts[index], task);
+        }
+
+        fn split(
+            &self,
+            output: &mut [f32],
+            count: usize,
+            start: impl Fn(usize) -> usize,
+            task: &(dyn Fn(usize, &mut [f32]) + Sync),
+        ) {
+            let (mine, mut rest) = output.split_at_mut(start(1));
 
             // SAFETY: every worker finishes before `run` returns, so the task reference
             // and the output slices outlive every worker's use of them.
@@ -143,9 +200,9 @@ mod backend {
             job.task = task;
             job.parts.clear();
             for index in 1..count {
-                let range = bounds(index, len, count, align);
-                let (part, tail) = rest.split_at_mut(range.len());
-                job.parts.push((range.start, part as *mut [f32]));
+                let (offset, next) = (start(index), start(index + 1));
+                let (part, tail) = rest.split_at_mut(next - offset);
+                job.parts.push((offset, part as *mut [f32]));
                 rest = tail;
             }
 
@@ -260,6 +317,10 @@ mod backend {
             Ok(Pool { shared, count })
         }
 
+        pub(super) fn count(&self) -> usize {
+            self.count
+        }
+
         pub(super) fn run(
             &self,
             output: &mut [f32],
@@ -268,7 +329,33 @@ mod backend {
         ) {
             let count = self.count;
             let len = output.len();
-            let (mine, mut rest) = output.split_at_mut(boundary(1, len, count, align));
+            self.split(
+                output,
+                count,
+                |index| boundary(index, len, count, align),
+                task,
+            );
+        }
+
+        pub(super) fn run_at(
+            &self,
+            output: &mut [f32],
+            starts: &[usize],
+            task: &(dyn Fn(usize, &mut [f32]) + Sync),
+        ) {
+            let count = self.count;
+            assert_eq!(starts.len(), count + 1, "one start per thread");
+            self.split(output, count, |index| starts[index], task);
+        }
+
+        fn split(
+            &self,
+            output: &mut [f32],
+            count: usize,
+            start: impl Fn(usize) -> usize,
+            task: &(dyn Fn(usize, &mut [f32]) + Sync),
+        ) {
+            let (mine, mut rest) = output.split_at_mut(start(1));
 
             // SAFETY: every worker finishes before `run` returns, so the task reference
             // and the output slices outlive every worker's use of them.
@@ -286,9 +373,9 @@ mod backend {
             job.task = task;
             job.parts.clear();
             for index in 1..count {
-                let range = bounds(index, len, count, align);
-                let (part, tail) = rest.split_at_mut(range.len());
-                job.parts.push((range.start, part as *mut [f32]));
+                let (offset, next) = (start(index), start(index + 1));
+                let (part, tail) = rest.split_at_mut(next - offset);
+                job.parts.push((offset, part as *mut [f32]));
                 rest = tail;
             }
 
@@ -404,7 +491,8 @@ pub fn thread_pool_worker_main(pointer: usize, index: usize) {
     backend::worker_main(pointer, index);
 }
 
-fn bounds(index: usize, len: usize, count: usize, align: usize) -> Range<usize> {
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+fn bounds(index: usize, len: usize, count: usize, align: usize) -> std::ops::Range<usize> {
     boundary(index, len, count, align)..boundary(index + 1, len, count, align)
 }
 

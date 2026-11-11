@@ -1049,16 +1049,15 @@ impl Layer {
         } = workspace;
         let projection: &mut [f32] = &mut projected[..n * n_embd];
 
-        for position in 0..n {
-            let range = position * n_embd..(position + 1) * n_embd;
-            layer_norm_into(
-                &x[range.clone()],
-                &self.ln_1_weight,
-                &self.ln_1_bias,
-                eps,
-                &mut normed[range],
-            );
-        }
+        normalize_rows(
+            threads,
+            &x[..n * n_embd],
+            &self.ln_1_weight,
+            &self.ln_1_bias,
+            eps,
+            n_embd,
+            &mut normed[..n * n_embd],
+        );
 
         linear(
             threads,
@@ -1101,16 +1100,15 @@ impl Layer {
         );
         add_in_place(&mut x[..n * n_embd], &projection[..n * n_embd]);
 
-        for position in 0..n {
-            let range = position * n_embd..(position + 1) * n_embd;
-            layer_norm_into(
-                &x[range.clone()],
-                &self.ln_2_weight,
-                &self.ln_2_bias,
-                eps,
-                &mut normed[range],
-            );
-        }
+        normalize_rows(
+            threads,
+            &x[..n * n_embd],
+            &self.ln_2_weight,
+            &self.ln_2_bias,
+            eps,
+            n_embd,
+            &mut normed[..n * n_embd],
+        );
 
         linear(
             threads,
@@ -1207,33 +1205,81 @@ fn attention(
         scale: 1.0 / (head_dim as f32).sqrt(),
     };
 
-    let align = if n == 1 { head_dim } else { n_embd };
-    threads.run(output, align, |offset, part| {
-        SCORES.with(|buffer| {
-            let mut buffer = buffer.borrow_mut();
-            if buffer.len() < start + n {
-                buffer.resize(config.n_ctx, 0.0);
-            }
-            let scores = &mut buffer[..start + n];
-            if n == 1 {
+    if n == 1 {
+        threads.run(output, head_dim, |offset, part| {
+            SCORES.with(|buffer| {
+                let mut buffer = buffer.borrow_mut();
+                if buffer.len() < start + n {
+                    buffer.resize(config.n_ctx, 0.0);
+                }
+                let scores = &mut buffer[..start + n];
                 let first = offset / head_dim;
                 let heads = part.len() / head_dim;
                 for head in first..first + heads {
                     let base = head * head_dim - offset;
                     kernel.head(scores, head, 0, &mut part[base..base + head_dim]);
                 }
-            } else {
-                let first = offset / n_embd;
-                let rows = part.len() / n_embd;
-                for row in first..first + rows {
-                    let output = &mut part[(row - first) * n_embd..][..n_embd];
-                    for head in 0..config.n_head {
-                        let base = head * head_dim;
-                        kernel.head(scores, head, row, &mut output[base..base + head_dim]);
-                    }
+            });
+        });
+        return;
+    }
+
+    // Row r scores r + 1 keys, so equal row counts make the last thread do almost
+    // eight times the work of the first; split at equal cumulative key counts.
+    let count = threads.count();
+    let total = (n * (n + 1) / 2) as u64;
+    let mut starts = Vec::with_capacity(count + 1);
+    starts.push(0);
+    let mut done = 0;
+    let mut row = 0;
+    for index in 1..count {
+        let target = total * index as u64 / count as u64;
+        while done < target {
+            done += (row + 1) as u64;
+            row += 1;
+        }
+        starts.push(row * n_embd);
+    }
+    starts.push(n * n_embd);
+    threads.run_at(output, &starts, |offset, part| {
+        SCORES.with(|buffer| {
+            let mut buffer = buffer.borrow_mut();
+            if buffer.len() < start + n {
+                buffer.resize(config.n_ctx, 0.0);
+            }
+            let scores = &mut buffer[..start + n];
+            let first = offset / n_embd;
+            let rows = part.len() / n_embd;
+            for row in first..first + rows {
+                let output = &mut part[(row - first) * n_embd..][..n_embd];
+                for head in 0..config.n_head {
+                    let base = head * head_dim;
+                    kernel.head(scores, head, row, &mut output[base..base + head_dim]);
                 }
             }
         });
+    });
+}
+
+fn normalize_rows(
+    threads: &Threads,
+    x: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    eps: f32,
+    n_embd: usize,
+    output: &mut [f32],
+) {
+    if x.len() == n_embd {
+        // One row is not worth a dispatch.
+        layer_norm_into(x, weight, bias, eps, output);
+        return;
+    }
+    threads.run(output, n_embd, |offset, part| {
+        for (row, output) in part.chunks_mut(n_embd).enumerate() {
+            let start = offset + row * n_embd;
+            layer_norm_into(&x[start..start + n_embd], weight, bias, eps, output);
+        }
     });
 }
 

@@ -190,8 +190,9 @@ mod int8_activations_neon {
     use crate::quantize::GROUP_SIZE;
 
     const DECODE_ROWS: usize = 4;
-    const PREFILL_TOKENS: usize = 4;
-    const PREFILL_OUTPUTS: usize = 4;
+    const PREFILL_ROWS: usize = 2;
+    const PREFILL_OUTPUTS: usize = 8;
+    // A block of output rows stays in cache while every prompt row passes over it.
     const PREFILL_OUTPUT_BLOCK: usize = 16;
 
     // SAFETY: the slices cover `n_in` inputs, the selected output rows' weights and
@@ -325,77 +326,167 @@ mod int8_activations_neon {
         }
     }
 
-    // SAFETY: the slices cover `rows * n_in` activations, `n_out * n_in` weights,
-    // `n_out` biases, and `rows * n_out` outputs; `i + 4 <= rows` and `j + 4 <= n_out`.
-    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-    #[target_feature(enable = "neon,dotprod")]
-    unsafe fn dotprod_tile4x4(
-        activations: &[i8],
-        activation_scale: &[f32],
-        weight: &[i8],
-        weight_scale: &[f32],
-        bias: &[f32],
+    struct Prefill<'a> {
+        activations: &'a [i8],
+        activation_scale: &'a [f32],
+        weight: &'a [i8],
+        weight_scale: &'a [f32],
+        bias: &'a [f32],
         n_in: usize,
         n_out: usize,
         group: usize,
-        i: usize,
-        j: usize,
         with_gelu: bool,
-        y: &mut [f32],
-    ) {
-        let activations = activations.as_ptr();
-        let weight = weight.as_ptr();
-        let weight_groups = n_in.div_ceil(GROUP_SIZE);
-        let activation_groups = n_in.div_ceil(group);
-        let mut total = [[0.0f32; PREFILL_OUTPUTS]; PREFILL_TOKENS];
+    }
 
-        for weight_group in 0..weight_groups {
-            let start = weight_group * GROUP_SIZE;
-            let weight_end = (start + GROUP_SIZE).min(n_in);
-            let mut scales = [0.0f32; PREFILL_OUTPUTS];
-            for (c, scale) in scales.iter_mut().enumerate() {
-                *scale = weight_scale[(j + c) * weight_groups + weight_group];
+    impl Prefill<'_> {
+        // SAFETY: the slices cover `rows * n_in` activations, `n_out * n_in`
+        // weights, `n_out` biases and `rows * n_out` outputs; `i + R <= rows` and
+        // `j + C <= n_out`.
+        #[inline]
+        unsafe fn tile<const R: usize, const C: usize>(&self, i: usize, j: usize, y: &mut [f32]) {
+            if C == PREFILL_OUTPUTS && self.n_in.is_multiple_of(16) && self.group.is_multiple_of(16)
+            {
+                self.tile_wide::<R>(i, j, y);
+            } else {
+                self.tile_generic::<R, C>(i, j, y);
             }
-            for activation_group in start / group..=(weight_end - 1) / group {
-                let group_start = activation_group * group;
-                let group_end = (group_start + group).min(n_in);
-                let mut acc = [[vdupq_n_s32(0); PREFILL_OUTPUTS]; PREFILL_TOKENS];
-                let mut p = group_start;
-                while p + 16 <= group_end {
-                    let mut input = [vdupq_n_s8(0); PREFILL_TOKENS];
-                    for (r, value) in input.iter_mut().enumerate() {
-                        *value = vld1q_s8(activations.add((i + r) * n_in + p));
-                    }
-                    for c in 0..PREFILL_OUTPUTS {
-                        let weights = vld1q_s8(weight.add((j + c) * n_in + p));
-                        for (r, input_r) in input.iter().enumerate() {
-                            acc[r][c] = vdotq_s32(acc[r][c], weights, *input_r);
-                        }
-                    }
-                    p += 16;
+        }
+
+        // Folding four output rows' group sums with pairwise adds and one vector
+        // multiply-add per group costs a fraction of four separate horizontal sums,
+        // and every output still adds its groups in ascending order.
+        // SAFETY: as `tile`, plus `n_in` and `group` are multiples of 16, so every
+        // group is a whole number of 16-byte chunks.
+        #[allow(clippy::needless_range_loop)]
+        #[target_feature(enable = "neon,dotprod")]
+        unsafe fn tile_wide<const R: usize>(&self, i: usize, j: usize, y: &mut [f32]) {
+            const C: usize = PREFILL_OUTPUTS;
+            let activations = self.activations.as_ptr();
+            let weight = self.weight.as_ptr();
+            let weight_groups = self.n_in.div_ceil(GROUP_SIZE);
+            let activation_groups = self.n_in.div_ceil(self.group);
+            let mut total = [[vdupq_n_f32(0.0); C / 4]; R];
+
+            for weight_group in 0..weight_groups {
+                let start = weight_group * GROUP_SIZE;
+                let weight_end = (start + GROUP_SIZE).min(self.n_in);
+                let mut scales = [0.0f32; C];
+                for (c, scale) in scales.iter_mut().enumerate() {
+                    *scale = self.weight_scale[(j + c) * weight_groups + weight_group];
                 }
-                for (r, acc_r) in acc.iter().enumerate() {
-                    let scale_row = activation_scale
-                        .as_ptr()
-                        .add((i + r) * activation_groups + activation_group);
-                    for (c, accumulated) in acc_r.iter().enumerate() {
-                        let mut dot = vaddvq_s32(*accumulated);
-                        let mut q = p;
-                        while q < group_end {
-                            dot += *activations.add((i + r) * n_in + q) as i32
-                                * *weight.add((j + c) * n_in + q) as i32;
-                            q += 1;
+                for activation_group in start / self.group..=(weight_end - 1) / self.group {
+                    let group_start = activation_group * self.group;
+                    let group_end = (group_start + self.group).min(self.n_in);
+                    let mut acc = [[vdupq_n_s32(0); C]; R];
+                    let mut p = group_start;
+                    while p + 16 <= group_end {
+                        let mut input = [vdupq_n_s8(0); R];
+                        for (r, value) in input.iter_mut().enumerate() {
+                            *value = vld1q_s8(activations.add((i + r) * self.n_in + p));
                         }
-                        total[r][c] = add_scaled_dot(total[r][c], dot, scales[c], *scale_row);
+                        for c in 0..C {
+                            let weights = vld1q_s8(weight.add((j + c) * self.n_in + p));
+                            for (r, input_r) in input.iter().enumerate() {
+                                acc[r][c] = vdotq_s32(acc[r][c], weights, *input_r);
+                            }
+                        }
+                        p += 16;
+                    }
+                    for (r, acc_r) in acc.iter().enumerate() {
+                        let scale_row =
+                            self.activation_scale[(i + r) * activation_groups + activation_group];
+                        for k in 0..C / 4 {
+                            let sums = vpaddq_s32(
+                                vpaddq_s32(acc_r[4 * k], acc_r[4 * k + 1]),
+                                vpaddq_s32(acc_r[4 * k + 2], acc_r[4 * k + 3]),
+                            );
+                            let combined = vmulq_f32(
+                                vld1q_f32(scales.as_ptr().add(4 * k)),
+                                vdupq_n_f32(scale_row),
+                            );
+                            total[r][k] =
+                                vaddq_f32(total[r][k], vmulq_f32(vcvtq_f32_s32(sums), combined));
+                        }
+                    }
+                }
+            }
+
+            for (r, total_r) in total.iter().enumerate() {
+                for (k, value) in total_r.iter().enumerate() {
+                    let mut sums = [0.0f32; 4];
+                    vst1q_f32(sums.as_mut_ptr(), *value);
+                    for (lane, sum) in sums.iter().enumerate() {
+                        let output = j + 4 * k + lane;
+                        *y.get_unchecked_mut((i + r) * self.n_out + output) =
+                            finish(*sum, Some(self.bias[output]), self.with_gelu);
                     }
                 }
             }
         }
 
-        for (r, total_r) in total.iter().enumerate() {
-            for (c, value) in total_r.iter().enumerate() {
-                *y.get_unchecked_mut((i + r) * n_out + j + c) =
-                    finish(*value, Some(*bias.get_unchecked(j + c)), with_gelu);
+        // SAFETY: as `tile`; this path also handles groups that are not whole
+        // 16-byte chunks.
+        #[allow(clippy::needless_range_loop)]
+        #[target_feature(enable = "neon,dotprod")]
+        unsafe fn tile_generic<const R: usize, const C: usize>(
+            &self,
+            i: usize,
+            j: usize,
+            y: &mut [f32],
+        ) {
+            let activations = self.activations.as_ptr();
+            let weight = self.weight.as_ptr();
+            let weight_groups = self.n_in.div_ceil(GROUP_SIZE);
+            let activation_groups = self.n_in.div_ceil(self.group);
+            let mut total = [[0.0f32; C]; R];
+
+            for weight_group in 0..weight_groups {
+                let start = weight_group * GROUP_SIZE;
+                let weight_end = (start + GROUP_SIZE).min(self.n_in);
+                let mut scales = [0.0f32; C];
+                for (c, scale) in scales.iter_mut().enumerate() {
+                    *scale = self.weight_scale[(j + c) * weight_groups + weight_group];
+                }
+                for activation_group in start / self.group..=(weight_end - 1) / self.group {
+                    let group_start = activation_group * self.group;
+                    let group_end = (group_start + self.group).min(self.n_in);
+                    let mut acc = [[vdupq_n_s32(0); C]; R];
+                    let mut p = group_start;
+                    while p + 16 <= group_end {
+                        let mut input = [vdupq_n_s8(0); R];
+                        for (r, value) in input.iter_mut().enumerate() {
+                            *value = vld1q_s8(activations.add((i + r) * self.n_in + p));
+                        }
+                        for c in 0..C {
+                            let weights = vld1q_s8(weight.add((j + c) * self.n_in + p));
+                            for (r, input_r) in input.iter().enumerate() {
+                                acc[r][c] = vdotq_s32(acc[r][c], weights, *input_r);
+                            }
+                        }
+                        p += 16;
+                    }
+                    for (r, acc_r) in acc.iter().enumerate() {
+                        let scale_row =
+                            self.activation_scale[(i + r) * activation_groups + activation_group];
+                        for (c, accumulated) in acc_r.iter().enumerate() {
+                            let mut dot = vaddvq_s32(*accumulated);
+                            let mut q = p;
+                            while q < group_end {
+                                dot += *activations.add((i + r) * self.n_in + q) as i32
+                                    * *weight.add((j + c) * self.n_in + q) as i32;
+                                q += 1;
+                            }
+                            total[r][c] = add_scaled_dot(total[r][c], dot, scales[c], scale_row);
+                        }
+                    }
+                }
+            }
+
+            for (r, total_r) in total.iter().enumerate() {
+                for (c, value) in total_r.iter().enumerate() {
+                    *y.get_unchecked_mut((i + r) * self.n_out + j + c) =
+                        finish(*value, Some(self.bias[j + c]), self.with_gelu);
+                }
             }
         }
     }
@@ -417,59 +508,42 @@ mod int8_activations_neon {
         with_gelu: bool,
         y: &mut [f32],
     ) {
-        let weight_groups = n_in.div_ceil(GROUP_SIZE);
-        let activation_groups = n_in.div_ceil(group);
+        let prefill = Prefill {
+            activations,
+            activation_scale,
+            weight,
+            weight_scale,
+            bias,
+            n_in,
+            n_out,
+            group,
+            with_gelu,
+        };
         let mut block = 0;
         while block < n_out {
             let end = (block + PREFILL_OUTPUT_BLOCK).min(n_out);
             let mut i = 0;
-            while i + PREFILL_TOKENS <= rows {
+            while i + PREFILL_ROWS <= rows {
                 let mut j = block;
                 while j + PREFILL_OUTPUTS <= end {
-                    dotprod_tile4x4(
-                        activations,
-                        activation_scale,
-                        weight,
-                        weight_scale,
-                        bias,
-                        n_in,
-                        n_out,
-                        group,
-                        i,
-                        j,
-                        with_gelu,
-                        y,
-                    );
+                    prefill.tile::<PREFILL_ROWS, PREFILL_OUTPUTS>(i, j, y);
                     j += PREFILL_OUTPUTS;
                 }
                 while j < end {
-                    for r in 0..PREFILL_TOKENS {
-                        let sum = super::int8_activations::row_value(
-                            &activations[(i + r) * n_in..(i + r + 1) * n_in],
-                            &activation_scale
-                                [(i + r) * activation_groups..(i + r + 1) * activation_groups],
-                            &weight[j * n_in..(j + 1) * n_in],
-                            &weight_scale[j * weight_groups..(j + 1) * weight_groups],
-                            n_in,
-                            group,
-                        );
-                        y[(i + r) * n_out + j] = finish(sum, Some(bias[j]), with_gelu);
-                    }
+                    prefill.tile::<PREFILL_ROWS, 1>(i, j, y);
                     j += 1;
                 }
-                i += PREFILL_TOKENS;
+                i += PREFILL_ROWS;
             }
             while i < rows {
-                for j in block..end {
-                    let sum = super::int8_activations::row_value(
-                        &activations[i * n_in..(i + 1) * n_in],
-                        &activation_scale[i * activation_groups..(i + 1) * activation_groups],
-                        &weight[j * n_in..(j + 1) * n_in],
-                        &weight_scale[j * weight_groups..(j + 1) * weight_groups],
-                        n_in,
-                        group,
-                    );
-                    y[i * n_out + j] = finish(sum, Some(bias[j]), with_gelu);
+                let mut j = block;
+                while j + PREFILL_OUTPUTS <= end {
+                    prefill.tile::<1, PREFILL_OUTPUTS>(i, j, y);
+                    j += PREFILL_OUTPUTS;
+                }
+                while j < end {
+                    prefill.tile::<1, 1>(i, j, y);
+                    j += 1;
                 }
                 i += 1;
             }
@@ -2448,6 +2522,18 @@ mod tests {
                 n_in: 33,
                 n_out: 19,
                 group: 32,
+            },
+            ActivationCase {
+                rows: 3,
+                n_in: 768,
+                n_out: 9,
+                group: 64,
+            },
+            ActivationCase {
+                rows: 5,
+                n_in: 768,
+                n_out: 13,
+                group: 16,
             },
         ] {
             let ActivationFixture {
