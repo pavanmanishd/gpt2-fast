@@ -219,6 +219,32 @@ the threaded build. The site only picks the threaded package when
 threaded build or shared memory is unavailable, so both pages keep working
 under a plain static server without the headers.
 
+## Developing
+
+```sh
+python3 web/serve.py --watch
+python3 web/serve.py --rebuild
+```
+
+Open <http://localhost:8000/web/> for the site,
+<http://localhost:8000/web/bench.html> for the benchmark, and
+<http://localhost:8000/web/dev.html> for the old development page.
+
+`--watch` reloads every open page when a file under `web/` changes: HTML, CSS,
+JavaScript, JSON, and finished wasm builds in `web/pkg*`. It injects a small
+reload script into HTML responses only, so nothing on disk changes and
+`web/dist` is untouched.
+
+`--rebuild` also watches `crates/engine/src`, `crates/web/src`, `Cargo.toml`
+and `Cargo.lock`, waits about a second after the last change, then runs
+`web/build.sh` followed by `web/build.sh --threads` and reloads the pages when
+both succeed. A failed build prints the compiler output and shows the first
+error lines in a banner on every open page.
+
+Rust changes only reach the browser after a wasm build. A change to the weight
+layout also needs `bench quantize` to regenerate
+`models/gpt2/model-int8.safetensors` (see Quantized weights).
+
 ## WebGPU
 
 The worker uses `?backend=webgpu` to run the forward pass with WGSL compute
