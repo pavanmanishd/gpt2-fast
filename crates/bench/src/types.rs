@@ -54,6 +54,10 @@ pub struct Session {
     pub matches_reference: bool,
     #[serde(default)]
     pub near_tie_mismatch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_tok_s: Option<f64>,
 }
 
 fn default_target() -> String {
@@ -105,6 +109,8 @@ pub struct Run {
     pub decode_tok_s: f64,
     pub total_ms: f64,
     pub matches: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_tok_s: Option<f64>,
 }
 
 pub fn read_f32_file(path: &Path) -> Result<Vec<f32>, String> {

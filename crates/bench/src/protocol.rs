@@ -10,6 +10,7 @@ pub enum ResponseLine {
     Ready { load_ms: f64 },
     Logits(Vec<f32>),
     Token(u32),
+    Tokens(Vec<u32>),
     Done,
 }
 
@@ -53,6 +54,20 @@ pub fn parse_line(line: &str) -> Result<ResponseLine, String> {
         return Ok(ResponseLine::Token(id));
     }
 
+    if let Some(tokens) = object.get("tokens") {
+        let values = tokens
+            .as_array()
+            .ok_or_else(|| "tokens is not an array".to_string())?;
+        let mut ids = Vec::with_capacity(values.len());
+        for value in values {
+            let id = value
+                .as_u64()
+                .ok_or_else(|| format!("batch token is not a non-negative integer: {value}"))?;
+            ids.push(u32::try_from(id).map_err(|_| format!("batch token id out of range: {id}"))?);
+        }
+        return Ok(ResponseLine::Tokens(ids));
+    }
+
     if let Some(done) = object.get("done") {
         if done.as_bool() != Some(true) {
             return Err(format!("worker reported done={done}, expected true"));
@@ -69,6 +84,13 @@ pub struct Response {
     pub request_at: Instant,
     pub first_token_at: Option<Instant>,
     pub last_token_at: Option<Instant>,
+}
+
+pub struct BatchResponse {
+    pub steps: Vec<Vec<u32>>,
+    pub request_at: Instant,
+    pub first_step_at: Option<Instant>,
+    pub last_step_at: Option<Instant>,
 }
 
 pub struct Worker {
@@ -123,13 +145,7 @@ impl Worker {
             "max_new_tokens": max_new_tokens,
             "return_logits": return_logits,
         });
-        let line = serde_json::to_string(&request)
-            .map_err(|error| format!("cannot encode request: {error}"))?;
-        self.stdin
-            .write_all(line.as_bytes())
-            .and_then(|_| self.stdin.write_all(b"\n"))
-            .and_then(|_| self.stdin.flush())
-            .map_err(|error| format!("cannot write to worker stdin: {error}"))?;
+        self.write_request(&request)?;
         let request_at = Instant::now();
 
         let mut response = Response {
@@ -157,12 +173,63 @@ impl Worker {
                     response.tokens.push(token);
                 }
                 ResponseLine::Done => break,
+                ResponseLine::Tokens(_) => {
+                    return Err("worker sent a batch line for a single request".to_string())
+                }
                 ResponseLine::Ready { .. } => {
                     return Err("worker sent a second ready line".to_string())
                 }
             }
         }
         Ok(response)
+    }
+
+    pub fn request_batch(
+        &mut self,
+        prompts: &[&[u32]],
+        max_new_tokens: usize,
+    ) -> Result<BatchResponse, String> {
+        let request = json!({
+            "batch": prompts,
+            "max_new_tokens": max_new_tokens,
+        });
+        self.write_request(&request)?;
+        let request_at = Instant::now();
+
+        let mut response = BatchResponse {
+            steps: Vec::new(),
+            request_at,
+            first_step_at: None,
+            last_step_at: None,
+        };
+        loop {
+            let line = self.read_line()?;
+            match parse_line(&line)? {
+                ResponseLine::Tokens(tokens) => {
+                    let now = Instant::now();
+                    if response.first_step_at.is_none() {
+                        response.first_step_at = Some(now);
+                    }
+                    response.last_step_at = Some(now);
+                    response.steps.push(tokens);
+                }
+                ResponseLine::Done => break,
+                ResponseLine::Logits(_) | ResponseLine::Token(_) | ResponseLine::Ready { .. } => {
+                    return Err(format!("unexpected line in a batch response: {line}"))
+                }
+            }
+        }
+        Ok(response)
+    }
+
+    fn write_request(&mut self, request: &Value) -> Result<(), String> {
+        let line = serde_json::to_string(request)
+            .map_err(|error| format!("cannot encode request: {error}"))?;
+        self.stdin
+            .write_all(line.as_bytes())
+            .and_then(|_| self.stdin.write_all(b"\n"))
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| format!("cannot write to worker stdin: {error}"))
     }
 
     pub fn peak_mb(&self) -> Option<f64> {
@@ -228,6 +295,20 @@ mod tests {
             parse_line(r#"{"token": 50256}"#),
             Ok(ResponseLine::Token(50256))
         );
+    }
+
+    #[test]
+    fn parses_batch_token_line() {
+        assert_eq!(
+            parse_line(r#"{"tokens": [12, 0, 50256]}"#),
+            Ok(ResponseLine::Tokens(vec![12, 0, 50256]))
+        );
+    }
+
+    #[test]
+    fn rejects_batch_tokens_that_are_not_integers() {
+        assert!(parse_line(r#"{"tokens": [12, -1]}"#).is_err());
+        assert!(parse_line(r#"{"tokens": 12}"#).is_err());
     }
 
     #[test]

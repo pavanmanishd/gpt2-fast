@@ -16,6 +16,10 @@ pub struct Summary {
     pub near_tie_mismatch: bool,
     pub token_match_rate: f64,
     pub sessions: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_tok_s: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,6 +41,10 @@ pub struct DraftLogLine {
     pub journal: String,
     pub flamegraph: String,
     pub headline: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_tok_s: Option<f64>,
 }
 
 pub fn summarize(sessions: &[Session]) -> Result<Summary, String> {
@@ -93,6 +101,13 @@ pub fn summarize(sessions: &[Session]) -> Result<Summary, String> {
     } else {
         matched_tokens as f64 / total_tokens as f64
     };
+    let batch = sessions.iter().find_map(|session| session.batch);
+    let batch_tok_s = median(
+        sessions
+            .iter()
+            .filter_map(|session| session.batch_tok_s)
+            .collect(),
+    );
 
     Ok(Summary {
         label: first.label.clone(),
@@ -106,6 +121,8 @@ pub fn summarize(sessions: &[Session]) -> Result<Summary, String> {
         near_tie_mismatch,
         token_match_rate,
         sessions: sessions.len(),
+        batch,
+        batch_tok_s,
     })
 }
 
@@ -128,6 +145,8 @@ pub fn draft_log_line(summary: &Summary) -> DraftLogLine {
         journal: "<journal>".to_string(),
         flamegraph: "<flamegraph>".to_string(),
         headline: "<headline>".to_string(),
+        batch: summary.batch,
+        batch_tok_s: summary.batch_tok_s.map(round3),
     }
 }
 
@@ -193,6 +212,8 @@ mod tests {
             },
             matches_reference,
             near_tie_mismatch: false,
+            batch: None,
+            batch_tok_s: None,
         }
     }
 
@@ -256,6 +277,39 @@ mod tests {
     #[test]
     fn rejects_zero_sessions() {
         assert!(summarize(&[]).is_err());
+    }
+
+    #[test]
+    fn reports_batch_throughput_from_batched_sessions() {
+        let mut first = session(10.0, 100.0, 4.0, None, 10, 10, true);
+        first.batch = Some(8);
+        first.batch_tok_s = Some(900.0);
+        let mut second = session(10.0, 100.0, 4.0, None, 10, 10, true);
+        second.batch = Some(8);
+        second.batch_tok_s = Some(1100.0);
+        let summary = summarize(&[first, second]).unwrap();
+        assert_eq!(summary.batch, Some(8));
+        assert_eq!(summary.batch_tok_s, Some(1000.0));
+    }
+
+    #[test]
+    fn sessions_without_batch_fields_still_deserialize() {
+        let value = serde_json::to_value(session(10.0, 100.0, 4.0, None, 10, 10, true)).unwrap();
+        assert!(value.get("batch").is_none());
+        assert!(value.get("batch_tok_s").is_none());
+        let parsed: Session = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.batch, None);
+        assert_eq!(parsed.batch_tok_s, None);
+    }
+
+    #[test]
+    fn unbatched_sessions_leave_batch_fields_out() {
+        let summary = summarize(&[session(10.0, 100.0, 4.0, None, 10, 10, true)]).unwrap();
+        assert_eq!(summary.batch, None);
+        assert_eq!(summary.batch_tok_s, None);
+        let value = serde_json::to_value(&summary).unwrap();
+        assert!(value.get("batch").is_none());
+        assert!(value.get("batch_tok_s").is_none());
     }
 
     #[test]

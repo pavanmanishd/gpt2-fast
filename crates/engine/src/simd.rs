@@ -112,6 +112,7 @@ mod int8_activations {
         group: usize,
         y: &mut [f32],
         epilogue: Epilogue,
+        outliers: Option<&[Outliers]>,
     ) {
         let weight_groups = n_in.div_ceil(GROUP_SIZE);
         let activation_groups = n_in.div_ceil(group);
@@ -121,6 +122,9 @@ mod int8_activations {
         assert!(weight_scale.len() >= n_out * weight_groups);
         assert!(bias.len() >= n_out);
         assert!(y.len() >= rows * n_out, "output is too short");
+        if let Some(outliers) = outliers {
+            assert_eq!(outliers.len(), rows, "one outlier list per row");
+        }
 
         let with_gelu = matches!(epilogue, Epilogue::Gelu);
         for row in 0..rows {
@@ -136,6 +140,15 @@ mod int8_activations {
                     n_in,
                     group,
                 );
+                let sum = match outliers {
+                    Some(outliers) => add_outliers(
+                        sum,
+                        outliers[row],
+                        &weight[output * n_in..(output + 1) * n_in],
+                        &weight_scale[output * weight_groups..(output + 1) * weight_groups],
+                    ),
+                    None => sum,
+                };
                 y[row * n_out + output] = finish(sum, Some(bias[output]), with_gelu);
             }
         }
@@ -336,6 +349,7 @@ mod int8_activations_neon {
         n_out: usize,
         group: usize,
         with_gelu: bool,
+        outliers: Option<&'a [Outliers<'a>]>,
     }
 
     impl Prefill<'_> {
@@ -417,8 +431,17 @@ mod int8_activations_neon {
                     vst1q_f32(sums.as_mut_ptr(), *value);
                     for (lane, sum) in sums.iter().enumerate() {
                         let output = j + 4 * k + lane;
+                        let sum = self.outliers.map_or(*sum, |outliers| {
+                            add_outliers(
+                                *sum,
+                                outliers[i + r],
+                                &self.weight[output * self.n_in..(output + 1) * self.n_in],
+                                &self.weight_scale
+                                    [output * weight_groups..(output + 1) * weight_groups],
+                            )
+                        });
                         *y.get_unchecked_mut((i + r) * self.n_out + output) =
-                            finish(*sum, Some(self.bias[output]), self.with_gelu);
+                            finish(sum, Some(self.bias[output]), self.with_gelu);
                     }
                 }
             }
@@ -484,8 +507,18 @@ mod int8_activations_neon {
 
             for (r, total_r) in total.iter().enumerate() {
                 for (c, value) in total_r.iter().enumerate() {
-                    *y.get_unchecked_mut((i + r) * self.n_out + j + c) =
-                        finish(*value, Some(self.bias[j + c]), self.with_gelu);
+                    let output = j + c;
+                    let sum = self.outliers.map_or(*value, |outliers| {
+                        add_outliers(
+                            *value,
+                            outliers[i + r],
+                            &self.weight[output * self.n_in..(output + 1) * self.n_in],
+                            &self.weight_scale
+                                [output * weight_groups..(output + 1) * weight_groups],
+                        )
+                    });
+                    *y.get_unchecked_mut((i + r) * self.n_out + output) =
+                        finish(sum, Some(self.bias[output]), self.with_gelu);
                 }
             }
         }
@@ -507,6 +540,7 @@ mod int8_activations_neon {
         group: usize,
         with_gelu: bool,
         y: &mut [f32],
+        outliers: Option<&[Outliers]>,
     ) {
         let prefill = Prefill {
             activations,
@@ -518,6 +552,7 @@ mod int8_activations_neon {
             n_out,
             group,
             with_gelu,
+            outliers,
         };
         let mut block = 0;
         while block < n_out {
@@ -646,6 +681,7 @@ impl Int8ActivationKernels {
         group: usize,
         y: &mut [f32],
         epilogue: Epilogue,
+        outliers: Option<&[Outliers]>,
     ) {
         let weight_groups = n_in.div_ceil(crate::quantize::GROUP_SIZE);
         assert!(activations.len() >= rows * n_in);
@@ -654,6 +690,9 @@ impl Int8ActivationKernels {
         assert!(weight_scale.len() >= n_out * weight_groups);
         assert!(bias.len() >= n_out);
         assert!(y.len() >= rows * n_out, "output is too short");
+        if let Some(outliers) = outliers {
+            assert_eq!(outliers.len(), rows, "one outlier list per row");
+        }
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -675,6 +714,7 @@ impl Int8ActivationKernels {
                             group,
                             with_gelu,
                             y,
+                            outliers,
                         );
                     }
                     return;
@@ -694,6 +734,7 @@ impl Int8ActivationKernels {
             group,
             y,
             epilogue,
+            outliers,
         );
     }
 }
@@ -1007,6 +1048,20 @@ mod neon {
                 }
                 i += PREFILL_TOKENS;
             }
+            while i + 2 <= rows {
+                let mut j = block;
+                while j + PREFILL_OUTPUTS <= end {
+                    f32_tile::<2, PREFILL_OUTPUTS>(
+                        x, weight, bias, n_in, n_out, i, j, with_gelu, y,
+                    );
+                    j += PREFILL_OUTPUTS;
+                }
+                while j < end {
+                    f32_tile::<2, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
+                    j += 1;
+                }
+                i += 2;
+            }
             while i < rows {
                 let mut j = block;
                 while j + PREFILL_OUTPUTS <= end {
@@ -1129,6 +1184,22 @@ mod neon {
                     j += 1;
                 }
                 i += PREFILL_TOKENS;
+            }
+            while i + 2 <= rows {
+                let mut j = block;
+                while j + PREFILL_OUTPUTS <= end {
+                    int8_tile::<2, PREFILL_OUTPUTS>(
+                        x, weight, scale, bias, group, n_in, n_out, i, j, with_gelu, y,
+                    );
+                    j += PREFILL_OUTPUTS;
+                }
+                while j < end {
+                    int8_tile::<2, 1>(
+                        x, weight, scale, bias, group, n_in, n_out, i, j, with_gelu, y,
+                    );
+                    j += 1;
+                }
+                i += 2;
             }
             while i < rows {
                 let mut j = block;
@@ -1562,6 +1633,18 @@ mod wasm {
             }
             i += PREFILL_TOKENS;
         }
+        while i + 2 <= rows {
+            let mut j = 0;
+            while j + PREFILL_OUTPUTS <= n_out {
+                f32_tile::<2, PREFILL_OUTPUTS>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
+                j += PREFILL_OUTPUTS;
+            }
+            while j < n_out {
+                f32_tile::<2, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
+                j += 1;
+            }
+            i += 2;
+        }
         while i < rows {
             let mut j = 0;
             while j + PREFILL_OUTPUTS <= n_out {
@@ -1675,6 +1758,16 @@ mod wasm {
                 j += 1;
             }
             i += INT8_PREFILL_TOKENS;
+        }
+        while i + 2 <= rows {
+            let mut j = 0;
+            while j < n_out {
+                int8_tile::<2, 1>(
+                    x, weight, scale, bias, group, n_in, n_out, i, j, with_gelu, y,
+                );
+                j += 1;
+            }
+            i += 2;
         }
         while i < rows {
             let mut j = 0;
@@ -2597,6 +2690,7 @@ mod tests {
                     group,
                     &mut expected,
                     epilogue,
+                    None,
                 );
                 let mut actual = vec![0.0f32; rows * n_out];
                 kernels.linear_rows(
@@ -2611,6 +2705,7 @@ mod tests {
                     group,
                     &mut actual,
                     epilogue,
+                    None,
                 );
                 for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
                     assert_eq!(
@@ -2640,6 +2735,7 @@ mod tests {
                                 group,
                                 with_gelu,
                                 &mut dotprod,
+                                None,
                             );
                         }
                         for (index, (a, e)) in dotprod.iter().zip(&expected).enumerate() {
@@ -2762,6 +2858,129 @@ mod tests {
                         e.to_bits(),
                         "in {n_in}, out {n_out}, group {group}, outliers {count}, element {index}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn int8_activation_row_outliers_match_the_scalar_order_bit_for_bit() {
+        let kernels = Int8ActivationKernels::detect();
+        for case in [
+            ActivationCase {
+                rows: 1,
+                n_in: 65,
+                n_out: 9,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 2,
+                n_in: 37,
+                n_out: 5,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 3,
+                n_in: 64,
+                n_out: 6,
+                group: 32,
+            },
+            ActivationCase {
+                rows: 5,
+                n_in: 130,
+                n_out: 11,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 7,
+                n_in: 64,
+                n_out: 17,
+                group: 64,
+            },
+        ] {
+            let ActivationFixture {
+                activations,
+                activation_scale,
+                weight,
+                weight_scale,
+                bias,
+            } = activation_data(&case);
+            let (rows, n_in, n_out, group) = (case.rows, case.n_in, case.n_out, case.group);
+            let per_row: Vec<(Vec<u32>, Vec<f32>)> = (0..rows)
+                .map(|row| {
+                    let indices = (0..4)
+                        .map(|i| ((i * n_in / 4 + row * 7) % n_in) as u32)
+                        .collect();
+                    let values = (0..4).map(|i| (i + row) as f32 * 1.5 - 2.0).collect();
+                    (indices, values)
+                })
+                .collect();
+            let row_outliers: Vec<Outliers> = per_row
+                .iter()
+                .map(|(indices, values)| Outliers { indices, values })
+                .collect();
+
+            for epilogue in [Epilogue::Store, Epilogue::Gelu] {
+                let mut expected = vec![0.0f32; rows * n_out];
+                int8_activations::linear_rows(
+                    &activations,
+                    &activation_scale,
+                    &weight,
+                    &weight_scale,
+                    &bias,
+                    rows,
+                    n_in,
+                    n_out,
+                    group,
+                    &mut expected,
+                    epilogue,
+                    Some(&row_outliers),
+                );
+                let mut actual = vec![0.0f32; rows * n_out];
+                kernels.linear_rows(
+                    &activations,
+                    &activation_scale,
+                    &weight,
+                    &weight_scale,
+                    &bias,
+                    rows,
+                    n_in,
+                    n_out,
+                    group,
+                    &mut actual,
+                    epilogue,
+                    Some(&row_outliers),
+                );
+                for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        e.to_bits(),
+                        "rows {rows}, in {n_in}, out {n_out}, group {group}, element {index}"
+                    );
+                }
+
+                if rows == 1 {
+                    let mut one = vec![0.0f32; n_out];
+                    kernels.linear_outputs(
+                        &activations,
+                        &activation_scale,
+                        &weight,
+                        &weight_scale,
+                        Some(&bias),
+                        n_in,
+                        group,
+                        0..n_out,
+                        &mut one,
+                        epilogue,
+                        Some(row_outliers[0]),
+                    );
+                    for (index, (a, e)) in one.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            e.to_bits(),
+                            "single row, in {n_in}, out {n_out}, group {group}, element {index}"
+                        );
+                    }
                 }
             }
         }
@@ -3006,6 +3225,7 @@ mod tests {
                                 64,
                                 part,
                                 Epilogue::Store,
+                                None,
                             );
                         } else {
                             int8_linear_rows(
@@ -3047,6 +3267,98 @@ mod tests {
                     let new = measure(n_in, n_out, rows, threads, true);
                     println!(
                         "{n_in}->{n_out} rows {rows} threads {threads}: old {old:.1} GB/s, new {new:.1} GB/s"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch_identity {
+    use super::{Epilogue, Int8ActivationKernels, Outliers};
+
+    #[test]
+    fn rows_match_single_row_outputs_at_model_sizes() {
+        let kernels = Int8ActivationKernels::detect();
+        for (rows, n_in, n_out, group) in [
+            (5usize, 768usize, 768usize, 64usize),
+            (5, 768, 2304, 64),
+            (5, 768, 3072, 64),
+            (5, 3072, 768, 64),
+            (5, 768, 1000, 64),
+            (5, 768, 50257, 64),
+        ] {
+            let activations: Vec<i8> = (0..rows * n_in)
+                .map(|i| ((i * 37 + 11) % 255) as i32 - 127)
+                .map(|v| v as i8)
+                .collect();
+            let activation_groups = n_in.div_ceil(group);
+            let activation_scale: Vec<f32> = (0..rows * activation_groups)
+                .map(|i| (i % 9 + 1) as f32 / 200.0)
+                .collect();
+            let weight: Vec<i8> = (0..n_out * n_in)
+                .map(|i| ((i * 53 + 7) % 255) as i32 - 127)
+                .map(|v| v as i8)
+                .collect();
+            let weight_groups = n_in.div_ceil(64);
+            let weight_scale: Vec<f32> = (0..n_out * weight_groups)
+                .map(|i| (i % 11 + 1) as f32 / 300.0)
+                .collect();
+            let bias: Vec<f32> = (0..n_out).map(|i| i as f32 / 17.0 - 1.0).collect();
+            let per_row: Vec<(Vec<u32>, Vec<f32>)> = (0..rows)
+                .map(|row| {
+                    let indices = (0..4)
+                        .map(|i| ((i * n_in / 4 + row * 7) % n_in) as u32)
+                        .collect();
+                    let values = (0..4).map(|i| (i + row) as f32 * 1.5 - 2.0).collect();
+                    (indices, values)
+                })
+                .collect();
+            let row_outliers: Vec<Outliers> = per_row
+                .iter()
+                .map(|(indices, values)| Outliers { indices, values })
+                .collect();
+
+            let mut actual = vec![0.0f32; rows * n_out];
+            kernels.linear_rows(
+                &activations,
+                &activation_scale,
+                &weight,
+                &weight_scale,
+                &bias,
+                rows,
+                n_in,
+                n_out,
+                group,
+                &mut actual,
+                Epilogue::Store,
+                Some(&row_outliers),
+            );
+            for row in 0..rows {
+                let mut expected = vec![0.0f32; n_out];
+                kernels.linear_outputs(
+                    &activations[row * n_in..(row + 1) * n_in],
+                    &activation_scale[row * activation_groups..(row + 1) * activation_groups],
+                    &weight,
+                    &weight_scale,
+                    Some(&bias),
+                    n_in,
+                    group,
+                    0..n_out,
+                    &mut expected,
+                    Epilogue::Store,
+                    Some(row_outliers[row]),
+                );
+                for (index, (a, e)) in actual[row * n_out..(row + 1) * n_out]
+                    .iter()
+                    .zip(&expected)
+                    .enumerate()
+                {
+                    assert_eq!(
+                        a.to_bits(),
+                        e.to_bits(),
+                        "rows {rows}, in {n_in}, out {n_out}, group {group}, row {row}, element {index}"
                     );
                 }
             }

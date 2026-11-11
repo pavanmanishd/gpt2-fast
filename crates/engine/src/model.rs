@@ -75,6 +75,15 @@ struct QuantizedActs<'a> {
     outliers: Option<Outliers<'a>>,
 }
 
+#[derive(Clone, Copy)]
+struct QuantizedRowActs<'a> {
+    data: &'a [i8],
+    scale: &'a [f32],
+    group: usize,
+    kernels: Int8ActivationKernels,
+    outliers: Option<&'a [Outliers<'a>]>,
+}
+
 enum Matrix {
     F32(Vec<f32>),
     Int8 { data: Vec<i8>, scale: Vec<f32> },
@@ -323,8 +332,8 @@ impl Workspace {
             activation_data: vec![0; n * 4 * n_embd],
             // Enough scales for the smallest activation group this model allows.
             activation_scale: vec![0.0; n * 4 * n_embd / 16],
-            outlier_index: vec![0; n_embd],
-            outlier_value: vec![0.0; n_embd],
+            outlier_index: vec![0; n * n_embd],
+            outlier_value: vec![0.0; n * n_embd],
         }
     }
 }
@@ -332,6 +341,7 @@ impl Workspace {
 // Each worker keeps its own score row so the attention loop never allocates.
 thread_local! {
     static SCORES: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static ROWS_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 struct KvCache {
@@ -342,7 +352,11 @@ struct KvCache {
 
 impl KvCache {
     fn new(config: &Config) -> KvCache {
-        let size = config.n_ctx * config.n_embd;
+        KvCache::with_capacity(config, config.n_ctx)
+    }
+
+    fn with_capacity(config: &Config, positions: usize) -> KvCache {
+        let size = positions * config.n_embd;
         KvCache {
             keys: vec![vec![0.0; size]; config.n_layer],
             values: vec![vec![0.0; size]; config.n_layer],
@@ -696,6 +710,195 @@ impl Model {
         }
     }
 
+    pub fn generate_batch(
+        &self,
+        prompts: &[&[u32]],
+        max_new_tokens: usize,
+        mut on_tokens: impl FnMut(&[u32]),
+    ) {
+        assert!(
+            !prompts.is_empty(),
+            "generate_batch requires at least one prompt"
+        );
+        let rows = prompts.len();
+        for prompt in prompts {
+            assert!(!prompt.is_empty(), "generate_batch prompt is empty");
+            assert!(
+                prompt.len() + max_new_tokens <= self.config.n_ctx,
+                "prompt of {} tokens plus {max_new_tokens} generated tokens exceeds context length {}",
+                prompt.len(),
+                self.config.n_ctx
+            );
+        }
+        if max_new_tokens == 0 {
+            return;
+        }
+
+        let capacity = prompts.iter().map(|prompt| prompt.len()).max().unwrap_or(0);
+        let mut workspace = Workspace::new(&self.config, capacity.max(rows));
+        let mut caches: Vec<KvCache> = prompts
+            .iter()
+            .map(|prompt| KvCache::with_capacity(&self.config, prompt.len() + max_new_tokens))
+            .collect();
+        let mut tokens = Vec::with_capacity(rows);
+        for (prompt, cache) in prompts.iter().zip(caches.iter_mut()) {
+            self.forward(prompt, 0, cache, &mut workspace);
+            tokens.push(argmax(self.last_logits(&mut workspace, prompt.len())));
+        }
+
+        let zero_bias = vec![0.0; self.config.vocab_size];
+        on_tokens(&tokens);
+        for _ in 1..max_new_tokens {
+            self.forward_batch(&tokens, &mut caches, &mut workspace);
+            self.next_tokens_batch(&mut workspace, rows, &zero_bias, &mut tokens);
+            on_tokens(&tokens);
+        }
+    }
+
+    fn forward_batch(&self, tokens: &[u32], caches: &mut [KvCache], workspace: &mut Workspace) {
+        let rows = tokens.len();
+        assert_eq!(rows, caches.len(), "one token per sequence");
+        let n_embd = self.config.n_embd;
+        for (row, &id) in tokens.iter().enumerate() {
+            assert!(
+                (id as usize) < self.config.vocab_size,
+                "token id {id} is outside the vocabulary"
+            );
+            let start = caches[row].len;
+            let position_row = start * n_embd;
+            self.wte.add_row_to(
+                id as usize,
+                n_embd,
+                &self.wpe[position_row..position_row + n_embd],
+                &mut workspace.x[row * n_embd..(row + 1) * n_embd],
+            );
+        }
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.forward_batch(workspace, rows, caches, index, self);
+        }
+        for cache in caches {
+            cache.len += 1;
+        }
+    }
+
+    fn next_tokens_batch(
+        &self,
+        workspace: &mut Workspace,
+        rows: usize,
+        zero_bias: &[f32],
+        tokens: &mut [u32],
+    ) {
+        if rows == 1 {
+            tokens[0] = argmax(self.last_logits(workspace, 1));
+            return;
+        }
+
+        let config = &self.config;
+        let n_embd = config.n_embd;
+        for row in 0..rows {
+            layer_norm_into(
+                &workspace.x[row * n_embd..(row + 1) * n_embd],
+                &self.ln_f_weight,
+                &self.ln_f_bias,
+                config.layer_norm_epsilon,
+                &mut workspace.normed[row * n_embd..(row + 1) * n_embd],
+            );
+        }
+
+        let vocab_size = config.vocab_size;
+        let input = &workspace.normed[..rows * n_embd];
+        let mode = self.activation_mode(self.logits_activations);
+        let mut outliers = Vec::new();
+        let acts = match mode {
+            Some(mode) => {
+                let groups = n_embd.div_ceil(mode.group);
+                let mut counts = Vec::with_capacity(rows);
+                for row in 0..rows {
+                    counts.push(quantize_activation_outliers(
+                        &input[row * n_embd..(row + 1) * n_embd],
+                        mode.group,
+                        self.logits_outliers,
+                        &mut workspace.activation_data[row * n_embd..(row + 1) * n_embd],
+                        &mut workspace.activation_scale[row * groups..(row + 1) * groups],
+                        &mut workspace.outlier_index[row * n_embd..(row + 1) * n_embd],
+                        &mut workspace.outlier_value[row * n_embd..(row + 1) * n_embd],
+                    ));
+                }
+                outliers.extend(counts.iter().enumerate().map(|(row, &count)| Outliers {
+                    indices: &workspace.outlier_index[row * n_embd..row * n_embd + count],
+                    values: &workspace.outlier_value[row * n_embd..row * n_embd + count],
+                }));
+                Some(QuantizedRowActs {
+                    data: &workspace.activation_data[..rows * n_embd],
+                    scale: &workspace.activation_scale[..rows * groups],
+                    group: mode.group,
+                    kernels: mode.kernels,
+                    outliers: Some(&outliers),
+                })
+            }
+            None => None,
+        };
+
+        let weight_groups = n_embd.div_ceil(GROUP_SIZE);
+        let wte = &self.wte;
+        let mut best = vec![f32::NEG_INFINITY; rows];
+        let mut best_token = vec![0u32; rows];
+        for_each_output_part(
+            &self.threads,
+            rows,
+            vocab_size,
+            |start, outputs, part| match wte {
+                Matrix::F32(weight) => linear_rows(
+                    input,
+                    &weight[start * n_embd..],
+                    &zero_bias[start..],
+                    rows,
+                    n_embd,
+                    outputs,
+                    part,
+                    Epilogue::Store,
+                ),
+                Matrix::Int8 { data, scale } => match acts {
+                    Some(acts) => acts.kernels.linear_rows(
+                        acts.data,
+                        acts.scale,
+                        &data[start * n_embd..],
+                        &scale[start * weight_groups..],
+                        &zero_bias[start..],
+                        rows,
+                        n_embd,
+                        outputs,
+                        acts.group,
+                        part,
+                        Epilogue::Store,
+                        acts.outliers,
+                    ),
+                    None => int8_linear_rows(
+                        input,
+                        &data[start * n_embd..],
+                        &scale[start * weight_groups..],
+                        &zero_bias[start..],
+                        rows,
+                        n_embd,
+                        outputs,
+                        part,
+                        Epilogue::Store,
+                        GROUP_SIZE,
+                    ),
+                },
+            },
+            |row, start, values| {
+                for (offset, &value) in values.iter().enumerate() {
+                    if value > best[row] {
+                        best[row] = value;
+                        best_token[row] = (start + offset) as u32;
+                    }
+                }
+            },
+        );
+        tokens.copy_from_slice(&best_token);
+    }
+
     fn forward(
         &self,
         tokens: &[u32],
@@ -823,6 +1026,12 @@ fn log_probability(logits: &[f32], id: u32) -> f32 {
     logits[id as usize] - max - sum.ln()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowSplit {
+    ByRow,
+    ByOutput,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn linear(
     threads: &Threads,
@@ -838,8 +1047,75 @@ fn linear(
     activation_data: &mut [i8],
     activation_scale: &mut [f32],
 ) {
+    linear_split(
+        threads,
+        x,
+        weight,
+        bias,
+        rows,
+        n_in,
+        n_out,
+        y,
+        epilogue,
+        mode,
+        activation_data,
+        activation_scale,
+        RowSplit::ByRow,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_batch(
+    threads: &Threads,
+    x: &[f32],
+    weight: &Matrix,
+    bias: &[f32],
+    rows: usize,
+    n_in: usize,
+    n_out: usize,
+    y: &mut [f32],
+    epilogue: Epilogue,
+    mode: Option<ActivationMode>,
+    activation_data: &mut [i8],
+    activation_scale: &mut [f32],
+) {
+    linear_split(
+        threads,
+        x,
+        weight,
+        bias,
+        rows,
+        n_in,
+        n_out,
+        y,
+        epilogue,
+        mode,
+        activation_data,
+        activation_scale,
+        RowSplit::ByOutput,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_split(
+    threads: &Threads,
+    x: &[f32],
+    weight: &Matrix,
+    bias: &[f32],
+    rows: usize,
+    n_in: usize,
+    n_out: usize,
+    y: &mut [f32],
+    epilogue: Epilogue,
+    mode: Option<ActivationMode>,
+    activation_data: &mut [i8],
+    activation_scale: &mut [f32],
+    split: RowSplit,
+) {
     match weight {
-        Matrix::F32(weight) => linear_f32(threads, x, weight, bias, rows, n_in, n_out, y, epilogue),
+        Matrix::F32(weight) => linear_f32(
+            threads, x, weight, bias, rows, n_in, n_out, y, epilogue, split,
+        ),
         Matrix::Int8 { data, scale } => match mode {
             Some(mode) => linear_int8_activations(
                 threads,
@@ -855,12 +1131,79 @@ fn linear(
                 mode,
                 activation_data,
                 activation_scale,
+                split,
             ),
             None => linear_int8(
-                threads, x, data, scale, bias, rows, n_in, n_out, y, epilogue,
+                threads, x, data, scale, bias, rows, n_in, n_out, y, epilogue, split,
             ),
         },
     }
+}
+
+// Few rows over a wide matrix reuse a weight block best when every thread owns
+// a slice of the outputs and all rows pass over it while it is in cache.
+fn for_each_output_part(
+    threads: &Threads,
+    rows: usize,
+    n_out: usize,
+    compute: impl Fn(usize, usize, &mut [f32]) + Sync,
+    mut consume: impl FnMut(usize, usize, &[f32]),
+) {
+    assert!(rows > 0 && n_out > 0, "an output split needs work");
+    let count = threads.count();
+    let mut bounds = Vec::with_capacity(count + 1);
+    bounds.push(0);
+    for index in 1..count {
+        bounds.push((index * n_out / count) / 16 * 16);
+    }
+    bounds.push(n_out);
+
+    let mut starts = Vec::with_capacity(count + 1);
+    starts.push(0);
+    for index in 1..count {
+        starts.push(starts[index - 1] + rows * (bounds[index] - bounds[index - 1]));
+    }
+    starts.push(rows * n_out);
+
+    ROWS_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        if scratch.len() < starts[count] {
+            scratch.resize(starts[count], 0.0);
+        }
+        let output = &mut scratch[..starts[count]];
+        threads.run_at(output, &starts, |offset, part| {
+            if part.is_empty() {
+                return;
+            }
+            let index = starts.binary_search(&offset).expect("part start");
+            let output_start = bounds[index];
+            compute(output_start, bounds[index + 1] - output_start, part);
+        });
+        for index in 0..count {
+            let outputs = bounds[index + 1] - bounds[index];
+            for row in 0..rows {
+                let offset = starts[index] + row * outputs;
+                consume(row, bounds[index], &scratch[offset..offset + outputs]);
+            }
+        }
+    });
+}
+
+fn run_output_split(
+    threads: &Threads,
+    rows: usize,
+    n_out: usize,
+    y: &mut [f32],
+    compute: impl Fn(usize, usize, &mut [f32]) + Sync,
+) {
+    assert_eq!(
+        y.len(),
+        rows * n_out,
+        "output split needs rows times outputs"
+    );
+    for_each_output_part(threads, rows, n_out, compute, |row, start, values| {
+        y[row * n_out + start..][..values.len()].copy_from_slice(values);
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -874,6 +1217,7 @@ fn linear_f32(
     n_out: usize,
     y: &mut [f32],
     epilogue: Epilogue,
+    split: RowSplit,
 ) {
     if rows == 1 {
         threads.run(y, 1, |start, part| {
@@ -883,6 +1227,19 @@ fn linear_f32(
                 Some(&bias[start..start + part.len()]),
                 n_in,
                 start..start + part.len(),
+                part,
+                epilogue,
+            );
+        });
+    } else if split == RowSplit::ByOutput {
+        run_output_split(threads, rows, n_out, y, |start, outputs, part| {
+            linear_rows(
+                x,
+                &weight[start * n_in..],
+                &bias[start..],
+                rows,
+                n_in,
+                outputs,
                 part,
                 epilogue,
             );
@@ -917,7 +1274,9 @@ fn linear_int8(
     n_out: usize,
     y: &mut [f32],
     epilogue: Epilogue,
+    split: RowSplit,
 ) {
+    let weight_groups = n_in.div_ceil(GROUP_SIZE);
     if rows == 1 {
         threads.run(y, 1, |start, part| {
             int8_linear_outputs(
@@ -927,6 +1286,21 @@ fn linear_int8(
                 Some(&bias[start..start + part.len()]),
                 n_in,
                 start..start + part.len(),
+                part,
+                epilogue,
+                GROUP_SIZE,
+            );
+        });
+    } else if split == RowSplit::ByOutput {
+        run_output_split(threads, rows, n_out, y, |start, outputs, part| {
+            int8_linear_rows(
+                x,
+                &weight[start * n_in..],
+                &scale[start * weight_groups..],
+                &bias[start..],
+                rows,
+                n_in,
+                outputs,
                 part,
                 epilogue,
                 GROUP_SIZE,
@@ -967,6 +1341,7 @@ fn linear_int8_activations(
     mode: ActivationMode,
     activation_data: &mut [i8],
     activation_scale: &mut [f32],
+    split: RowSplit,
 ) {
     let groups = n_in.div_ceil(mode.group);
     quantize_activations(
@@ -984,6 +1359,7 @@ fn linear_int8_activations(
         kernels: mode.kernels,
         outliers: None,
     };
+    let weight_groups = n_in.div_ceil(GROUP_SIZE);
 
     if rows == 1 {
         threads.run(y, 1, |start, part| {
@@ -999,6 +1375,23 @@ fn linear_int8_activations(
                 part,
                 epilogue,
                 acts.outliers,
+            );
+        });
+    } else if split == RowSplit::ByOutput {
+        run_output_split(threads, rows, n_out, y, |start, outputs, part| {
+            acts.kernels.linear_rows(
+                acts.data,
+                acts.scale,
+                &weight[start * n_in..],
+                &scale[start * weight_groups..],
+                &bias[start..],
+                rows,
+                n_in,
+                outputs,
+                acts.group,
+                part,
+                epilogue,
+                None,
             );
         });
     } else {
@@ -1017,6 +1410,7 @@ fn linear_int8_activations(
                 acts.group,
                 part,
                 epilogue,
+                None,
             );
         });
     }
@@ -1140,6 +1534,130 @@ impl Layer {
         );
         add_in_place(&mut x[..n * n_embd], &projection[..n * n_embd]);
     }
+
+    fn forward_batch(
+        &self,
+        workspace: &mut Workspace,
+        rows: usize,
+        caches: &mut [KvCache],
+        index: usize,
+        model: &Model,
+    ) {
+        let config = &model.config;
+        let threads = &model.threads;
+        let n_embd = config.n_embd;
+        let eps = config.layer_norm_epsilon;
+        let mode = model.activation_mode(model.activations);
+        let Workspace {
+            x,
+            projected,
+            normed,
+            qkv,
+            hidden,
+            activation_data,
+            activation_scale,
+            ..
+        } = workspace;
+        let projection: &mut [f32] = &mut projected[..rows * n_embd];
+
+        normalize_rows(
+            threads,
+            &x[..rows * n_embd],
+            &self.ln_1_weight,
+            &self.ln_1_bias,
+            eps,
+            n_embd,
+            &mut normed[..rows * n_embd],
+        );
+
+        linear_batch(
+            threads,
+            &normed[..rows * n_embd],
+            &self.c_attn_weight,
+            &self.c_attn_bias,
+            rows,
+            n_embd,
+            3 * n_embd,
+            &mut qkv[..rows * 3 * n_embd],
+            Epilogue::Store,
+            mode,
+            activation_data,
+            activation_scale,
+        );
+        for row in 0..rows {
+            let start = caches[row].len;
+            caches[row].store(
+                index,
+                start,
+                &qkv[row * 3 * n_embd..(row + 1) * 3 * n_embd],
+                1,
+                n_embd,
+            );
+        }
+        attention_batch(
+            threads,
+            &qkv[..rows * 3 * n_embd],
+            caches,
+            index,
+            config,
+            &mut normed[..rows * n_embd],
+        );
+        linear_batch(
+            threads,
+            &normed[..rows * n_embd],
+            &self.c_proj_weight,
+            &self.c_proj_bias,
+            rows,
+            n_embd,
+            n_embd,
+            projection,
+            Epilogue::Store,
+            mode,
+            activation_data,
+            activation_scale,
+        );
+        add_in_place(&mut x[..rows * n_embd], &projection[..rows * n_embd]);
+
+        normalize_rows(
+            threads,
+            &x[..rows * n_embd],
+            &self.ln_2_weight,
+            &self.ln_2_bias,
+            eps,
+            n_embd,
+            &mut normed[..rows * n_embd],
+        );
+
+        linear_batch(
+            threads,
+            &normed[..rows * n_embd],
+            &self.c_fc_weight,
+            &self.c_fc_bias,
+            rows,
+            n_embd,
+            4 * n_embd,
+            &mut hidden[..rows * 4 * n_embd],
+            Epilogue::Gelu,
+            mode,
+            activation_data,
+            activation_scale,
+        );
+        linear_batch(
+            threads,
+            &hidden[..rows * 4 * n_embd],
+            &self.mlp_c_proj_weight,
+            &self.mlp_c_proj_bias,
+            rows,
+            4 * n_embd,
+            n_embd,
+            projection,
+            Epilogue::Store,
+            mode,
+            activation_data,
+            activation_scale,
+        );
+        add_in_place(&mut x[..rows * n_embd], &projection[..rows * n_embd]);
+    }
 }
 
 struct Attention<'a> {
@@ -1256,6 +1774,114 @@ fn attention(
                     let base = head * head_dim;
                     kernel.head(scores, head, row, &mut output[base..base + head_dim]);
                 }
+            }
+        });
+    });
+}
+
+struct BatchAttention<'a> {
+    qkv: &'a [f32],
+    caches: &'a [KvCache],
+    layer: usize,
+    n_embd: usize,
+    head_dim: usize,
+    scale: f32,
+}
+
+impl BatchAttention<'_> {
+    fn unit(&self, scores: &mut [f32], row: usize, head: usize, output: &mut [f32]) {
+        let base = head * self.head_dim;
+        let query = row * 3 * self.n_embd + base;
+        let cache = &self.caches[row];
+        let end = cache.len + 1;
+        let keys = &cache.keys[self.layer];
+        for (past, score) in scores[..end].iter_mut().enumerate() {
+            let key = past * self.n_embd + base;
+            *score = dot(
+                &self.qkv[query..query + self.head_dim],
+                &keys[key..key + self.head_dim],
+            ) * self.scale;
+        }
+
+        let max = scores[..end]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0;
+        for score in &mut scores[..end] {
+            *score = (*score - max).exp();
+            sum += *score;
+        }
+        for score in &mut scores[..end] {
+            *score /= sum;
+        }
+
+        weighted_sum(
+            &cache.values[self.layer][base..],
+            self.n_embd,
+            &scores[..end],
+            output,
+        );
+    }
+}
+
+fn attention_batch(
+    threads: &Threads,
+    qkv: &[f32],
+    caches: &[KvCache],
+    layer: usize,
+    config: &Config,
+    output: &mut [f32],
+) {
+    let n_embd = config.n_embd;
+    let head_dim = n_embd / config.n_head;
+    let kernel = BatchAttention {
+        qkv,
+        caches,
+        layer,
+        n_embd,
+        head_dim,
+        scale: 1.0 / (head_dim as f32).sqrt(),
+    };
+    let units = caches.len() * config.n_head;
+    assert_eq!(output.len(), units * head_dim, "one output per head");
+
+    // A unit costs its sequence's context length, and the rows can differ by
+    // hundreds of positions, so split at equal cumulative key counts.
+    let count = threads.count();
+    let total: u64 = caches
+        .iter()
+        .map(|cache| (cache.len + 1) as u64)
+        .sum::<u64>()
+        * config.n_head as u64;
+    let mut starts = Vec::with_capacity(count + 1);
+    starts.push(0);
+    let mut done = 0u64;
+    let mut unit = 0;
+    for index in 1..count {
+        let target = total * index as u64 / count as u64;
+        while done < target && unit < units {
+            done += (caches[unit / config.n_head].len + 1) as u64;
+            unit += 1;
+        }
+        starts.push(unit * head_dim);
+    }
+    starts.push(output.len());
+
+    threads.run_at(output, &starts, |offset, part| {
+        SCORES.with(|buffer| {
+            let mut buffer = buffer.borrow_mut();
+            if buffer.len() < config.n_ctx {
+                buffer.resize(config.n_ctx, 0.0);
+            }
+            let scores = &mut buffer[..];
+            let first = offset / head_dim;
+            let count = part.len() / head_dim;
+            for unit in first..first + count {
+                let row = unit / config.n_head;
+                let head = unit % config.n_head;
+                let local = (unit - first) * head_dim;
+                kernel.unit(scores, row, head, &mut part[local..local + head_dim]);
             }
         });
     });

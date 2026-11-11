@@ -9,7 +9,10 @@ use serde_json::{json, Value};
 
 #[derive(Deserialize)]
 struct Request {
-    ids: Vec<u32>,
+    #[serde(default)]
+    ids: Option<Vec<u32>>,
+    #[serde(default)]
+    batch: Option<Vec<Vec<u32>>>,
     max_new_tokens: usize,
     #[serde(default)]
     return_logits: bool,
@@ -116,17 +119,34 @@ fn main() {
             Ok(request) => request,
             Err(error) => fail(&format!("invalid request: {error}")),
         };
-        if request.ids.is_empty() {
-            fail("request has no ids");
+        match (request.ids, request.batch) {
+            (Some(ids), None) => {
+                if ids.is_empty() {
+                    fail("request has no ids");
+                }
+                if request.return_logits {
+                    let logits = model.logits(&ids);
+                    write_line(&mut out, &json!({"logits": logits}));
+                }
+                model.generate(&ids, request.max_new_tokens, |token| {
+                    write_line(&mut out, &json!({"token": token}));
+                });
+            }
+            (None, Some(batch)) => {
+                if batch.is_empty() || batch.iter().any(Vec::is_empty) {
+                    fail("batch request has an empty prompt");
+                }
+                if request.return_logits {
+                    fail("batch request cannot return logits");
+                }
+                let prompts: Vec<&[u32]> = batch.iter().map(Vec::as_slice).collect();
+                model.generate_batch(&prompts, request.max_new_tokens, |tokens| {
+                    write_line(&mut out, &json!({"tokens": tokens}));
+                });
+            }
+            (Some(_), Some(_)) => fail("request has both ids and batch"),
+            (None, None) => fail("request has neither ids nor batch"),
         }
-
-        if request.return_logits {
-            let logits = model.logits(&request.ids);
-            write_line(&mut out, &json!({"logits": logits}));
-        }
-        model.generate(&request.ids, request.max_new_tokens, |token| {
-            write_line(&mut out, &json!({"token": token}));
-        });
         write_line(&mut out, &json!({"done": true}));
     }
 }
