@@ -1,6 +1,7 @@
 const REPO_URL = "https://github.com/pavanmanishd/gpt2-fast/blob/main/";
 const REPO_TREE_URL = REPO_URL.replace("/blob/main/", "/tree/main/");
-const MODEL_BASE_URL = "/models/gpt2/";
+const DEFAULT_MODEL_BASE_URL = "/models/gpt2/";
+const MODEL_BASE_URL = resolveModelBase();
 const CACHE_NAME = "gpt2-weights-v2";
 const WEIGHTS = "int8";
 const WEIGHTS_FILE = "model-int8.safetensors";
@@ -74,6 +75,20 @@ let benchResults = [];
 
 const chartData = new Map();
 const chartWidths = new Map();
+
+function resolveModelBase() {
+  const meta = document.querySelector('meta[name="gpt2-fast-model-base"]');
+  const value = meta?.content?.trim() || DEFAULT_MODEL_BASE_URL;
+  try {
+    const url = new URL(value, document.baseURI);
+    if (!url.pathname.endsWith("/")) {
+      url.pathname += "/";
+    }
+    return url.href;
+  } catch {
+    return new URL(DEFAULT_MODEL_BASE_URL, document.baseURI).href;
+  }
+}
 
 function detectSimd() {
   try {
@@ -250,6 +265,7 @@ function workerUrl(requested) {
     backend: requested,
     pkg: workerPackage(),
     threads: String(preferredThreads()),
+    model: MODEL_BASE_URL,
   });
   return `./worker.js?${params.toString()}`;
 }
@@ -446,10 +462,44 @@ async function modelIsCached() {
   if (!("caches" in window)) {
     return false;
   }
-  const url = new URL(WEIGHTS_FILE, new URL(MODEL_BASE_URL, location.origin));
-  url.searchParams.set("part", "manifest");
   const cache = await caches.open(CACHE_NAME);
+  const manifest = await cachedManifest(cache);
+  if (manifest) {
+    return allPartsCached(cache, manifest.weights.parts);
+  }
+  const url = new URL(WEIGHTS_FILE, MODEL_BASE_URL);
+  url.searchParams.set("part", "manifest");
   return Boolean(await cache.match(url.href));
+}
+
+async function cachedManifest(cache) {
+  const url = new URL("manifest.json", MODEL_BASE_URL).href;
+  const response = await cache.match(url);
+  if (!response) {
+    return null;
+  }
+  try {
+    const record = await response.json();
+    const manifest = record?.manifest ?? record;
+    const parts = manifest?.weights?.parts;
+    return manifest?.weights?.name === WEIGHTS_FILE &&
+      Array.isArray(parts) &&
+      parts.length > 0
+      ? manifest
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function allPartsCached(cache, parts) {
+  for (const part of parts) {
+    const response = await cache.match(new URL(part.name, MODEL_BASE_URL).href);
+    if (!response) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function handleProgress(message) {

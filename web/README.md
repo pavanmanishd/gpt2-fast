@@ -21,12 +21,14 @@ framework, bundler, external JavaScript, web fonts or analytics.
 | `gpu/shaders.js` | WGSL compute shaders for embeddings, layer norm, linear layers, attention, residual adds, the tied head and argmax. |
 | `thread.js` | The pool worker for the threaded build: joins the engine's shared memory and runs its worker loop. |
 | `bench.html`, `bench.js` | The browser benchmark page. |
+| `build_site.py` | Assembles the deployable static site in `web/dist`, including the split weights and `_headers`. |
 | `serve.py` | Development server that sends the COOP/COEP headers `SharedArrayBuffer` requires. |
 | `sync_data.py` | Builds `data/milestones.json` from the results log, prompts and reference output. |
 
 The site never downloads the model on page load. On a first visit it shows a
-load button; after that the four model files are in the Cache API and later
-visits load them from cache without showing the button.
+load button; after that the tokenizer files and the weight parts are in the
+Cache API, keyed by their content-hashed names, and later visits load them from
+cache without showing the button.
 
 ### Engine choice
 
@@ -47,7 +49,8 @@ The line under the demo always shows what actually ran, for example
 
 Changing the engine starts a fresh worker, but the weights stay in the Cache
 API: the worker reads them from cache, so a switch does not download them again.
-The weights are `models/gpt2/model-int8.safetensors`, int8, about 135 MB.
+The weights are `models/gpt2/model-int8.safetensors`, int8, about 135 MB in
+development and split into `model/*.part` files in the built site.
 
 The device benchmark runs prompt `p064` for 64 new tokens with one warm-up and
 one timed run on each engine the device supports: CPU first, then WebGPU if the
@@ -136,6 +139,52 @@ nightly Rust. `web/rust-toolchain.toml` pins `nightly-2026-08-23` and the
 `rust-src` and `wasm32-unknown-unknown` components; `build.sh` runs the build
 from `web/`, so that file selects the compiler. It links an imported shared
 memory and exports the TLS symbols the wasm-bindgen threads transform expects.
+
+## Deploying
+
+Build the public site into `web/dist`:
+
+```sh
+python3 web/build_site.py
+python3 web/build_site.py --out /tmp/site --model-dir models/gpt2 --part-mb 20
+```
+
+`web/dist` holds `index.html`, `site.js`, `site.css`, `worker.js`, `thread.js`,
+`gpu/`, `pkg/`, `pkg-nosimd/`, `pkg-threads/`, a freshly generated
+`data/milestones.json`, and `model/`: `config.json`, `vocab.json`, `merges.txt`,
+`manifest.json` and the int8 weights cut into content-hashed `.part` files.
+Every part is at most `--part-mb` MiB (20 by default), under Cloudflare Pages'
+25 MB file limit. The weights are not in git, so build where
+`models/gpt2/model-int8.safetensors` exists. `_headers` carries the COOP/COEP
+headers for cross-origin isolation and marks the hashed parts immutable. The
+worker keeps the manifest in the Cache API and rechecks it after five minutes,
+so a new build reaches visitors without ever mixing old and new parts.
+
+Hosting cases:
+
+- **A host that applies `_headers`** (Cloudflare Pages, Netlify): upload the
+  contents of `web/dist`. COOP/COEP turn on cross-origin isolation, so the
+  threaded WebAssembly build works next to WebGPU.
+- **A host without custom headers** (GitHub Pages, plain object storage):
+  upload `web/dist` as is; `_headers` is ignored. The page still runs on WebGPU
+  or on single-threaded SIMD WebAssembly; WebAssembly threads are unavailable
+  because `SharedArrayBuffer` needs cross-origin isolation.
+- **Weights on a different origin**: set the `gpt2-fast-model-base` meta tag in
+  `web/index.html` to that origin, or pass `--model-base
+  https://cdn.example.com/gpt2/` to the build. The worker fetches
+  `manifest.json` and the parts with CORS, so the other origin must send
+  `Access-Control-Allow-Origin` for the site; a CORS response also satisfies
+  cross-origin isolation on the page. The rest of the site stays on its own
+  origin.
+
+Check the built site locally with the headers a real host would send:
+
+```sh
+python3 web/serve.py --root web/dist --port 8000
+```
+
+Nothing is published by these commands. The site goes live only when the owner
+decides to deploy `web/dist`.
 
 ## Quantized weights
 

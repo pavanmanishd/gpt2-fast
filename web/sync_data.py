@@ -377,9 +377,9 @@ def read_protocol(entries, prompts, expected):
     }
 
 
-def weights_bytes():
+def weights_bytes(path):
     try:
-        return WEIGHTS_PATH.stat().st_size
+        return path.stat().st_size
     except OSError:
         return WEIGHTS_FALLBACK_BYTES
 
@@ -399,6 +399,12 @@ def parse_args():
         type=Path,
         default=DEFAULT_OUT,
         help="data file to write (default: web/data/milestones.json)",
+    )
+    parser.add_argument(
+        "--weights",
+        type=Path,
+        default=WEIGHTS_PATH,
+        help="int8 weights file (default: models/gpt2/model-int8.safetensors)",
     )
     return parser.parse_args()
 
@@ -424,8 +430,8 @@ def main():
         },
         "weights": {
             "format": "int8",
-            "file": WEIGHTS_PATH.name,
-            "bytes": weights_bytes(),
+            "file": args.weights.name,
+            "bytes": weights_bytes(args.weights),
         },
         "native": native_section(entries),
         "race": race_section(entries, protocol["tokens_checked"]),
