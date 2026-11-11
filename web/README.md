@@ -25,10 +25,13 @@ framework, bundler, external JavaScript, web fonts or analytics.
 | `serve.py` | Development server that sends the COOP/COEP headers `SharedArrayBuffer` requires. |
 | `sync_data.py` | Builds `data/milestones.json` from the results log, prompts and reference output. |
 
-The site never downloads the model on page load. On a first visit it shows a
-load button; after that the tokenizer files and the weight parts are in the
-Cache API, keyed by their content-hashed names, and later visits load them from
-cache without showing the button.
+The site starts loading the model as soon as the page opens: a first visit
+shows the download progress, and later visits read the tokenizer files and the
+weight parts from the Cache API, keyed by their content-hashed names, without
+downloading the model again. When the browser reports
+`navigator.connection.saveData`, the page keeps a load button instead and says
+why. The prompt box stays editable while the model loads, and pressing Generate
+during loading runs the prompt as soon as the engine is ready.
 
 ### Engine choice
 

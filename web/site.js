@@ -2,13 +2,12 @@ const REPO_URL = "https://github.com/pavanmanishd/gpt2-fast/blob/main/";
 const REPO_TREE_URL = REPO_URL.replace("/blob/main/", "/tree/main/");
 const DEFAULT_MODEL_BASE_URL = "/models/gpt2/";
 const MODEL_BASE_URL = resolveModelBase();
-const CACHE_NAME = "gpt2-weights-v2";
 const WEIGHTS = "int8";
-const WEIGHTS_FILE = "model-int8.safetensors";
 const THREAD_CAP = 8;
 const DEFAULT_DATA_URL = "./data/milestones.json";
 
 const SIMD_SUPPORTED = detectSimd();
+const SAVE_DATA = Boolean(navigator.connection?.saveData);
 
 const els = {
   loadPanel: document.getElementById("load-panel"),
@@ -60,8 +59,9 @@ const rateFormat3 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 3 })
 
 let pageClient = null;
 let modelReady = null;
-let probing = true;
 let loading = false;
+let loadOnDemand = SAVE_DATA;
+let generateQueued = false;
 let generating = false;
 let busy = false;
 let stopRequested = false;
@@ -433,11 +433,12 @@ function updateProgress(percent) {
 }
 
 function updateControls() {
-  els.loadButton.hidden = probing || loading || modelReady !== null;
+  els.loadButton.hidden = !loadOnDemand || loading || modelReady !== null;
   els.loadButton.disabled = loading;
   els.progressWrap.hidden = !loading;
   els.loadPanel.hidden = modelReady !== null;
-  els.generate.disabled = modelReady === null || busy;
+  els.generate.disabled =
+    busy || generateQueued || (modelReady === null && !loading);
   els.stop.disabled = !generating;
   els.prompt.disabled = busy;
   els.maxTokens.disabled = busy;
@@ -456,50 +457,6 @@ function setRunningState() {
       ? "downloaded and cached"
       : "from browser cache";
   }
-}
-
-async function modelIsCached() {
-  if (!("caches" in window)) {
-    return false;
-  }
-  const cache = await caches.open(CACHE_NAME);
-  const manifest = await cachedManifest(cache);
-  if (manifest) {
-    return allPartsCached(cache, manifest.weights.parts);
-  }
-  const url = new URL(WEIGHTS_FILE, MODEL_BASE_URL);
-  url.searchParams.set("part", "manifest");
-  return Boolean(await cache.match(url.href));
-}
-
-async function cachedManifest(cache) {
-  const url = new URL("manifest.json", MODEL_BASE_URL).href;
-  const response = await cache.match(url);
-  if (!response) {
-    return null;
-  }
-  try {
-    const record = await response.json();
-    const manifest = record?.manifest ?? record;
-    const parts = manifest?.weights?.parts;
-    return manifest?.weights?.name === WEIGHTS_FILE &&
-      Array.isArray(parts) &&
-      parts.length > 0
-      ? manifest
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-async function allPartsCached(cache, parts) {
-  for (const part of parts) {
-    const response = await cache.match(new URL(part.name, MODEL_BASE_URL).href);
-    if (!response) {
-      return false;
-    }
-  }
-  return true;
 }
 
 function handleProgress(message) {
@@ -526,6 +483,8 @@ function handleProgress(message) {
 
 function handlePageWorkerError(message) {
   modelReady = null;
+  generateQueued = false;
+  loadOnDemand = true;
   if (pageClient) {
     pageClient.terminate();
     pageClient = null;
@@ -541,7 +500,7 @@ function handlePageWorkerError(message) {
   els.progressWrap.hidden = true;
   els.loadStatus.textContent = `The worker stopped: ${message}`;
   els.demoStatus.textContent = "The model is not loaded.";
-  els.benchStatus.textContent = "Load the model above first.";
+  els.benchStatus.textContent = "Load the model above to run the benchmark.";
   els.backendNote.hidden = true;
   els.running.textContent = "not loaded";
   els.cache.textContent = "not loaded";
@@ -602,9 +561,15 @@ async function loadModel(options = {}) {
       els.benchStatus.textContent = "Ready to run.";
     }
     updateControls();
+    if (generateQueued) {
+      generateQueued = false;
+      generate();
+    }
   } catch (error) {
     loading = false;
     modelReady = null;
+    generateQueued = false;
+    loadOnDemand = true;
     if (pageClient) {
       pageClient.terminate();
       pageClient = null;
@@ -614,7 +579,7 @@ async function loadModel(options = {}) {
     els.progressWrap.hidden = true;
     els.loadStatus.textContent = `Could not load the model: ${describeError(error)}`;
     els.demoStatus.textContent = "The model is not loaded.";
-    els.benchStatus.textContent = "Load the model above first.";
+    els.benchStatus.textContent = "Load the model above to run the benchmark.";
     els.backendNote.hidden = true;
     els.running.textContent = "not loaded";
     els.cache.textContent = "not loaded";
@@ -658,6 +623,8 @@ function stopGeneration() {
   }
   modelReady = null;
   loading = false;
+  loadOnDemand = true;
+  generateQueued = false;
   busy = false;
   generating = false;
   els.loadPanel.hidden = false;
@@ -668,11 +635,33 @@ function stopGeneration() {
     lastTokenCount > 0
       ? `Stopped after ${formatCount(lastTokenCount)} tokens.`
       : "Stopped before the first token.";
-  els.benchStatus.textContent = "Load the model above first.";
+  els.benchStatus.textContent = "Load the model above to run the benchmark.";
   els.backendNote.hidden = true;
   els.running.textContent = "not loaded";
   els.cache.textContent = "in browser cache";
   updateControls();
+}
+
+function requestGenerate() {
+  if (busy || generating) {
+    return;
+  }
+  if (els.prompt.value.length === 0) {
+    els.demoStatus.textContent = "Enter a prompt first.";
+    return;
+  }
+  if (modelReady === null) {
+    if (loading) {
+      generateQueued = true;
+      els.demoStatus.textContent =
+        "The model is still loading. Generate starts when it is ready.";
+      updateControls();
+    } else {
+      els.demoStatus.textContent = "The model is not loaded.";
+    }
+    return;
+  }
+  generate();
 }
 
 async function generate() {
@@ -1892,8 +1881,13 @@ function renderDevice(payload) {
   }, then ${formatCount(runs)} timed run${
     runs === 1 ? "" : "s"
   }. It runs on each engine this device supports, one after the other. The project rows are browser measurements from this repository on the development laptop, not the container.`;
-  els.benchStatus.textContent =
-    modelReady === null ? "Load the model above first." : "Ready to run.";
+  if (modelReady !== null) {
+    els.benchStatus.textContent = "Ready to run.";
+  } else if (loading) {
+    els.benchStatus.textContent = "Waiting for the model above.";
+  } else {
+    els.benchStatus.textContent = "Load the model above to run the benchmark.";
+  }
 }
 
 function renderMethod(protocol) {
@@ -1983,7 +1977,7 @@ function linkRepo() {
 
 function wireEvents() {
   els.loadButton.addEventListener("click", () => loadModel());
-  els.generate.addEventListener("click", generate);
+  els.generate.addEventListener("click", requestGenerate);
   els.stop.addEventListener("click", stopGeneration);
   els.runBench.addEventListener("click", runBenchmark);
   els.backendMode.addEventListener("change", handleBackendChange);
@@ -2007,7 +2001,7 @@ function observeCharts() {
   observer.observe(els.webChart);
 }
 
-async function init() {
+function init() {
   wireEvents();
   linkRepo();
   observeCharts();
@@ -2020,17 +2014,14 @@ async function init() {
 
   fetchData().then(renderData).catch(renderDataError);
 
-  const cached = await modelIsCached().catch(() => false);
-  probing = false;
-  if (cached) {
-    els.loadStatus.textContent = "The model is cached. Loading it.";
-    loadModel();
-  } else {
-    els.loadButton.hidden = false;
+  if (SAVE_DATA) {
     els.loadStatus.textContent =
-      "The model is not loaded. It downloads once and stays in this browser's cache.";
+      "Save-Data is on, so the model loads only when you ask.";
+    els.demoStatus.textContent = "Load the model to start.";
     updateControls();
+    return;
   }
+  loadModel();
 }
 
 init();

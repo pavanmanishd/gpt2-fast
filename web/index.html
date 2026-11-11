@@ -29,9 +29,10 @@
         <div class="section-head">
           <h2 id="demo-title">Try it</h2>
           <p class="section-note">
-            The model runs in a Web Worker on this device. Auto uses WebGPU when
-            it is available, otherwise WebAssembly with threads or SIMD. The
-            weights download once and stay in the browser's cache.
+            The model starts loading as soon as the page opens and runs in a Web
+            Worker on this device. Auto uses WebGPU when it is available,
+            otherwise WebAssembly with threads or SIMD. The weights download
+            once and stay in the browser's cache.
           </p>
         </div>
 
@@ -44,7 +45,7 @@
             Load the model (cached after the first time)
           </button>
           <p id="load-status" class="load-status" role="status" aria-live="polite">
-            Checking browser storage.
+            Preparing the model.
           </p>
           <div id="progress-wrap" class="progress-wrap" hidden>
             <div
@@ -106,7 +107,7 @@
         <pre id="output" class="output" tabindex="0" aria-label="Generated text"></pre>
 
         <p id="demo-status" class="status" role="status" aria-live="polite">
-          Load the model to start.
+          Waiting for the model.
         </p>
 
         <dl class="specs">
@@ -132,7 +133,7 @@
 
         <button id="run-bench" type="button" disabled>Run the benchmark</button>
         <p id="bench-status" class="status" role="status" aria-live="polite">
-          Load the model above first.
+          Waiting for the model above.
         </p>
 
         <div id="bench-table-wrap" class="table-scroll" hidden>
