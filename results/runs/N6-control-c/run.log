@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N6-control-c","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":128.254,"prefill_tok_s":1061.549,"ttft_ms":56.019,"peak_mb":560.066,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N6-control-c/summary.json

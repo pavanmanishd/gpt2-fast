@@ -1,0 +1,2 @@
+summary written to results/runs/N10-gpt2-medium-f32/summary.json
+{"date":"<date>","milestone":"N10-gpt2-medium-f32","title":"<title>","commit":"<commit>","model":"gpt2-medium","target":"cpu-linux","decode_tok_s":110.241,"prefill_tok_s":368.246,"ttft_ms":173.797,"peak_mb":1552.723,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}

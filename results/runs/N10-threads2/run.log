@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N10-threads2","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":192.559,"prefill_tok_s":791.017,"ttft_ms":77.818,"peak_mb":552.586,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N10-threads2/summary.json

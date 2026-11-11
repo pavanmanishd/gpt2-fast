@@ -1,0 +1,13 @@
+{
+  "label": "N10-int8",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 410.1601143007078,
+  "prefill_tok_s": 975.5170224976785,
+  "ttft_ms": 61.578556,
+  "peak_mb": 208.3515625,
+  "matches_reference": false,
+  "near_tie_mismatch": false,
+  "token_match_rate": 0.4640625,
+  "sessions": 5
+}

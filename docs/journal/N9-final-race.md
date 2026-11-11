@@ -47,3 +47,7 @@ For prompts the picture flips: with many tokens at once, gpt2-fast's register-bl
 ## Post draft
 
 > Step 9: the final race, GPT-2 124M on 4 CPU cores. gpt2-fast: 133 tok/s f32, 255 int8. PyTorch: 48. llama.cpp: 310 f32, 541 q8_0. We win on prompt processing in f32 (1,107 vs 895) and lose decode by 2.3x. The profile shows why: llama.cpp stores each output's weights as one contiguous row and spends 77% of its time in one dot-product loop, reading memory at ~155 GB/s to our ~66. So the race isn't over: next, the same layout trick.
+
+## Correction (re-measured in N12)
+
+llama.cpp q8_0 measured 679.6 tok/s decode and 4,316 tok/s prompt processing when re-run under the same conditions as N11 (`docs/journal/N12-rematch.md`), against 541 and 3,041 here. These sessions ran around 07:30, when the Mac briefly lost power and went to sleep, and the f16 sessions just before were already slowing; the numbers above were most likely depressed by that. Use the N12 numbers for llama.cpp q8_0.

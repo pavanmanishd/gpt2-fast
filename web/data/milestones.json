@@ -214,6 +214,84 @@
       "perplexity_f32": 76.83,
       "perplexity_reference": 76.84,
       "quantized": true
+    },
+    {
+      "milestone": "N10",
+      "title": "Output-major weights: decode with dot products",
+      "date": "2026-11-11",
+      "commit": "b874bc9",
+      "model": "gpt2-124m",
+      "target": "cpu-linux",
+      "decode_tok_s": 306.53,
+      "prefill_tok_s": 1265.3,
+      "ttft_ms": 45.7,
+      "peak_mb": 552.6,
+      "matches_reference": true,
+      "token_match_rate": 1.0,
+      "sessions": 5,
+      "baseline": "N6",
+      "headline": "Storing each output's weights as one contiguous row, the layout llama.cpp uses, makes f32 decoding 2.3 times faster (132.6 to 306.5 tokens per second).",
+      "journal": "docs/journal/N10-output-major-weights.md",
+      "quantized": false
+    },
+    {
+      "milestone": "N10-int8",
+      "title": "Output-major weights, int8",
+      "date": "2026-11-11",
+      "commit": "b874bc9",
+      "model": "gpt2-124m",
+      "target": "cpu-linux",
+      "decode_tok_s": 410.16,
+      "prefill_tok_s": 975.5,
+      "ttft_ms": 61.6,
+      "peak_mb": 208.4,
+      "matches_reference": false,
+      "token_match_rate": 0.4641,
+      "sessions": 5,
+      "baseline": "N7",
+      "headline": "The same layout makes int8 decoding 1.6 times faster (254.6 to 410.2 tokens per second) with unchanged quality.",
+      "journal": "docs/journal/N10-output-major-weights.md",
+      "perplexity": 78.0,
+      "quantized": true
+    },
+    {
+      "milestone": "N11",
+      "title": "Cache blocking for prompts",
+      "date": "2026-11-11",
+      "commit": "6de594c",
+      "model": "gpt2-124m",
+      "target": "cpu-linux",
+      "decode_tok_s": 323.64,
+      "prefill_tok_s": 1397.2,
+      "ttft_ms": 45.8,
+      "peak_mb": 552.6,
+      "matches_reference": true,
+      "token_match_rate": 1.0,
+      "sessions": 5,
+      "baseline": "N10",
+      "headline": "Walking the weights in blocks of 16 rows during prompt processing speeds it up 10% on GPT-2 124M with bit-identical output.",
+      "journal": "docs/journal/N11-cache-blocking.md",
+      "quantized": false
+    },
+    {
+      "milestone": "N11-int8",
+      "title": "Cache blocking for prompts, int8",
+      "date": "2026-11-11",
+      "commit": "6de594c",
+      "model": "gpt2-124m",
+      "target": "cpu-linux",
+      "decode_tok_s": 413.05,
+      "prefill_tok_s": 995.5,
+      "ttft_ms": 61.1,
+      "peak_mb": 208.3,
+      "matches_reference": false,
+      "token_match_rate": 0.4641,
+      "sessions": 5,
+      "baseline": "N10-int8",
+      "headline": "int8 prompt processing is unchanged by cache blocking because its smaller matrices already fit in cache.",
+      "journal": "docs/journal/N11-cache-blocking.md",
+      "perplexity": 78.0,
+      "quantized": true
     }
   ],
   "race": [
@@ -300,6 +378,90 @@
           "quantized": true
         }
       ]
+    },
+    {
+      "id": "N12",
+      "label": "Rematch",
+      "note": "N11 f32 and N11-int8 against llama.cpp. PyTorch and NumPy are the R0 references, not re-run for this race.",
+      "rows": [
+        {
+          "label": "PyTorch",
+          "milestone": "R0-torch",
+          "decode_tok_s": 48.45,
+          "prefill_tok_s": 1010.5,
+          "ttft_ms": 63.3,
+          "token_match_rate": 1.0,
+          "matched_tokens": 640,
+          "tokens_total": 640,
+          "quantized": false
+        },
+        {
+          "label": "NumPy",
+          "milestone": "R0-numpy",
+          "decode_tok_s": 61.36,
+          "prefill_tok_s": 1167.1,
+          "ttft_ms": 53.3,
+          "token_match_rate": 1.0,
+          "matched_tokens": 640,
+          "tokens_total": 640,
+          "quantized": false
+        },
+        {
+          "label": "gpt2-fast f32",
+          "milestone": "N11",
+          "decode_tok_s": 323.64,
+          "prefill_tok_s": 1397.2,
+          "ttft_ms": 45.8,
+          "token_match_rate": 1.0,
+          "matched_tokens": 640,
+          "tokens_total": 640,
+          "quantized": false
+        },
+        {
+          "label": "gpt2-fast int8",
+          "milestone": "N11-int8",
+          "decode_tok_s": 413.05,
+          "prefill_tok_s": 995.5,
+          "ttft_ms": 61.1,
+          "token_match_rate": 0.4641,
+          "matched_tokens": 297,
+          "tokens_total": 640,
+          "quantized": true
+        },
+        {
+          "label": "llama.cpp f32",
+          "milestone": "N12-llamacpp-f32",
+          "decode_tok_s": 300.67,
+          "prefill_tok_s": 895.5,
+          "ttft_ms": 71.1,
+          "token_match_rate": 1.0,
+          "matched_tokens": 640,
+          "tokens_total": 640,
+          "quantized": false
+        },
+        {
+          "label": "llama.cpp f16",
+          "milestone": "N12-llamacpp-f16",
+          "decode_tok_s": 386.38,
+          "prefill_tok_s": 838.7,
+          "ttft_ms": 75.6,
+          "token_match_rate": 1.0,
+          "matched_tokens": 640,
+          "tokens_total": 640,
+          "quantized": false
+        },
+        {
+          "label": "llama.cpp q8_0",
+          "milestone": "N12-llamacpp-q8_0",
+          "decode_tok_s": 679.56,
+          "prefill_tok_s": 4316.2,
+          "ttft_ms": 14.8,
+          "token_match_rate": 0.2844,
+          "matched_tokens": 182,
+          "tokens_total": 640,
+          "quantized": true
+        }
+      ]
     }
   ],
   "sizes": [
@@ -351,13 +513,12 @@
         },
         {
           "label": "gpt2-fast f32",
-          "milestone": "N8-gpt2-medium-f32",
-          "decode_tok_s": 29.56,
-          "prefill_tok_s": 123.2,
-          "peak_mb": 1579.8,
+          "milestone": "N11-gpt2-medium-f32",
+          "decode_tok_s": 110.84,
+          "prefill_tok_s": 416.1,
+          "peak_mb": 1552.9,
           "matches_reference": true,
-          "token_match_rate": 1.0,
-          "perplexity": 51.691
+          "token_match_rate": 1.0
         },
         {
           "label": "gpt2-fast int8",
