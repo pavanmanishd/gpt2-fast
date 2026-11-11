@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use gpt2_engine::{argmax, Model, Tokenizer};
+use gpt2_engine::{argmax, Activations, Model, Tokenizer, Weights};
 
 fn model_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/gpt2")
@@ -103,4 +103,32 @@ fn next_token_logprobs_match_the_logits_of_each_prefix() {
         let expected = logits[ids[position + 1] as usize] - max - sum.ln();
         assert_close(logprobs[position], expected);
     }
+}
+
+#[test]
+fn int8_activations_stay_close_to_int8_weights() {
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping model test: {} is missing", dir.display());
+        return;
+    }
+    let tokenizer = Tokenizer::load(&dir).expect("tokenizer loads");
+    let ids = tokenizer.encode("Hello, my name is");
+
+    let int8 = Model::load_with(&dir, Weights::Int8).expect("int8 model loads");
+    let quantized = Model::load_with_activations(&dir, Weights::Int8, Activations::Int8)
+        .expect("int8 activation model loads");
+    let expected = int8.logits(&ids);
+    let actual = quantized.logits(&ids);
+    assert_eq!(actual.len(), expected.len());
+
+    let max_diff = actual
+        .iter()
+        .zip(&expected)
+        .map(|(a, e)| (a - e).abs())
+        .fold(0.0f32, f32::max);
+    // The measured maximum for this prompt is 0.34; 0.5 leaves room for a
+    // different toolchain's rounding.
+    assert!(max_diff < 0.5, "logits differ by {max_diff}");
+    assert_eq!(argmax(&actual), argmax(&expected));
 }

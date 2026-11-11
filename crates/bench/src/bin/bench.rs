@@ -12,7 +12,7 @@ use gpt2_bench::types::{
     PromptsFile, Run, Session,
 };
 use gpt2_bench::verify::{verdict, PromptCheck};
-use gpt2_engine::{write_int8, Model, Tokenizer, Weights};
+use gpt2_engine::{write_int8, Activations, Model, Tokenizer, Weights};
 use serde::de::DeserializeOwned;
 
 fn main() {
@@ -80,7 +80,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] [--quantized] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>\n  bench perplexity --model-dir <dir> --text <file> --expected-perplexity <file> [--weights f32|int8] [--out <file>]\n  bench quantize --model-dir <dir> --out <file>"
+        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] [--quantized] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>\n  bench perplexity --model-dir <dir> --text <file> --expected-perplexity <file> [--weights f32|int8] [--activations f32|int8] [--activation-group 16|32|64] [--logits-activations f32|int8] [--out <file>]\n  bench quantize --model-dir <dir> --out <file>"
     );
 }
 
@@ -571,6 +571,9 @@ struct PerplexityOptions {
     text: String,
     expected_perplexity: String,
     weights: Weights,
+    activations: Activations,
+    activation_group: usize,
+    logits_activations: Option<Activations>,
     out: String,
 }
 
@@ -580,6 +583,9 @@ impl PerplexityOptions {
         let mut text = None;
         let mut expected_perplexity = None;
         let mut weights = Weights::F32;
+        let mut activations = Activations::F32;
+        let mut activation_group = 64;
+        let mut logits_activations = None;
         let mut out = None;
         let mut index = 0;
         while index < args.len() {
@@ -595,18 +601,45 @@ impl PerplexityOptions {
                     weights = Weights::parse(&value)
                         .ok_or_else(|| format!("--weights must be f32 or int8, got `{value}`"))?;
                 }
+                "--activations" => {
+                    let value = take_value(args, &mut index, "--activations")?;
+                    activations = Activations::parse(&value).ok_or_else(|| {
+                        format!("--activations must be f32 or int8, got `{value}`")
+                    })?;
+                }
+                "--activation-group" => {
+                    activation_group = parse_usize(
+                        take_value(args, &mut index, "--activation-group")?,
+                        "--activation-group",
+                    )?;
+                }
+                "--logits-activations" => {
+                    let value = take_value(args, &mut index, "--logits-activations")?;
+                    logits_activations = Some(Activations::parse(&value).ok_or_else(|| {
+                        format!("--logits-activations must be f32 or int8, got `{value}`")
+                    })?);
+                }
                 "--out" => out = Some(take_value(args, &mut index, "--out")?),
                 other => return Err(format!("unknown option `{other}`")),
             }
             index += 1;
         }
-        let default_out = format!("results/runs/perplexity-{}.json", weights.name());
+        let default_out = match activations {
+            Activations::F32 => format!("results/runs/perplexity-{}.json", weights.name()),
+            Activations::Int8 => format!(
+                "results/runs/perplexity-{}-activations-int8.json",
+                weights.name()
+            ),
+        };
         Ok(PerplexityOptions {
             model_dir: model_dir.ok_or_else(|| "missing --model-dir".to_string())?,
             text: text.ok_or_else(|| "missing --text".to_string())?,
             expected_perplexity: expected_perplexity
                 .ok_or_else(|| "missing --expected-perplexity".to_string())?,
             weights,
+            activations,
+            activation_group,
+            logits_activations,
             out: out.unwrap_or(default_out),
         })
     }
@@ -637,13 +670,24 @@ fn perplexity_command(args: &[String]) -> Result<i32, String> {
         );
     }
 
-    let model = Model::load_with(Path::new(&options.model_dir), options.weights)
-        .map_err(|error| format!("{}: {error}", options.model_dir))?;
+    let mut model = Model::load_with_activations(
+        Path::new(&options.model_dir),
+        options.weights,
+        options.activations,
+    )
+    .map_err(|error| format!("{}: {error}", options.model_dir))?;
+    model
+        .set_activation_group(options.activation_group)
+        .map_err(|error| error.to_string())?;
+    if let Some(logits_activations) = options.logits_activations {
+        model.set_logits_activations(logits_activations);
+    }
     let logprobs = model.next_token_logprobs(&ids);
     let mean_nll = -logprobs.iter().map(|&value| value as f64).sum::<f64>() / logprobs.len() as f64;
     let perplexity = mean_nll.exp();
     let result = PerplexityResult {
         weights: options.weights.name().to_string(),
+        activations: options.activations.name().to_string(),
         tokens: ids.len(),
         perplexity,
         reference_perplexity: reference.perplexity,

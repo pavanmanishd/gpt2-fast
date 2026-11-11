@@ -5,10 +5,11 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::parallel::Threads;
-use crate::quantize::GROUP_SIZE;
+use crate::quantize::{quantize_activations, GROUP_SIZE};
 use crate::safetensors::SafeTensors;
 use crate::simd::{
-    dot, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum, Epilogue,
+    dot, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
+    Epilogue, Int8ActivationKernels,
 };
 use crate::{argmax, Config, Error};
 
@@ -35,26 +36,85 @@ impl Weights {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Activations {
+    #[default]
+    F32,
+    Int8,
+}
+
+impl Activations {
+    pub fn parse(name: &str) -> Option<Activations> {
+        match name {
+            "f32" => Some(Activations::F32),
+            "int8" => Some(Activations::Int8),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Activations::F32 => "f32",
+            Activations::Int8 => "int8",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActivationMode {
+    group: usize,
+    kernels: Int8ActivationKernels,
+}
+
+#[derive(Clone, Copy)]
+struct QuantizedActs<'a> {
+    data: &'a [i8],
+    scale: &'a [f32],
+    group: usize,
+    kernels: Int8ActivationKernels,
+}
+
 enum Matrix {
     F32(Vec<f32>),
     Int8 { data: Vec<i8>, scale: Vec<f32> },
 }
 
 impl Matrix {
-    fn outputs(&self, x: &[f32], n_in: usize, outputs: Range<usize>, y: &mut [f32]) {
+    fn outputs(
+        &self,
+        x: &[f32],
+        n_in: usize,
+        outputs: Range<usize>,
+        y: &mut [f32],
+        acts: Option<QuantizedActs>,
+    ) {
         match self {
             Matrix::F32(data) => linear_outputs(x, data, None, n_in, outputs, y, Epilogue::Store),
-            Matrix::Int8 { data, scale } => int8_linear_outputs(
-                x,
-                data,
-                scale,
-                None,
-                n_in,
-                outputs,
-                y,
-                Epilogue::Store,
-                GROUP_SIZE,
-            ),
+            Matrix::Int8 { data, scale } => match acts {
+                Some(acts) => acts.kernels.linear_outputs(
+                    acts.data,
+                    acts.scale,
+                    data,
+                    scale,
+                    None,
+                    n_in,
+                    acts.group,
+                    outputs,
+                    y,
+                    Epilogue::Store,
+                ),
+                None => int8_linear_outputs(
+                    x,
+                    data,
+                    scale,
+                    None,
+                    n_in,
+                    outputs,
+                    y,
+                    Epilogue::Store,
+                    GROUP_SIZE,
+                ),
+            },
         }
     }
 
@@ -187,6 +247,10 @@ pub struct Model {
     ln_f_weight: Vec<f32>,
     ln_f_bias: Vec<f32>,
     threads: Threads,
+    activations: Activations,
+    activation_group: usize,
+    logits_activations: Activations,
+    int8_activation_kernels: Int8ActivationKernels,
 }
 
 struct Layer {
@@ -237,6 +301,8 @@ struct Workspace {
     qkv: Vec<f32>,
     hidden: Vec<f32>,
     logits: Vec<f32>,
+    activation_data: Vec<i8>,
+    activation_scale: Vec<f32>,
 }
 
 impl Workspace {
@@ -249,6 +315,9 @@ impl Workspace {
             qkv: vec![0.0; n * 3 * n_embd],
             hidden: vec![0.0; n * 4 * n_embd],
             logits: vec![0.0; config.vocab_size],
+            activation_data: vec![0; n * 4 * n_embd],
+            // Enough scales for the smallest activation group this model allows.
+            activation_scale: vec![0.0; n * 4 * n_embd / 16],
         }
     }
 }
@@ -296,9 +365,17 @@ impl Model {
     }
 
     pub fn load_with(model_dir: &Path, weights: Weights) -> Result<Model, Error> {
+        Model::load_with_activations(model_dir, weights, Activations::F32)
+    }
+
+    pub fn load_with_activations(
+        model_dir: &Path,
+        weights: Weights,
+        activations: Activations,
+    ) -> Result<Model, Error> {
         let config = Config::load(model_dir)?;
         let tensors = SafeTensors::open(&model_dir.join("model.safetensors"))?;
-        Model::from_tensors(config, tensors, weights)
+        Model::from_tensors(config, tensors, weights, activations)
     }
 
     pub fn from_bytes(
@@ -306,15 +383,25 @@ impl Model {
         weights_bytes: &[u8],
         weights: Weights,
     ) -> Result<Model, Error> {
+        Model::from_bytes_with_activations(config_json, weights_bytes, weights, Activations::F32)
+    }
+
+    pub fn from_bytes_with_activations(
+        config_json: &str,
+        weights_bytes: &[u8],
+        weights: Weights,
+        activations: Activations,
+    ) -> Result<Model, Error> {
         let config = Config::from_json(config_json)?;
         let tensors = SafeTensors::from_bytes(weights_bytes)?;
-        Model::from_tensors(config, tensors, weights)
+        Model::from_tensors(config, tensors, weights, activations)
     }
 
     fn from_tensors(
         config: Config,
         mut tensors: SafeTensors<'_>,
         weights: Weights,
+        activations: Activations,
     ) -> Result<Model, Error> {
         let n_embd = config.n_embd;
         let n_inner = 4 * n_embd;
@@ -383,6 +470,12 @@ impl Model {
             ln_f_weight,
             ln_f_bias,
             threads: Threads::from_env()?,
+            activations,
+            activation_group: GROUP_SIZE,
+            // Quantizing the scoring projection's activations costs 6.3 perplexity
+            // on the 124M model, so this layer stays on f32 activations.
+            logits_activations: Activations::F32,
+            int8_activation_kernels: Int8ActivationKernels::detect(),
         })
     }
 
@@ -393,6 +486,28 @@ impl Model {
     pub fn set_threads(&mut self, count: usize) -> Result<(), Error> {
         self.threads = Threads::with_count(count)?;
         Ok(())
+    }
+
+    pub fn set_activation_group(&mut self, group: usize) -> Result<(), Error> {
+        if !matches!(group, 16 | 32 | 64) {
+            return Err(Error::new("activation group must be 16, 32 or 64"));
+        }
+        self.activation_group = group;
+        Ok(())
+    }
+
+    pub fn set_logits_activations(&mut self, activations: Activations) {
+        self.logits_activations = activations;
+    }
+
+    fn activation_mode(&self, activations: Activations) -> Option<ActivationMode> {
+        match activations {
+            Activations::F32 => None,
+            Activations::Int8 => Some(ActivationMode {
+                group: self.activation_group,
+                kernels: self.int8_activation_kernels,
+            }),
+        }
     }
 
     pub fn weight_manifest(&self) -> String {
@@ -612,9 +727,31 @@ impl Model {
             hidden,
         );
 
+        let mode = self.activation_mode(self.logits_activations);
+        let acts = match mode {
+            Some(mode) => {
+                let groups = n_embd.div_ceil(mode.group);
+                quantize_activations(
+                    hidden,
+                    1,
+                    n_embd,
+                    mode.group,
+                    &mut workspace.activation_data[..n_embd],
+                    &mut workspace.activation_scale[..groups],
+                );
+                Some(QuantizedActs {
+                    data: &workspace.activation_data[..n_embd],
+                    scale: &workspace.activation_scale[..groups],
+                    group: mode.group,
+                    kernels: mode.kernels,
+                })
+            }
+            None => None,
+        };
+
         let wte = &self.wte;
         self.threads.run(&mut workspace.logits, 1, |start, part| {
-            wte.outputs(hidden, n_embd, start..start + part.len(), part);
+            wte.outputs(hidden, n_embd, start..start + part.len(), part, acts);
         });
         &workspace.logits
     }
@@ -671,12 +808,32 @@ fn linear(
     n_out: usize,
     y: &mut [f32],
     epilogue: Epilogue,
+    mode: Option<ActivationMode>,
+    activation_data: &mut [i8],
+    activation_scale: &mut [f32],
 ) {
     match weight {
         Matrix::F32(weight) => linear_f32(threads, x, weight, bias, rows, n_in, n_out, y, epilogue),
-        Matrix::Int8 { data, scale } => linear_int8(
-            threads, x, data, scale, bias, rows, n_in, n_out, y, epilogue,
-        ),
+        Matrix::Int8 { data, scale } => match mode {
+            Some(mode) => linear_int8_activations(
+                threads,
+                x,
+                data,
+                scale,
+                bias,
+                rows,
+                n_in,
+                n_out,
+                y,
+                epilogue,
+                mode,
+                activation_data,
+                activation_scale,
+            ),
+            None => linear_int8(
+                threads, x, data, scale, bias, rows, n_in, n_out, y, epilogue,
+            ),
+        },
     }
 }
 
@@ -769,6 +926,74 @@ fn linear_int8(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn linear_int8_activations(
+    threads: &Threads,
+    x: &[f32],
+    weight: &[i8],
+    scale: &[f32],
+    bias: &[f32],
+    rows: usize,
+    n_in: usize,
+    n_out: usize,
+    y: &mut [f32],
+    epilogue: Epilogue,
+    mode: ActivationMode,
+    activation_data: &mut [i8],
+    activation_scale: &mut [f32],
+) {
+    let groups = n_in.div_ceil(mode.group);
+    quantize_activations(
+        &x[..rows * n_in],
+        rows,
+        n_in,
+        mode.group,
+        &mut activation_data[..rows * n_in],
+        &mut activation_scale[..rows * groups],
+    );
+    let acts = QuantizedActs {
+        data: &activation_data[..rows * n_in],
+        scale: &activation_scale[..rows * groups],
+        group: mode.group,
+        kernels: mode.kernels,
+    };
+
+    if rows == 1 {
+        threads.run(y, 1, |start, part| {
+            acts.kernels.linear_outputs(
+                acts.data,
+                acts.scale,
+                weight,
+                scale,
+                Some(&bias[start..start + part.len()]),
+                n_in,
+                acts.group,
+                start..start + part.len(),
+                part,
+                epilogue,
+            );
+        });
+    } else {
+        threads.run(y, n_out, |start, part| {
+            let first = start / n_out;
+            let count = part.len() / n_out;
+            acts.kernels.linear_rows(
+                &acts.data[first * n_in..(first + count) * n_in],
+                &acts.scale[first * groups..(first + count) * groups],
+                weight,
+                scale,
+                bias,
+                count,
+                n_in,
+                n_out,
+                acts.group,
+                part,
+                epilogue,
+            );
+        });
+    }
+}
+
 impl Layer {
     fn forward(
         &self,
@@ -783,12 +1008,15 @@ impl Layer {
         let threads = &model.threads;
         let n_embd = config.n_embd;
         let eps = config.layer_norm_epsilon;
+        let mode = model.activation_mode(model.activations);
         let Workspace {
             x,
             projected,
             normed,
             qkv,
             hidden,
+            activation_data,
+            activation_scale,
             ..
         } = workspace;
         let projection: &mut [f32] = &mut projected[..n * n_embd];
@@ -814,6 +1042,9 @@ impl Layer {
             3 * n_embd,
             &mut qkv[..n * 3 * n_embd],
             Epilogue::Store,
+            mode,
+            activation_data,
+            activation_scale,
         );
         cache.store(index, start, &qkv[..n * 3 * n_embd], n, n_embd);
         attention(
@@ -836,6 +1067,9 @@ impl Layer {
             n_embd,
             projection,
             Epilogue::Store,
+            mode,
+            activation_data,
+            activation_scale,
         );
         add_in_place(&mut x[..n * n_embd], &projection[..n * n_embd]);
 
@@ -860,6 +1094,9 @@ impl Layer {
             4 * n_embd,
             &mut hidden[..n * 4 * n_embd],
             Epilogue::Gelu,
+            mode,
+            activation_data,
+            activation_scale,
         );
         linear(
             threads,
@@ -871,6 +1108,9 @@ impl Layer {
             n_embd,
             projection,
             Epilogue::Store,
+            mode,
+            activation_data,
+            activation_scale,
         );
         add_in_place(&mut x[..n * n_embd], &projection[..n * n_embd]);
     }
@@ -1057,6 +1297,9 @@ mod tests {
                         n_out,
                         &mut actual,
                         epilogue,
+                        None,
+                        &mut [],
+                        &mut [],
                     );
                     let mut expected = vec![0.0; rows * n_out];
                     linear(
@@ -1069,6 +1312,9 @@ mod tests {
                         n_out,
                         &mut expected,
                         epilogue,
+                        None,
+                        &mut [],
+                        &mut [],
                     );
                     assert_eq!(actual.len(), expected.len());
                     for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {

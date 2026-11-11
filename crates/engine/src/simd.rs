@@ -9,6 +9,571 @@ fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + (coefficient * (x + 0.044715 * x * x * x)).tanh())
 }
 
+#[inline]
+fn finish(sum: f32, bias: Option<f32>, with_gelu: bool) -> f32 {
+    let value = sum + bias.unwrap_or(0.0);
+    if with_gelu {
+        gelu(value)
+    } else {
+        value
+    }
+}
+
+// The integer dot product is exact; its conversion to f32 and the two multiplies
+// and add happen in this order so the scalar and dot-product kernels produce the
+// same bits.
+#[inline]
+pub(crate) fn add_scaled_dot(
+    total: f32,
+    dot: i32,
+    weight_scale: f32,
+    activation_scale: f32,
+) -> f32 {
+    let combined = weight_scale * activation_scale;
+    total + dot as f32 * combined
+}
+
+mod int8_activations {
+    use std::ops::Range;
+
+    use super::{add_scaled_dot, finish, Epilogue};
+    use crate::quantize::GROUP_SIZE;
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_outputs(
+        activations: &[i8],
+        activation_scale: &[f32],
+        weight: &[i8],
+        weight_scale: &[f32],
+        bias: Option<&[f32]>,
+        n_in: usize,
+        group: usize,
+        outputs: Range<usize>,
+        y: &mut [f32],
+        epilogue: Epilogue,
+    ) {
+        let weight_groups = n_in.div_ceil(GROUP_SIZE);
+        let activation_groups = n_in.div_ceil(group);
+        assert!(activations.len() >= n_in, "activation row is too short");
+        assert!(activation_scale.len() >= activation_groups);
+        assert!(weight.len() >= outputs.end * n_in, "weights are too short");
+        assert!(weight_scale.len() >= outputs.end * weight_groups);
+        assert!(y.len() >= outputs.len(), "output is too short");
+
+        let with_gelu = matches!(epilogue, Epilogue::Gelu);
+        for (offset, row) in outputs.enumerate() {
+            let sum = row_value(
+                activations,
+                activation_scale,
+                &weight[row * n_in..(row + 1) * n_in],
+                &weight_scale[row * weight_groups..(row + 1) * weight_groups],
+                n_in,
+                group,
+            );
+            y[offset] = finish(sum, bias.map(|bias| bias[offset]), with_gelu);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_rows(
+        activations: &[i8],
+        activation_scale: &[f32],
+        weight: &[i8],
+        weight_scale: &[f32],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        group: usize,
+        y: &mut [f32],
+        epilogue: Epilogue,
+    ) {
+        let weight_groups = n_in.div_ceil(GROUP_SIZE);
+        let activation_groups = n_in.div_ceil(group);
+        assert!(activations.len() >= rows * n_in);
+        assert!(activation_scale.len() >= rows * activation_groups);
+        assert!(weight.len() >= n_out * n_in, "weights are too short");
+        assert!(weight_scale.len() >= n_out * weight_groups);
+        assert!(bias.len() >= n_out);
+        assert!(y.len() >= rows * n_out, "output is too short");
+
+        let with_gelu = matches!(epilogue, Epilogue::Gelu);
+        for row in 0..rows {
+            let activation_row = &activations[row * n_in..(row + 1) * n_in];
+            let scale_row =
+                &activation_scale[row * activation_groups..(row + 1) * activation_groups];
+            for output in 0..n_out {
+                let sum = row_value(
+                    activation_row,
+                    scale_row,
+                    &weight[output * n_in..(output + 1) * n_in],
+                    &weight_scale[output * weight_groups..(output + 1) * weight_groups],
+                    n_in,
+                    group,
+                );
+                y[row * n_out + output] = finish(sum, Some(bias[output]), with_gelu);
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn row_value(
+        activations: &[i8],
+        activation_scale: &[f32],
+        weight: &[i8],
+        weight_scale: &[f32],
+        n_in: usize,
+        group: usize,
+    ) -> f32 {
+        let weight_groups = n_in.div_ceil(GROUP_SIZE);
+        debug_assert!(activations.len() >= n_in);
+        debug_assert!(activation_scale.len() >= n_in.div_ceil(group));
+        debug_assert!(weight.len() >= n_in);
+        debug_assert!(weight_scale.len() >= weight_groups);
+
+        let mut total = 0.0f32;
+        for weight_group in 0..weight_groups {
+            let start = weight_group * GROUP_SIZE;
+            let end = (start + GROUP_SIZE).min(n_in);
+            let weight_scale = weight_scale[weight_group];
+            let first = start / group;
+            let last = (end - 1) / group;
+            for (activation_group, &activation_scale) in activation_scale
+                .iter()
+                .enumerate()
+                .take(last + 1)
+                .skip(first)
+            {
+                let group_start = activation_group * group;
+                let group_end = (group_start + group).min(n_in);
+                let mut dot = 0i32;
+                for p in group_start..group_end {
+                    dot += activations[p] as i32 * weight[p] as i32;
+                }
+                total = add_scaled_dot(total, dot, weight_scale, activation_scale);
+            }
+        }
+        total
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod int8_activations_neon {
+    use std::arch::aarch64::*;
+
+    use super::{add_scaled_dot, finish};
+    use crate::quantize::GROUP_SIZE;
+
+    const DECODE_ROWS: usize = 4;
+    const PREFILL_TOKENS: usize = 4;
+    const PREFILL_OUTPUTS: usize = 4;
+    const PREFILL_OUTPUT_BLOCK: usize = 16;
+
+    // SAFETY: the slices cover `n_in` inputs, the selected output rows' weights and
+    // scales, and the outputs; the CPU has the dot-product extension.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,dotprod")]
+    pub(super) unsafe fn linear_outputs(
+        activations: &[i8],
+        activation_scale: &[f32],
+        weight: &[i8],
+        weight_scale: &[f32],
+        bias: Option<&[f32]>,
+        n_in: usize,
+        group: usize,
+        first: usize,
+        end: usize,
+        with_gelu: bool,
+        y: &mut [f32],
+    ) {
+        let activations = activations.as_ptr();
+        let weight = weight.as_ptr();
+        let weight_scale = weight_scale.as_ptr();
+        let activation_scale = activation_scale.as_ptr();
+        let weight_groups = n_in.div_ceil(GROUP_SIZE);
+
+        let mut row = first;
+        while row + DECODE_ROWS <= end {
+            let mut total = [0.0f32; DECODE_ROWS];
+            for weight_group in 0..weight_groups {
+                let start = weight_group * GROUP_SIZE;
+                let weight_end = (start + GROUP_SIZE).min(n_in);
+                let mut scales = [0.0f32; DECODE_ROWS];
+                for (r, scale) in scales.iter_mut().enumerate() {
+                    *scale = *weight_scale.add((row + r) * weight_groups + weight_group);
+                }
+                for activation_group in start / group..=(weight_end - 1) / group {
+                    let group_start = activation_group * group;
+                    let group_end = (group_start + group).min(n_in);
+                    let mut acc = [vdupq_n_s32(0); DECODE_ROWS];
+                    let mut p = group_start;
+                    while p + 16 <= group_end {
+                        let input = vld1q_s8(activations.add(p));
+                        for (r, acc_r) in acc.iter_mut().enumerate() {
+                            *acc_r = vdotq_s32(
+                                *acc_r,
+                                input,
+                                vld1q_s8(weight.add((row + r) * n_in + p)),
+                            );
+                        }
+                        p += 16;
+                    }
+                    let scale = *activation_scale.add(activation_group);
+                    for (r, accumulated) in acc.iter().enumerate() {
+                        let mut dot = vaddvq_s32(*accumulated);
+                        let mut q = p;
+                        while q < group_end {
+                            dot += *activations.add(q) as i32
+                                * *weight.add((row + r) * n_in + q) as i32;
+                            q += 1;
+                        }
+                        total[r] = add_scaled_dot(total[r], dot, scales[r], scale);
+                    }
+                }
+            }
+            for (r, value) in total.iter().enumerate() {
+                *y.get_unchecked_mut(row + r - first) = finish(
+                    *value,
+                    bias.map(|bias| *bias.get_unchecked(row + r - first)),
+                    with_gelu,
+                );
+            }
+            row += DECODE_ROWS;
+        }
+        while row < end {
+            let mut total = 0.0f32;
+            for weight_group in 0..weight_groups {
+                let start = weight_group * GROUP_SIZE;
+                let weight_end = (start + GROUP_SIZE).min(n_in);
+                let scale = *weight_scale.add(row * weight_groups + weight_group);
+                for activation_group in start / group..=(weight_end - 1) / group {
+                    let group_start = activation_group * group;
+                    let group_end = (group_start + group).min(n_in);
+                    let mut acc = vdupq_n_s32(0);
+                    let mut p = group_start;
+                    while p + 16 <= group_end {
+                        acc = vdotq_s32(
+                            acc,
+                            vld1q_s8(activations.add(p)),
+                            vld1q_s8(weight.add(row * n_in + p)),
+                        );
+                        p += 16;
+                    }
+                    let mut dot = vaddvq_s32(acc);
+                    let mut q = p;
+                    while q < group_end {
+                        dot += *activations.add(q) as i32 * *weight.add(row * n_in + q) as i32;
+                        q += 1;
+                    }
+                    total =
+                        add_scaled_dot(total, dot, scale, *activation_scale.add(activation_group));
+                }
+            }
+            *y.get_unchecked_mut(row - first) = finish(
+                total,
+                bias.map(|bias| *bias.get_unchecked(row - first)),
+                with_gelu,
+            );
+            row += 1;
+        }
+    }
+
+    // SAFETY: the slices cover `rows * n_in` activations, `n_out * n_in` weights,
+    // `n_out` biases, and `rows * n_out` outputs; `i + 4 <= rows` and `j + 4 <= n_out`.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn dotprod_tile4x4(
+        activations: &[i8],
+        activation_scale: &[f32],
+        weight: &[i8],
+        weight_scale: &[f32],
+        bias: &[f32],
+        n_in: usize,
+        n_out: usize,
+        group: usize,
+        i: usize,
+        j: usize,
+        with_gelu: bool,
+        y: &mut [f32],
+    ) {
+        let activations = activations.as_ptr();
+        let weight = weight.as_ptr();
+        let weight_groups = n_in.div_ceil(GROUP_SIZE);
+        let activation_groups = n_in.div_ceil(group);
+        let mut total = [[0.0f32; PREFILL_OUTPUTS]; PREFILL_TOKENS];
+
+        for weight_group in 0..weight_groups {
+            let start = weight_group * GROUP_SIZE;
+            let weight_end = (start + GROUP_SIZE).min(n_in);
+            let mut scales = [0.0f32; PREFILL_OUTPUTS];
+            for (c, scale) in scales.iter_mut().enumerate() {
+                *scale = weight_scale[(j + c) * weight_groups + weight_group];
+            }
+            for activation_group in start / group..=(weight_end - 1) / group {
+                let group_start = activation_group * group;
+                let group_end = (group_start + group).min(n_in);
+                let mut acc = [[vdupq_n_s32(0); PREFILL_OUTPUTS]; PREFILL_TOKENS];
+                let mut p = group_start;
+                while p + 16 <= group_end {
+                    let mut input = [vdupq_n_s8(0); PREFILL_TOKENS];
+                    for (r, value) in input.iter_mut().enumerate() {
+                        *value = vld1q_s8(activations.add((i + r) * n_in + p));
+                    }
+                    for c in 0..PREFILL_OUTPUTS {
+                        let weights = vld1q_s8(weight.add((j + c) * n_in + p));
+                        for (r, input_r) in input.iter().enumerate() {
+                            acc[r][c] = vdotq_s32(acc[r][c], weights, *input_r);
+                        }
+                    }
+                    p += 16;
+                }
+                for (r, acc_r) in acc.iter().enumerate() {
+                    let scale_row = activation_scale
+                        .as_ptr()
+                        .add((i + r) * activation_groups + activation_group);
+                    for (c, accumulated) in acc_r.iter().enumerate() {
+                        let mut dot = vaddvq_s32(*accumulated);
+                        let mut q = p;
+                        while q < group_end {
+                            dot += *activations.add((i + r) * n_in + q) as i32
+                                * *weight.add((j + c) * n_in + q) as i32;
+                            q += 1;
+                        }
+                        total[r][c] = add_scaled_dot(total[r][c], dot, scales[c], *scale_row);
+                    }
+                }
+            }
+        }
+
+        for (r, total_r) in total.iter().enumerate() {
+            for (c, value) in total_r.iter().enumerate() {
+                *y.get_unchecked_mut((i + r) * n_out + j + c) =
+                    finish(*value, Some(*bias.get_unchecked(j + c)), with_gelu);
+            }
+        }
+    }
+
+    // SAFETY: the slices cover `rows * n_in` activations, `n_out * n_in` weights,
+    // `n_out` biases, and `rows * n_out` outputs.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,dotprod")]
+    pub(super) unsafe fn linear_rows_dotprod(
+        activations: &[i8],
+        activation_scale: &[f32],
+        weight: &[i8],
+        weight_scale: &[f32],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        group: usize,
+        with_gelu: bool,
+        y: &mut [f32],
+    ) {
+        let weight_groups = n_in.div_ceil(GROUP_SIZE);
+        let activation_groups = n_in.div_ceil(group);
+        let mut block = 0;
+        while block < n_out {
+            let end = (block + PREFILL_OUTPUT_BLOCK).min(n_out);
+            let mut i = 0;
+            while i + PREFILL_TOKENS <= rows {
+                let mut j = block;
+                while j + PREFILL_OUTPUTS <= end {
+                    dotprod_tile4x4(
+                        activations,
+                        activation_scale,
+                        weight,
+                        weight_scale,
+                        bias,
+                        n_in,
+                        n_out,
+                        group,
+                        i,
+                        j,
+                        with_gelu,
+                        y,
+                    );
+                    j += PREFILL_OUTPUTS;
+                }
+                while j < end {
+                    for r in 0..PREFILL_TOKENS {
+                        let sum = super::int8_activations::row_value(
+                            &activations[(i + r) * n_in..(i + r + 1) * n_in],
+                            &activation_scale
+                                [(i + r) * activation_groups..(i + r + 1) * activation_groups],
+                            &weight[j * n_in..(j + 1) * n_in],
+                            &weight_scale[j * weight_groups..(j + 1) * weight_groups],
+                            n_in,
+                            group,
+                        );
+                        y[(i + r) * n_out + j] = finish(sum, Some(bias[j]), with_gelu);
+                    }
+                    j += 1;
+                }
+                i += PREFILL_TOKENS;
+            }
+            while i < rows {
+                for j in block..end {
+                    let sum = super::int8_activations::row_value(
+                        &activations[i * n_in..(i + 1) * n_in],
+                        &activation_scale[i * activation_groups..(i + 1) * activation_groups],
+                        &weight[j * n_in..(j + 1) * n_in],
+                        &weight_scale[j * weight_groups..(j + 1) * weight_groups],
+                        n_in,
+                        group,
+                    );
+                    y[i * n_out + j] = finish(sum, Some(bias[j]), with_gelu);
+                }
+                i += 1;
+            }
+            block = end;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Int8ActivationKernels {
+    Scalar,
+    #[cfg(target_arch = "aarch64")]
+    DotProduct,
+}
+
+impl Int8ActivationKernels {
+    pub(crate) fn detect() -> Int8ActivationKernels {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                return Int8ActivationKernels::DotProduct;
+            }
+        }
+        Int8ActivationKernels::Scalar
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_outputs(
+        self,
+        activations: &[i8],
+        activation_scale: &[f32],
+        weight: &[i8],
+        weight_scale: &[f32],
+        bias: Option<&[f32]>,
+        n_in: usize,
+        group: usize,
+        outputs: std::ops::Range<usize>,
+        y: &mut [f32],
+        epilogue: Epilogue,
+    ) {
+        let weight_groups = n_in.div_ceil(crate::quantize::GROUP_SIZE);
+        assert!(activations.len() >= n_in, "activation row is too short");
+        assert!(activation_scale.len() >= n_in.div_ceil(group));
+        assert!(weight.len() >= outputs.end * n_in, "weights are too short");
+        assert!(weight_scale.len() >= outputs.end * weight_groups);
+        assert!(y.len() >= outputs.len(), "output is too short");
+
+        #[cfg(target_arch = "aarch64")]
+        match self {
+            Int8ActivationKernels::DotProduct => {
+                // SAFETY: the lengths are checked above and detection confirmed the
+                // dot-product extension.
+                unsafe {
+                    int8_activations_neon::linear_outputs(
+                        activations,
+                        activation_scale,
+                        weight,
+                        weight_scale,
+                        bias,
+                        n_in,
+                        group,
+                        outputs.start,
+                        outputs.end,
+                        matches!(epilogue, Epilogue::Gelu),
+                        y,
+                    );
+                }
+                return;
+            }
+            Int8ActivationKernels::Scalar => {}
+        }
+        int8_activations::linear_outputs(
+            activations,
+            activation_scale,
+            weight,
+            weight_scale,
+            bias,
+            n_in,
+            group,
+            outputs,
+            y,
+            epilogue,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_rows(
+        self,
+        activations: &[i8],
+        activation_scale: &[f32],
+        weight: &[i8],
+        weight_scale: &[f32],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        group: usize,
+        y: &mut [f32],
+        epilogue: Epilogue,
+    ) {
+        let weight_groups = n_in.div_ceil(crate::quantize::GROUP_SIZE);
+        assert!(activations.len() >= rows * n_in);
+        assert!(activation_scale.len() >= rows * n_in.div_ceil(group));
+        assert!(weight.len() >= n_out * n_in, "weights are too short");
+        assert!(weight_scale.len() >= n_out * weight_groups);
+        assert!(bias.len() >= n_out);
+        assert!(y.len() >= rows * n_out, "output is too short");
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let with_gelu = matches!(epilogue, Epilogue::Gelu);
+            match self {
+                Int8ActivationKernels::DotProduct => {
+                    // SAFETY: the lengths are checked above and detection confirmed
+                    // the dot-product extension.
+                    unsafe {
+                        int8_activations_neon::linear_rows_dotprod(
+                            activations,
+                            activation_scale,
+                            weight,
+                            weight_scale,
+                            bias,
+                            rows,
+                            n_in,
+                            n_out,
+                            group,
+                            with_gelu,
+                            y,
+                        );
+                    }
+                    return;
+                }
+                Int8ActivationKernels::Scalar => {}
+            }
+        }
+        int8_activations::linear_rows(
+            activations,
+            activation_scale,
+            weight,
+            weight_scale,
+            bias,
+            rows,
+            n_in,
+            n_out,
+            group,
+            y,
+            epilogue,
+        );
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use std::arch::aarch64::*;
@@ -1412,8 +1977,8 @@ pub(crate) use scalar::int8_dot;
 #[cfg(test)]
 mod tests {
     use super::{
-        dot, int8_dot, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows,
-        weighted_sum, Epilogue,
+        dot, int8_activations, int8_dot, int8_linear_outputs, int8_linear_rows, linear_outputs,
+        linear_rows, weighted_sum, Epilogue, Int8ActivationKernels,
     };
 
     fn linear(
@@ -1695,6 +2260,382 @@ mod tests {
                 (actual - expected).abs() <= 1e-4 * expected.abs().max(1.0),
                 "n {n}, group {group}: expected {expected}, got {actual}"
             );
+        }
+    }
+
+    struct ActivationCase {
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        group: usize,
+    }
+
+    struct ActivationFixture {
+        activations: Vec<i8>,
+        activation_scale: Vec<f32>,
+        weight: Vec<i8>,
+        weight_scale: Vec<f32>,
+        bias: Vec<f32>,
+    }
+
+    fn activation_data(case: &ActivationCase) -> ActivationFixture {
+        let ActivationCase {
+            rows,
+            n_in,
+            n_out,
+            group,
+        } = *case;
+        let activations = (0..rows * n_in)
+            .map(|i| ((i * 37 + 11) % 255) as i32 - 127)
+            .map(|value| value as i8)
+            .collect();
+        let activation_groups = n_in.div_ceil(group);
+        let activation_scale = (0..rows * activation_groups)
+            .map(|i| (i % 9 + 1) as f32 / 200.0)
+            .collect();
+        let weight = (0..n_out * n_in)
+            .map(|i| ((i * 53 + 7) % 255) as i32 - 127)
+            .map(|value| value as i8)
+            .collect();
+        let weight_groups = n_in.div_ceil(crate::quantize::GROUP_SIZE);
+        let weight_scale = (0..n_out * weight_groups)
+            .map(|i| (i % 11 + 1) as f32 / 300.0)
+            .collect();
+        let bias = (0..n_out).map(|i| i as f32 / 17.0 - 1.0).collect();
+        ActivationFixture {
+            activations,
+            activation_scale,
+            weight,
+            weight_scale,
+            bias,
+        }
+    }
+
+    #[test]
+    fn int8_activation_kernels_match_the_scalar_order_bit_for_bit() {
+        let kernels = Int8ActivationKernels::detect();
+        for case in [
+            ActivationCase {
+                rows: 1,
+                n_in: 1,
+                n_out: 1,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 7,
+                n_out: 3,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 15,
+                n_out: 5,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 16,
+                n_out: 4,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 17,
+                n_out: 9,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 31,
+                n_out: 7,
+                group: 32,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 64,
+                n_out: 8,
+                group: 64,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 65,
+                n_out: 9,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 2,
+                n_in: 37,
+                n_out: 5,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 3,
+                n_in: 64,
+                n_out: 6,
+                group: 32,
+            },
+            ActivationCase {
+                rows: 4,
+                n_in: 96,
+                n_out: 7,
+                group: 64,
+            },
+            ActivationCase {
+                rows: 5,
+                n_in: 130,
+                n_out: 11,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 7,
+                n_in: 64,
+                n_out: 17,
+                group: 64,
+            },
+            ActivationCase {
+                rows: 6,
+                n_in: 33,
+                n_out: 19,
+                group: 32,
+            },
+        ] {
+            let ActivationFixture {
+                activations,
+                activation_scale,
+                weight,
+                weight_scale,
+                bias,
+            } = activation_data(&case);
+            let (rows, n_in, n_out, group) = (case.rows, case.n_in, case.n_out, case.group);
+
+            for epilogue in [Epilogue::Store, Epilogue::Gelu] {
+                if rows == 1 {
+                    let mut expected = vec![0.0f32; n_out];
+                    int8_activations::linear_outputs(
+                        &activations,
+                        &activation_scale,
+                        &weight,
+                        &weight_scale,
+                        Some(&bias),
+                        n_in,
+                        group,
+                        0..n_out,
+                        &mut expected,
+                        epilogue,
+                    );
+                    let mut actual = vec![0.0f32; n_out];
+                    kernels.linear_outputs(
+                        &activations,
+                        &activation_scale,
+                        &weight,
+                        &weight_scale,
+                        Some(&bias),
+                        n_in,
+                        group,
+                        0..n_out,
+                        &mut actual,
+                        epilogue,
+                    );
+                    for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            e.to_bits(),
+                            "rows {rows}, in {n_in}, out {n_out}, group {group}, element {index}"
+                        );
+                    }
+                }
+
+                let mut expected = vec![0.0f32; rows * n_out];
+                int8_activations::linear_rows(
+                    &activations,
+                    &activation_scale,
+                    &weight,
+                    &weight_scale,
+                    &bias,
+                    rows,
+                    n_in,
+                    n_out,
+                    group,
+                    &mut expected,
+                    epilogue,
+                );
+                let mut actual = vec![0.0f32; rows * n_out];
+                kernels.linear_rows(
+                    &activations,
+                    &activation_scale,
+                    &weight,
+                    &weight_scale,
+                    &bias,
+                    rows,
+                    n_in,
+                    n_out,
+                    group,
+                    &mut actual,
+                    epilogue,
+                );
+                for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        e.to_bits(),
+                        "rows {rows}, in {n_in}, out {n_out}, group {group}, element {index}"
+                    );
+                }
+
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let with_gelu = matches!(epilogue, Epilogue::Gelu);
+                    if std::arch::is_aarch64_feature_detected!("dotprod") {
+                        let mut dotprod = vec![0.0f32; rows * n_out];
+                        // SAFETY: the case sizes match the slices and the CPU has
+                        // the dot-product extension.
+                        unsafe {
+                            super::int8_activations_neon::linear_rows_dotprod(
+                                &activations,
+                                &activation_scale,
+                                &weight,
+                                &weight_scale,
+                                &bias,
+                                rows,
+                                n_in,
+                                n_out,
+                                group,
+                                with_gelu,
+                                &mut dotprod,
+                            );
+                        }
+                        for (index, (a, e)) in dotprod.iter().zip(&expected).enumerate() {
+                            assert_eq!(
+                                a.to_bits(),
+                                e.to_bits(),
+                                "dotprod rows {rows}, in {n_in}, out {n_out}, group {group}, element {index}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn int8_activation_kernel_weight_bandwidth() {
+        use std::time::{Duration, Instant};
+
+        use crate::parallel::Threads;
+
+        let kernels = Int8ActivationKernels::detect();
+        let measure = |n_in: usize, n_out: usize, rows: usize, count: usize, new: bool| {
+            let threads = Threads::with_count(count).expect("thread pool");
+            let groups = n_in.div_ceil(64);
+            let activations: Vec<f32> = (0..rows * n_in)
+                .map(|i| ((i * 29 + 3) % 71) as f32 / 71.0 - 0.5)
+                .collect();
+            let quantized: Vec<i8> = activations
+                .iter()
+                .map(|value| (value * 127.0) as i8)
+                .collect();
+            let activation_scale = vec![0.01f32; rows * groups];
+            let weight: Vec<i8> = (0..n_out * n_in)
+                .map(|i| ((i * 43 + 5) % 255) as i32 - 127)
+                .map(|value| value as i8)
+                .collect();
+            let weight_scale = vec![0.01f32; n_out * groups];
+            let bias: Vec<f32> = (0..n_out).map(|i| i as f32 / 1000.0).collect();
+            let mut y = vec![0.0f32; rows * n_out];
+
+            let mut run = || {
+                if rows == 1 {
+                    threads.run(&mut y, 1, |start, part| {
+                        if new {
+                            kernels.linear_outputs(
+                                &quantized,
+                                &activation_scale,
+                                &weight,
+                                &weight_scale,
+                                Some(&bias[start..start + part.len()]),
+                                n_in,
+                                64,
+                                start..start + part.len(),
+                                part,
+                                Epilogue::Store,
+                            );
+                        } else {
+                            int8_linear_outputs(
+                                &activations,
+                                &weight,
+                                &weight_scale,
+                                Some(&bias[start..start + part.len()]),
+                                n_in,
+                                start..start + part.len(),
+                                part,
+                                Epilogue::Store,
+                                64,
+                            );
+                        }
+                    });
+                } else {
+                    threads.run(&mut y, n_out, |start, part| {
+                        let first = start / n_out;
+                        let count = part.len() / n_out;
+                        let scales = &activation_scale[first * groups..(first + count) * groups];
+                        if new {
+                            kernels.linear_rows(
+                                &quantized[first * n_in..(first + count) * n_in],
+                                scales,
+                                &weight,
+                                &weight_scale,
+                                &bias,
+                                count,
+                                n_in,
+                                n_out,
+                                64,
+                                part,
+                                Epilogue::Store,
+                            );
+                        } else {
+                            int8_linear_rows(
+                                &activations[first * n_in..(first + count) * n_in],
+                                &weight,
+                                &weight_scale,
+                                &bias,
+                                count,
+                                n_in,
+                                n_out,
+                                part,
+                                Epilogue::Store,
+                                64,
+                            );
+                        }
+                    });
+                }
+            };
+
+            run();
+            let iterations = (2_000_000_000 / (n_out * n_in)).max(5);
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    run();
+                }
+                times.push(start.elapsed());
+            }
+            times.sort();
+            let elapsed: Duration = times[2];
+            n_out as f64 * n_in as f64 * iterations as f64 / elapsed.as_secs_f64() / 1e9
+        };
+
+        for (n_in, n_out) in [(768usize, 3072usize), (3072, 768), (768, 50257)] {
+            for rows in [1usize, 16] {
+                for threads in [1usize, 4] {
+                    let old = measure(n_in, n_out, rows, threads, false);
+                    let new = measure(n_in, n_out, rows, threads, true);
+                    println!(
+                        "{n_in}->{n_out} rows {rows} threads {threads}: old {old:.1} GB/s, new {new:.1} GB/s"
+                    );
+                }
+            }
         }
     }
 }

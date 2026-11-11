@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process;
 use std::time::Instant;
 
-use gpt2_engine::{Model, Weights};
+use gpt2_engine::{Activations, Model, Weights};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -19,6 +19,9 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut model_dir = None;
     let mut weights = Weights::F32;
+    let mut activations = Activations::F32;
+    let mut logits_activations = None;
+    let mut activation_group = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--model-dir" => match args.next() {
@@ -32,20 +35,55 @@ fn main() {
                 },
                 None => fail("--weights needs a value"),
             },
+            "--activations" => match args.next() {
+                Some(value) => match Activations::parse(&value) {
+                    Some(parsed) => activations = parsed,
+                    None => fail(&format!("--activations must be f32 or int8, got `{value}`")),
+                },
+                None => fail("--activations needs a value"),
+            },
+            "--logits-activations" => match args.next() {
+                Some(value) => match Activations::parse(&value) {
+                    Some(parsed) => logits_activations = Some(parsed),
+                    None => fail(&format!(
+                        "--logits-activations must be f32 or int8, got `{value}`"
+                    )),
+                },
+                None => fail("--logits-activations needs a value"),
+            },
+            "--activation-group" => match args.next() {
+                Some(value) => match value.parse::<usize>() {
+                    Ok(parsed) => activation_group = Some(parsed),
+                    Err(_) => fail(&format!(
+                        "--activation-group must be an integer, got `{value}`"
+                    )),
+                },
+                None => fail("--activation-group needs a value"),
+            },
             other => fail(&format!("unknown argument `{other}`")),
         }
     }
     let Some(model_dir) = model_dir else {
-        fail("usage: worker --model-dir <dir> [--weights f32|int8]");
+        fail("usage: worker --model-dir <dir> [--weights f32|int8] [--activations f32|int8] [--activation-group 16|32|64] [--logits-activations f32|int8]");
     };
 
     let started = Instant::now();
-    let model = match Model::load_with(Path::new(&model_dir), weights) {
+    let mut model = match Model::load_with_activations(Path::new(&model_dir), weights, activations)
+    {
         Ok(model) => model,
         Err(error) => fail(&format!("failed to load model: {error}")),
     };
+    if let Some(activation_group) = activation_group {
+        if let Err(error) = model.set_activation_group(activation_group) {
+            fail(&error.to_string());
+        }
+    }
+    if let Some(logits_activations) = logits_activations {
+        model.set_logits_activations(logits_activations);
+    }
     let load_ms = started.elapsed().as_secs_f64() * 1000.0;
     eprintln!("weights: {}", weights.name());
+    eprintln!("activations: {}", activations.name());
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
     write_line(&mut out, &json!({"ready": true, "load_ms": load_ms}));

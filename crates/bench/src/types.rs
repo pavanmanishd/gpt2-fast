@@ -84,6 +84,7 @@ pub struct PerplexityReference {
 #[derive(Debug, Serialize)]
 pub struct PerplexityResult {
     pub weights: String,
+    pub activations: String,
     pub tokens: usize,
     pub perplexity: f64,
     pub reference_perplexity: f64,

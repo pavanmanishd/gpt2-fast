@@ -40,9 +40,45 @@ fn round(value: f32, scale: f32) -> i8 {
     (value / scale).round().clamp(-127.0, 127.0) as i8
 }
 
+pub(crate) fn quantize_activations(
+    x: &[f32],
+    rows: usize,
+    n_in: usize,
+    group: usize,
+    values: &mut [i8],
+    scales: &mut [f32],
+) {
+    assert!(group > 0, "activation group must be positive");
+    let groups = n_in.div_ceil(group);
+    assert!(x.len() >= rows * n_in, "activation input is too short");
+    assert!(
+        values.len() >= rows * n_in,
+        "activation output is too short"
+    );
+    assert!(
+        scales.len() >= rows * groups,
+        "activation scales are too short"
+    );
+
+    let mut index = 0;
+    let mut scale_index = 0;
+    for row in x[..rows * n_in].chunks(n_in) {
+        for chunk in row.chunks(group) {
+            let max = chunk.iter().fold(0.0f32, |max, value| max.max(value.abs()));
+            let scale = max / 127.0;
+            scales[scale_index] = scale;
+            scale_index += 1;
+            for &value in chunk {
+                values[index] = round(value, scale);
+                index += 1;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Rows;
+    use super::{quantize_activations, Rows};
 
     fn check_round_trip(
         data: &[i8],
@@ -85,5 +121,58 @@ mod tests {
         check_round_trip(&data, &scale, &values, |index| {
             index / row_len * groups + index % row_len / group
         });
+    }
+
+    #[test]
+    fn activations_round_trip_within_half_a_scale_and_clamp() {
+        for (rows, n_in, group) in [
+            (1usize, 16usize, 16usize),
+            (1, 37, 16),
+            (3, 65, 32),
+            (2, 96, 64),
+        ] {
+            let mut values: Vec<f32> = (0..rows * n_in)
+                .map(|i| ((i * 41 + 13) % 157) as f32 / 23.0 - 3.0)
+                .collect();
+            values[0] = 40.0;
+            if rows > 1 {
+                values[n_in] = 0.0;
+            }
+
+            let groups = n_in.div_ceil(group);
+            let mut data = vec![0i8; rows * n_in];
+            let mut scale = vec![0.0f32; rows * groups];
+            quantize_activations(&values, rows, n_in, group, &mut data, &mut scale);
+
+            assert_eq!(scale.len(), rows * groups);
+            for (index, &value) in values.iter().enumerate() {
+                let row = index / n_in;
+                let column = index % n_in;
+                let group_index = row * groups + column / group;
+                assert!(data[index] >= -127);
+                let restored = data[index] as f32 * scale[group_index];
+                let error = (restored - value).abs();
+                assert!(
+                    error <= scale[group_index] / 2.0 * (1.0 + 1e-6),
+                    "element {index}: value {value}, restored {restored}, scale {}",
+                    scale[group_index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_zero_activation_groups_quantize_to_zero_scale() {
+        let mut values = vec![0.0f32; 48];
+        values[20] = -2.0;
+        let mut data = vec![0i8; values.len()];
+        let mut scale = vec![0.0f32; 3];
+        quantize_activations(&values, 1, values.len(), 16, &mut data, &mut scale);
+
+        assert_eq!(scale[0], 0.0);
+        assert_eq!(scale[2], 0.0);
+        assert!(data[..16].iter().all(|&value| value == 0));
+        assert!(data[32..].iter().all(|&value| value == 0));
+        assert_eq!(data[20], -127);
     }
 }
