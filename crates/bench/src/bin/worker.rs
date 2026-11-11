@@ -21,6 +21,7 @@ fn main() {
     let mut weights = Weights::F32;
     let mut activations = Activations::F32;
     let mut logits_activations = None;
+    let mut logits_outliers = None;
     let mut activation_group = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -51,6 +52,15 @@ fn main() {
                 },
                 None => fail("--logits-activations needs a value"),
             },
+            "--logits-outliers" => match args.next() {
+                Some(value) => match value.parse::<usize>() {
+                    Ok(parsed) => logits_outliers = Some(parsed),
+                    Err(_) => fail(&format!(
+                        "--logits-outliers must be an integer, got `{value}`"
+                    )),
+                },
+                None => fail("--logits-outliers needs a value"),
+            },
             "--activation-group" => match args.next() {
                 Some(value) => match value.parse::<usize>() {
                     Ok(parsed) => activation_group = Some(parsed),
@@ -64,7 +74,7 @@ fn main() {
         }
     }
     let Some(model_dir) = model_dir else {
-        fail("usage: worker --model-dir <dir> [--weights f32|int8] [--activations f32|int8] [--activation-group 16|32|64] [--logits-activations f32|int8]");
+        fail("usage: worker --model-dir <dir> [--weights f32|int8] [--activations f32|int8] [--activation-group 16|32|64] [--logits-activations f32|int8] [--logits-outliers <n>]");
     };
 
     let started = Instant::now();
@@ -80,6 +90,11 @@ fn main() {
     }
     if let Some(logits_activations) = logits_activations {
         model.set_logits_activations(logits_activations);
+    }
+    if let Some(logits_outliers) = logits_outliers {
+        if let Err(error) = model.set_logits_outliers(logits_outliers) {
+            fail(&error.to_string());
+        }
     }
     let load_ms = started.elapsed().as_secs_f64() * 1000.0;
     eprintln!("weights: {}", weights.name());

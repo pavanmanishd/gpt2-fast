@@ -4,6 +4,12 @@ pub(crate) enum Epilogue {
     Gelu,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Outliers<'a> {
+    pub indices: &'a [u32],
+    pub values: &'a [f32],
+}
+
 fn gelu(x: f32) -> f32 {
     let coefficient = (2.0 / std::f32::consts::PI).sqrt();
     0.5 * x * (1.0 + (coefficient * (x + 0.044715 * x * x * x)).tanh())
@@ -33,10 +39,23 @@ pub(crate) fn add_scaled_dot(
     total + dot as f32 * combined
 }
 
+// Removed activations keep their exact value, so they are added back in ascending
+// input order for the scalar and vector kernels to produce the same bits.
+#[inline]
+fn add_outliers(total: f32, outliers: Outliers, weight: &[i8], weight_scale: &[f32]) -> f32 {
+    let mut total = total;
+    for (&index, &value) in outliers.indices.iter().zip(outliers.values) {
+        let index = index as usize;
+        let group = index / crate::quantize::GROUP_SIZE;
+        total += value * (weight_scale[group] * weight[index] as f32);
+    }
+    total
+}
+
 mod int8_activations {
     use std::ops::Range;
 
-    use super::{add_scaled_dot, finish, Epilogue};
+    use super::{add_outliers, add_scaled_dot, finish, Epilogue, Outliers};
     use crate::quantize::GROUP_SIZE;
 
     #[allow(clippy::too_many_arguments)]
@@ -51,6 +70,7 @@ mod int8_activations {
         outputs: Range<usize>,
         y: &mut [f32],
         epilogue: Epilogue,
+        outliers: Option<Outliers>,
     ) {
         let weight_groups = n_in.div_ceil(GROUP_SIZE);
         let activation_groups = n_in.div_ceil(group);
@@ -62,14 +82,19 @@ mod int8_activations {
 
         let with_gelu = matches!(epilogue, Epilogue::Gelu);
         for (offset, row) in outputs.enumerate() {
-            let sum = row_value(
+            let weight_row = &weight[row * n_in..(row + 1) * n_in];
+            let scale_row = &weight_scale[row * weight_groups..(row + 1) * weight_groups];
+            let mut sum = row_value(
                 activations,
                 activation_scale,
-                &weight[row * n_in..(row + 1) * n_in],
-                &weight_scale[row * weight_groups..(row + 1) * weight_groups],
+                weight_row,
+                scale_row,
                 n_in,
                 group,
             );
+            if let Some(outliers) = outliers {
+                sum = add_outliers(sum, outliers, weight_row, scale_row);
+            }
             y[offset] = finish(sum, bias.map(|bias| bias[offset]), with_gelu);
         }
     }
@@ -161,7 +186,7 @@ mod int8_activations {
 mod int8_activations_neon {
     use std::arch::aarch64::*;
 
-    use super::{add_scaled_dot, finish};
+    use super::{add_outliers, add_scaled_dot, finish, Outliers};
     use crate::quantize::GROUP_SIZE;
 
     const DECODE_ROWS: usize = 4;
@@ -185,7 +210,10 @@ mod int8_activations_neon {
         end: usize,
         with_gelu: bool,
         y: &mut [f32],
+        outliers: Option<Outliers>,
     ) {
+        let weights = weight;
+        let weight_scales = weight_scale;
         let activations = activations.as_ptr();
         let weight = weight.as_ptr();
         let weight_scale = weight_scale.as_ptr();
@@ -232,9 +260,19 @@ mod int8_activations_neon {
                 }
             }
             for (r, value) in total.iter().enumerate() {
-                *y.get_unchecked_mut(row + r - first) = finish(
-                    *value,
-                    bias.map(|bias| *bias.get_unchecked(row + r - first)),
+                let output = row + r;
+                let value = match outliers {
+                    Some(outliers) => add_outliers(
+                        *value,
+                        outliers,
+                        &weights[output * n_in..(output + 1) * n_in],
+                        &weight_scales[output * weight_groups..(output + 1) * weight_groups],
+                    ),
+                    None => *value,
+                };
+                *y.get_unchecked_mut(output - first) = finish(
+                    value,
+                    bias.map(|bias| *bias.get_unchecked(output - first)),
                     with_gelu,
                 );
             }
@@ -269,6 +307,15 @@ mod int8_activations_neon {
                         add_scaled_dot(total, dot, scale, *activation_scale.add(activation_group));
                 }
             }
+            let total = match outliers {
+                Some(outliers) => add_outliers(
+                    total,
+                    outliers,
+                    &weights[row * n_in..(row + 1) * n_in],
+                    &weight_scales[row * weight_groups..(row + 1) * weight_groups],
+                ),
+                None => total,
+            };
             *y.get_unchecked_mut(row - first) = finish(
                 total,
                 bias.map(|bias| *bias.get_unchecked(row - first)),
@@ -462,6 +509,7 @@ impl Int8ActivationKernels {
         outputs: std::ops::Range<usize>,
         y: &mut [f32],
         epilogue: Epilogue,
+        outliers: Option<Outliers>,
     ) {
         let weight_groups = n_in.div_ceil(crate::quantize::GROUP_SIZE);
         assert!(activations.len() >= n_in, "activation row is too short");
@@ -488,6 +536,7 @@ impl Int8ActivationKernels {
                         outputs.end,
                         matches!(epilogue, Epilogue::Gelu),
                         y,
+                        outliers,
                     );
                 }
                 return;
@@ -505,6 +554,7 @@ impl Int8ActivationKernels {
             outputs,
             y,
             epilogue,
+            outliers,
         );
     }
 
@@ -1978,7 +2028,7 @@ pub(crate) use scalar::int8_dot;
 mod tests {
     use super::{
         dot, int8_activations, int8_dot, int8_linear_outputs, int8_linear_rows, linear_outputs,
-        linear_rows, weighted_sum, Epilogue, Int8ActivationKernels,
+        linear_rows, weighted_sum, Epilogue, Int8ActivationKernels, Outliers,
     };
 
     fn linear(
@@ -2423,6 +2473,7 @@ mod tests {
                         0..n_out,
                         &mut expected,
                         epilogue,
+                        None,
                     );
                     let mut actual = vec![0.0f32; n_out];
                     kernels.linear_outputs(
@@ -2436,6 +2487,7 @@ mod tests {
                         0..n_out,
                         &mut actual,
                         epilogue,
+                        None,
                     );
                     for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
                         assert_eq!(
@@ -2517,6 +2569,281 @@ mod tests {
         }
     }
 
+    fn outliers(n_in: usize, count: usize) -> (Vec<u32>, Vec<f32>) {
+        assert!(count <= n_in);
+        let indices = (0..count)
+            .map(|i| (i * n_in / count.max(1)) as u32)
+            .collect();
+        let values = (0..count).map(|i| i as f32 * 1.5 - 2.0).collect();
+        (indices, values)
+    }
+
+    #[test]
+    fn int8_activation_outliers_match_the_scalar_order_bit_for_bit() {
+        let kernels = Int8ActivationKernels::detect();
+        for case in [
+            ActivationCase {
+                rows: 1,
+                n_in: 1,
+                n_out: 1,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 17,
+                n_out: 9,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 33,
+                n_out: 7,
+                group: 32,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 64,
+                n_out: 13,
+                group: 64,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 65,
+                n_out: 9,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 130,
+                n_out: 11,
+                group: 32,
+            },
+            ActivationCase {
+                rows: 1,
+                n_in: 769,
+                n_out: 17,
+                group: 64,
+            },
+        ] {
+            let ActivationFixture {
+                activations,
+                activation_scale,
+                weight,
+                weight_scale,
+                bias,
+            } = activation_data(&case);
+            let (n_in, n_out, group) = (case.n_in, case.n_out, case.group);
+            for count in [0usize, 4, 8] {
+                if count > 0 && n_in < 8 {
+                    continue;
+                }
+                let (indices, values) = outliers(n_in, count);
+                let outliers = Some(Outliers {
+                    indices: &indices,
+                    values: &values,
+                });
+                let mut expected = vec![0.0f32; n_out];
+                int8_activations::linear_outputs(
+                    &activations,
+                    &activation_scale,
+                    &weight,
+                    &weight_scale,
+                    Some(&bias),
+                    n_in,
+                    group,
+                    0..n_out,
+                    &mut expected,
+                    Epilogue::Store,
+                    outliers,
+                );
+                let mut actual = vec![0.0f32; n_out];
+                kernels.linear_outputs(
+                    &activations,
+                    &activation_scale,
+                    &weight,
+                    &weight_scale,
+                    Some(&bias),
+                    n_in,
+                    group,
+                    0..n_out,
+                    &mut actual,
+                    Epilogue::Store,
+                    outliers,
+                );
+                for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        e.to_bits(),
+                        "in {n_in}, out {n_out}, group {group}, outliers {count}, element {index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outlier_scheme_matches_the_plain_scheme_when_k_is_zero() {
+        use crate::quantize::{quantize_activation_outliers, quantize_activations};
+
+        let (n_in, n_out, group) = (65usize, 9usize, 32usize);
+        let x: Vec<f32> = (0..n_in)
+            .map(|i| ((i * 37 + 11) % 101) as f32 / 7.0 - 5.0)
+            .collect();
+        let weight: Vec<i8> = (0..n_out * n_in)
+            .map(|i| ((i * 53 + 7) % 255) as i32 - 127)
+            .map(|value| value as i8)
+            .collect();
+        let weight_scale: Vec<f32> = (0..n_out * n_in.div_ceil(64))
+            .map(|i| (i % 11 + 1) as f32 / 300.0)
+            .collect();
+        let bias: Vec<f32> = (0..n_out).map(|i| i as f32 / 17.0 - 1.0).collect();
+        let groups = n_in.div_ceil(group);
+
+        let mut plain_data = vec![0i8; n_in];
+        let mut plain_scale = vec![0.0f32; groups];
+        quantize_activations(&x, 1, n_in, group, &mut plain_data, &mut plain_scale);
+        let mut expected = vec![0.0f32; n_out];
+        Int8ActivationKernels::detect().linear_outputs(
+            &plain_data,
+            &plain_scale,
+            &weight,
+            &weight_scale,
+            Some(&bias),
+            n_in,
+            group,
+            0..n_out,
+            &mut expected,
+            Epilogue::Store,
+            None,
+        );
+
+        let mut data = vec![1i8; n_in];
+        let mut scale = vec![1.0f32; groups];
+        let mut indices = vec![0u32; n_in];
+        let mut removed = vec![0.0f32; n_in];
+        let count = quantize_activation_outliers(
+            &x,
+            group,
+            0,
+            &mut data,
+            &mut scale,
+            &mut indices,
+            &mut removed,
+        );
+        assert_eq!(count, 0);
+        let mut actual = vec![0.0f32; n_out];
+        Int8ActivationKernels::detect().linear_outputs(
+            &data,
+            &scale,
+            &weight,
+            &weight_scale,
+            Some(&bias),
+            n_in,
+            group,
+            0..n_out,
+            &mut actual,
+            Epilogue::Store,
+            Some(Outliers {
+                indices: &indices[..count],
+                values: &removed[..count],
+            }),
+        );
+        for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(a.to_bits(), e.to_bits(), "element {index}");
+        }
+    }
+
+    #[test]
+    fn outlier_correction_adds_the_removed_values_back_exactly() {
+        use crate::quantize::quantize_activation_outliers;
+
+        let (n_in, n_out, group, keep) = (130usize, 7usize, 32usize, 4usize);
+        let x: Vec<f32> = (0..n_in)
+            .map(|i| ((i * 37 + 11) % 101) as f32 / 7.0 - 5.0)
+            .collect();
+        let mut x = x;
+        x[1] = 300.0;
+        x[35] = -400.0;
+        let weight: Vec<i8> = (0..n_out * n_in)
+            .map(|i| ((i * 53 + 7) % 255) as i32 - 127)
+            .map(|value| value as i8)
+            .collect();
+        let weight_scale: Vec<f32> = (0..n_out * n_in.div_ceil(64))
+            .map(|i| (i % 11 + 1) as f32 / 300.0)
+            .collect();
+        let bias: Vec<f32> = (0..n_out).map(|i| i as f32 / 17.0 - 1.0).collect();
+        let groups = n_in.div_ceil(group);
+        let weight_groups = n_in.div_ceil(64);
+
+        let mut data = vec![0i8; n_in];
+        let mut scale = vec![0.0f32; groups];
+        let mut indices = vec![0u32; n_in];
+        let mut removed = vec![0.0f32; n_in];
+        let count = quantize_activation_outliers(
+            &x,
+            group,
+            keep,
+            &mut data,
+            &mut scale,
+            &mut indices,
+            &mut removed,
+        );
+        assert_eq!(count, keep);
+
+        let mut actual = vec![0.0f32; n_out];
+        Int8ActivationKernels::detect().linear_outputs(
+            &data,
+            &scale,
+            &weight,
+            &weight_scale,
+            Some(&bias),
+            n_in,
+            group,
+            0..n_out,
+            &mut actual,
+            Epilogue::Store,
+            Some(Outliers {
+                indices: &indices[..count],
+                values: &removed[..count],
+            }),
+        );
+
+        for output in 0..n_out {
+            let mut expected = 0.0f64;
+            for weight_group in 0..weight_groups {
+                let start = weight_group * 64;
+                let end = (start + 64).min(n_in);
+                let first = start / group;
+                let last = (end - 1) / group;
+                for (activation_group, &activation_scale) in
+                    scale.iter().enumerate().take(last + 1).skip(first)
+                {
+                    let start = activation_group * group;
+                    let end = (start + group).min(n_in);
+                    let dot: i64 = (start..end)
+                        .map(|p| data[p] as i64 * weight[output * n_in + p] as i64)
+                        .sum();
+                    expected += dot as f64
+                        * (weight_scale[output * weight_groups + weight_group] as f64
+                            * activation_scale as f64);
+                }
+            }
+            for (&index, &value) in indices[..count].iter().zip(&removed[..count]) {
+                let index = index as usize;
+                expected += value as f64
+                    * (weight_scale[output * weight_groups + index / 64] as f64
+                        * weight[output * n_in + index] as f64);
+            }
+            expected += bias[output] as f64;
+            let tolerance = 1e-4 * expected.abs().max(1.0);
+            assert!(
+                (actual[output] as f64 - expected).abs() <= tolerance,
+                "output {output}: expected {expected}, got {}",
+                actual[output]
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn int8_activation_kernel_weight_bandwidth() {
@@ -2559,6 +2886,7 @@ mod tests {
                                 start..start + part.len(),
                                 part,
                                 Epilogue::Store,
+                                None,
                             );
                         } else {
                             int8_linear_outputs(

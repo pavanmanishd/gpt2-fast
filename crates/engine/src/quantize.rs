@@ -76,9 +76,95 @@ pub(crate) fn quantize_activations(
     }
 }
 
+// The largest magnitudes are moved out of the vector so one value cannot flatten
+// the resolution of the whole group it sits in; they are added back exactly.
+fn select_outliers(x: &[f32], keep: usize, indices: &mut [u32], removed: &mut [f32]) -> usize {
+    debug_assert!(keep <= indices.len());
+    let mut count = 0;
+    for (index, &value) in x.iter().enumerate() {
+        let magnitude = value.abs();
+        if count < keep {
+            let mut at = count;
+            while at > 0 && removed[at - 1].abs() > magnitude {
+                removed[at] = removed[at - 1];
+                indices[at] = indices[at - 1];
+                at -= 1;
+            }
+            removed[at] = value;
+            indices[at] = index as u32;
+            count += 1;
+        } else if keep > 0 && magnitude > removed[0].abs() {
+            let mut at = 0;
+            while at + 1 < keep && removed[at + 1].abs() < magnitude {
+                removed[at] = removed[at + 1];
+                indices[at] = indices[at + 1];
+                at += 1;
+            }
+            removed[at] = value;
+            indices[at] = index as u32;
+        }
+    }
+    for at in 1..count {
+        let index = indices[at];
+        let value = removed[at];
+        let mut slot = at;
+        while slot > 0 && indices[slot - 1] > index {
+            indices[slot] = indices[slot - 1];
+            removed[slot] = removed[slot - 1];
+            slot -= 1;
+        }
+        indices[slot] = index;
+        removed[slot] = value;
+    }
+    count
+}
+
+pub(crate) fn quantize_activation_outliers(
+    x: &[f32],
+    group: usize,
+    keep: usize,
+    values: &mut [i8],
+    scales: &mut [f32],
+    indices: &mut [u32],
+    removed: &mut [f32],
+) -> usize {
+    assert!(group > 0, "activation group must be positive");
+    assert!(
+        keep <= indices.len() && keep <= removed.len(),
+        "outlier buffer is too short"
+    );
+    assert!(values.len() >= x.len(), "activation output is too short");
+    assert!(
+        scales.len() >= x.len().div_ceil(group),
+        "activation scales are too short"
+    );
+
+    let count = select_outliers(x, keep, indices, removed);
+    for (group_index, chunk) in x.chunks(group).enumerate() {
+        let start = group_index * group;
+        let excluded = &indices[..count];
+        let max = chunk
+            .iter()
+            .enumerate()
+            .filter(|(offset, _)| excluded.binary_search(&((start + offset) as u32)).is_err())
+            .fold(0.0f32, |max, (_, value)| max.max(value.abs()));
+        let scale = max / 127.0;
+        scales[group_index] = scale;
+        for (offset, &value) in chunk.iter().enumerate() {
+            let index = start + offset;
+            values[index] = if excluded.binary_search(&(index as u32)).is_ok() {
+                0
+            } else {
+                round(value, scale)
+            };
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{quantize_activations, Rows};
+    use super::{quantize_activation_outliers, quantize_activations, Rows};
 
     fn check_round_trip(
         data: &[i8],
@@ -97,6 +183,97 @@ mod tests {
                 scale[group]
             );
         }
+    }
+
+    #[test]
+    fn outlier_quantization_without_outliers_matches_plain_activations() {
+        for (len, group) in [(1usize, 16usize), (37, 16), (64, 32), (65, 64), (130, 32)] {
+            let values: Vec<f32> = (0..len)
+                .map(|i| ((i * 41 + 13) % 157) as f32 / 23.0 - 3.0)
+                .collect();
+            let groups = len.div_ceil(group);
+            let mut plain = vec![0i8; len];
+            let mut plain_scale = vec![0.0f32; groups];
+            quantize_activations(&values, 1, len, group, &mut plain, &mut plain_scale);
+
+            let mut data = vec![1i8; len];
+            let mut scale = vec![1.0f32; groups];
+            let mut indices = vec![0u32; len];
+            let mut removed = vec![0.0f32; len];
+            let count = quantize_activation_outliers(
+                &values,
+                group,
+                0,
+                &mut data,
+                &mut scale,
+                &mut indices,
+                &mut removed,
+            );
+
+            assert_eq!(count, 0);
+            for index in 0..len {
+                assert_eq!(data[index], plain[index], "element {index}");
+            }
+            for group_index in 0..groups {
+                assert_eq!(
+                    scale[group_index].to_bits(),
+                    plain_scale[group_index].to_bits(),
+                    "group {group_index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outliers_are_zeroed_and_do_not_set_the_group_scale() {
+        let values = [1.0, 2.0, 500.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let mut data = vec![1i8; values.len()];
+        let mut scale = vec![1.0f32; 3];
+        let mut indices = vec![0u32; 4];
+        let mut removed = vec![0.0f32; 4];
+        let count = quantize_activation_outliers(
+            &values,
+            4,
+            1,
+            &mut data,
+            &mut scale,
+            &mut indices,
+            &mut removed,
+        );
+
+        assert_eq!(count, 1);
+        assert_eq!(&indices[..count], &[2]);
+        assert_eq!(removed[0], 500.0);
+        assert_eq!(data[2], 0);
+        assert_eq!(scale[0], 3.0 / 127.0);
+        assert_eq!(data[0], (1.0f32 / scale[0]).round() as i8);
+        assert_eq!(data[3], 127);
+        assert_eq!(scale[2], 9.0 / 127.0);
+    }
+
+    #[test]
+    fn outlier_selection_takes_the_largest_magnitudes_in_index_order() {
+        let values = [0.5, -9.0, 1.0, 7.0, -2.0, 8.0, 3.0, -6.0];
+        let mut data = vec![0i8; values.len()];
+        let mut scale = vec![0.0f32; 2];
+        let mut indices = vec![0u32; 3];
+        let mut removed = vec![0.0f32; 3];
+        let count = quantize_activation_outliers(
+            &values,
+            4,
+            3,
+            &mut data,
+            &mut scale,
+            &mut indices,
+            &mut removed,
+        );
+
+        assert_eq!(count, 3);
+        assert_eq!(&indices[..count], &[1, 3, 5]);
+        assert_eq!(&removed[..count], &[-9.0, 7.0, 8.0]);
+        assert_eq!(data[1], 0);
+        assert_eq!(data[3], 0);
+        assert_eq!(data[5], 0);
     }
 
     #[test]

@@ -5,11 +5,11 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::parallel::Threads;
-use crate::quantize::{quantize_activations, GROUP_SIZE};
+use crate::quantize::{quantize_activation_outliers, quantize_activations, GROUP_SIZE};
 use crate::safetensors::SafeTensors;
 use crate::simd::{
     dot, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
-    Epilogue, Int8ActivationKernels,
+    Epilogue, Int8ActivationKernels, Outliers,
 };
 use crate::{argmax, Config, Error};
 
@@ -72,6 +72,7 @@ struct QuantizedActs<'a> {
     scale: &'a [f32],
     group: usize,
     kernels: Int8ActivationKernels,
+    outliers: Option<Outliers<'a>>,
 }
 
 enum Matrix {
@@ -102,6 +103,7 @@ impl Matrix {
                     outputs,
                     y,
                     Epilogue::Store,
+                    acts.outliers,
                 ),
                 None => int8_linear_outputs(
                     x,
@@ -250,6 +252,7 @@ pub struct Model {
     activations: Activations,
     activation_group: usize,
     logits_activations: Activations,
+    logits_outliers: usize,
     int8_activation_kernels: Int8ActivationKernels,
 }
 
@@ -303,6 +306,8 @@ struct Workspace {
     logits: Vec<f32>,
     activation_data: Vec<i8>,
     activation_scale: Vec<f32>,
+    outlier_index: Vec<u32>,
+    outlier_value: Vec<f32>,
 }
 
 impl Workspace {
@@ -318,6 +323,8 @@ impl Workspace {
             activation_data: vec![0; n * 4 * n_embd],
             // Enough scales for the smallest activation group this model allows.
             activation_scale: vec![0.0; n * 4 * n_embd / 16],
+            outlier_index: vec![0; n_embd],
+            outlier_value: vec![0.0; n_embd],
         }
     }
 }
@@ -472,9 +479,15 @@ impl Model {
             threads: Threads::from_env()?,
             activations,
             activation_group: GROUP_SIZE,
-            // Quantizing the scoring projection's activations costs 6.3 perplexity
-            // on the 124M model, so this layer stays on f32 activations.
-            logits_activations: Activations::F32,
+            // Without removing the largest inputs, quantizing the scoring layer
+            // costs 6.3 perplexity on the 124M model; the four it removes are the
+            // same dimensions in almost every token and recover all of that.
+            logits_activations: if weights == Weights::Int8 {
+                activations
+            } else {
+                Activations::F32
+            },
+            logits_outliers: 4,
             int8_activation_kernels: Int8ActivationKernels::detect(),
         })
     }
@@ -498,6 +511,14 @@ impl Model {
 
     pub fn set_logits_activations(&mut self, activations: Activations) {
         self.logits_activations = activations;
+    }
+
+    pub fn set_logits_outliers(&mut self, count: usize) -> Result<(), Error> {
+        if count > self.config.n_embd {
+            return Err(Error::new("logits outliers exceed the embedding width"));
+        }
+        self.logits_outliers = count;
+        Ok(())
     }
 
     fn activation_mode(&self, activations: Activations) -> Option<ActivationMode> {
@@ -731,19 +752,24 @@ impl Model {
         let acts = match mode {
             Some(mode) => {
                 let groups = n_embd.div_ceil(mode.group);
-                quantize_activations(
+                let count = quantize_activation_outliers(
                     hidden,
-                    1,
-                    n_embd,
                     mode.group,
+                    self.logits_outliers,
                     &mut workspace.activation_data[..n_embd],
                     &mut workspace.activation_scale[..groups],
+                    &mut workspace.outlier_index[..n_embd],
+                    &mut workspace.outlier_value[..n_embd],
                 );
                 Some(QuantizedActs {
                     data: &workspace.activation_data[..n_embd],
                     scale: &workspace.activation_scale[..groups],
                     group: mode.group,
                     kernels: mode.kernels,
+                    outliers: (count > 0).then(|| Outliers {
+                        indices: &workspace.outlier_index[..count],
+                        values: &workspace.outlier_value[..count],
+                    }),
                 })
             }
             None => None,
@@ -956,6 +982,7 @@ fn linear_int8_activations(
         scale: &activation_scale[..rows * groups],
         group: mode.group,
         kernels: mode.kernels,
+        outliers: None,
     };
 
     if rows == 1 {
@@ -971,6 +998,7 @@ fn linear_int8_activations(
                 start..start + part.len(),
                 part,
                 epilogue,
+                acts.outliers,
             );
         });
     } else {

@@ -80,7 +80,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] [--quantized] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>\n  bench perplexity --model-dir <dir> --text <file> --expected-perplexity <file> [--weights f32|int8] [--activations f32|int8] [--activation-group 16|32|64] [--logits-activations f32|int8] [--out <file>]\n  bench quantize --model-dir <dir> --out <file>"
+        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] [--quantized] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>\n  bench perplexity --model-dir <dir> --text <file> --expected-perplexity <file> [--weights f32|int8] [--activations f32|int8] [--activation-group 16|32|64] [--logits-activations f32|int8] [--logits-outliers <n>] [--out <file>]\n  bench quantize --model-dir <dir> --out <file>"
     );
 }
 
@@ -574,6 +574,7 @@ struct PerplexityOptions {
     activations: Activations,
     activation_group: usize,
     logits_activations: Option<Activations>,
+    logits_outliers: Option<usize>,
     out: String,
 }
 
@@ -586,6 +587,7 @@ impl PerplexityOptions {
         let mut activations = Activations::F32;
         let mut activation_group = 64;
         let mut logits_activations = None;
+        let mut logits_outliers = None;
         let mut out = None;
         let mut index = 0;
         while index < args.len() {
@@ -619,6 +621,12 @@ impl PerplexityOptions {
                         format!("--logits-activations must be f32 or int8, got `{value}`")
                     })?);
                 }
+                "--logits-outliers" => {
+                    logits_outliers = Some(parse_usize(
+                        take_value(args, &mut index, "--logits-outliers")?,
+                        "--logits-outliers",
+                    )?);
+                }
                 "--out" => out = Some(take_value(args, &mut index, "--out")?),
                 other => return Err(format!("unknown option `{other}`")),
             }
@@ -640,6 +648,7 @@ impl PerplexityOptions {
             activations,
             activation_group,
             logits_activations,
+            logits_outliers,
             out: out.unwrap_or(default_out),
         })
     }
@@ -681,6 +690,11 @@ fn perplexity_command(args: &[String]) -> Result<i32, String> {
         .map_err(|error| error.to_string())?;
     if let Some(logits_activations) = options.logits_activations {
         model.set_logits_activations(logits_activations);
+    }
+    if let Some(logits_outliers) = options.logits_outliers {
+        model
+            .set_logits_outliers(logits_outliers)
+            .map_err(|error| error.to_string())?;
     }
     let logprobs = model.next_token_logprobs(&ids);
     let mean_nll = -logprobs.iter().map(|&value| value as f64).sum::<f64>() / logprobs.len() as f64;
