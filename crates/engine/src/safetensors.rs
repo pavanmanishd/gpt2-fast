@@ -201,8 +201,19 @@ impl<'a> SafeTensors<'a> {
         n_in: usize,
         n_out: usize,
     ) -> Result<(Vec<i8>, Vec<f32>), Error> {
+        self.quantize_transposed_group(name, n_in, n_out, GROUP_SIZE)
+    }
+
+    pub(crate) fn quantize_transposed_group(
+        &mut self,
+        name: &str,
+        n_in: usize,
+        n_out: usize,
+        group: usize,
+    ) -> Result<(Vec<i8>, Vec<f32>), Error> {
+        let group = crate::quantize::group_size(group, n_in);
         let values = self.load_matrix_transposed(name, n_in, n_out)?;
-        let mut quantizer = Rows::new(n_out, n_in, GROUP_SIZE);
+        let mut quantizer = Rows::new(n_out, n_in, group);
         for row in values.chunks(n_in) {
             quantizer.push(row);
         }
@@ -215,7 +226,18 @@ impl<'a> SafeTensors<'a> {
         rows: usize,
         cols: usize,
     ) -> Result<(Vec<i8>, Vec<f32>), Error> {
-        let mut quantizer = Rows::new(rows, cols, GROUP_SIZE);
+        self.quantize_rows_group(name, rows, cols, GROUP_SIZE)
+    }
+
+    pub(crate) fn quantize_rows_group(
+        &mut self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        group: usize,
+    ) -> Result<(Vec<i8>, Vec<f32>), Error> {
+        let group = crate::quantize::group_size(group, cols);
+        let mut quantizer = Rows::new(rows, cols, group);
         self.for_each_row(name, rows, cols, |_, values| quantizer.push(values))?;
         Ok(quantizer.into_parts())
     }

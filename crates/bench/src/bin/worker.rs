@@ -26,6 +26,9 @@ fn main() {
     let mut logits_activations = None;
     let mut logits_outliers = None;
     let mut activation_group = None;
+    let mut activation_outliers = None;
+    let mut weight_group = None;
+    let mut logits_activation_group = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--model-dir" => match args.next() {
@@ -65,24 +68,55 @@ fn main() {
                 None => fail("--logits-outliers needs a value"),
             },
             "--activation-group" => match args.next() {
-                Some(value) => match value.parse::<usize>() {
-                    Ok(parsed) => activation_group = Some(parsed),
-                    Err(_) => fail(&format!(
-                        "--activation-group must be an integer, got `{value}`"
+                Some(value) => match group_value(&value) {
+                    Some(parsed) => activation_group = Some(parsed),
+                    None => fail(&format!(
+                        "--activation-group must be a multiple of 8, row or 0, got `{value}`"
                     )),
                 },
                 None => fail("--activation-group needs a value"),
+            },
+            "--activation-outliers" => match args.next() {
+                Some(value) => match value.parse::<usize>() {
+                    Ok(parsed) => activation_outliers = Some(parsed),
+                    Err(_) => fail(&format!(
+                        "--activation-outliers must be an integer, got `{value}`"
+                    )),
+                },
+                None => fail("--activation-outliers needs a value"),
+            },
+            "--weight-group" => match args.next() {
+                Some(value) => match group_value(&value) {
+                    Some(parsed) => weight_group = Some(parsed),
+                    None => fail(&format!(
+                        "--weight-group must be a multiple of 8, row or 0, got `{value}`"
+                    )),
+                },
+                None => fail("--weight-group needs a value"),
+            },
+            "--logits-activation-group" => match args.next() {
+                Some(value) => match group_value(&value) {
+                    Some(parsed) => logits_activation_group = Some(parsed),
+                    None => fail(&format!(
+                        "--logits-activation-group must be a multiple of 8, row or 0, got `{value}`"
+                    )),
+                },
+                None => fail("--logits-activation-group needs a value"),
             },
             other => fail(&format!("unknown argument `{other}`")),
         }
     }
     let Some(model_dir) = model_dir else {
-        fail("usage: worker --model-dir <dir> [--weights f32|int8] [--activations f32|int8] [--activation-group 16|32|64] [--logits-activations f32|int8] [--logits-outliers <n>]");
+        fail("usage: worker --model-dir <dir> [--weights f32|int8] [--activations f32|int8] [--weight-group N|row] [--activation-group N|row] [--activation-outliers <n>] [--logits-activations f32|int8] [--logits-activation-group N|row] [--logits-outliers <n>]");
     };
 
     let started = Instant::now();
-    let mut model = match Model::load_with_activations(Path::new(&model_dir), weights, activations)
-    {
+    let mut model = match Model::load_with_groups(
+        Path::new(&model_dir),
+        weights,
+        activations,
+        weight_group.unwrap_or(64),
+    ) {
         Ok(model) => model,
         Err(error) => fail(&format!("failed to load model: {error}")),
     };
@@ -91,8 +125,18 @@ fn main() {
             fail(&error.to_string());
         }
     }
+    if let Some(activation_outliers) = activation_outliers {
+        if let Err(error) = model.set_activation_outliers(activation_outliers) {
+            fail(&error.to_string());
+        }
+    }
     if let Some(logits_activations) = logits_activations {
         model.set_logits_activations(logits_activations);
+    }
+    if let Some(logits_activation_group) = logits_activation_group {
+        if let Err(error) = model.set_logits_activation_group(logits_activation_group) {
+            fail(&error.to_string());
+        }
     }
     if let Some(logits_outliers) = logits_outliers {
         if let Err(error) = model.set_logits_outliers(logits_outliers) {
@@ -149,6 +193,16 @@ fn main() {
         }
         write_line(&mut out, &json!({"done": true}));
     }
+}
+
+fn group_value(value: &str) -> Option<usize> {
+    if value == "row" {
+        return Some(0);
+    }
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|&group| group == 0 || group.is_multiple_of(8))
 }
 
 fn write_line(out: &mut impl Write, value: &Value) {

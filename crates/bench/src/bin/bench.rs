@@ -80,7 +80,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] [--quantized] [--batch <n>] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>\n  bench perplexity --model-dir <dir> --text <file> --expected-perplexity <file> [--weights f32|int8] [--activations f32|int8] [--activation-group 16|32|64] [--logits-activations f32|int8] [--logits-outliers <n>] [--out <file>]\n  bench quantize --model-dir <dir> --out <file>"
+        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] [--quantized] [--batch <n>] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>\n  bench perplexity --model-dir <dir> --text <file> --expected-perplexity <file> [--weights f32|int8] [--activations f32|int8] [--weight-group N|row] [--activation-group N|row] [--activation-outliers <n>] [--logits-activations f32|int8] [--logits-activation-group N|row] [--logits-outliers <n>] [--out <file>]\n  bench quantize --model-dir <dir> --out <file>"
     );
 }
 
@@ -828,8 +828,11 @@ struct PerplexityOptions {
     expected_perplexity: String,
     weights: Weights,
     activations: Activations,
+    weight_group: usize,
     activation_group: usize,
+    activation_outliers: Option<usize>,
     logits_activations: Option<Activations>,
+    logits_activation_group: Option<usize>,
     logits_outliers: Option<usize>,
     out: String,
 }
@@ -841,8 +844,11 @@ impl PerplexityOptions {
         let mut expected_perplexity = None;
         let mut weights = Weights::F32;
         let mut activations = Activations::F32;
+        let mut weight_group = 64;
         let mut activation_group = 64;
+        let mut activation_outliers = None;
         let mut logits_activations = None;
+        let mut logits_activation_group = None;
         let mut logits_outliers = None;
         let mut out = None;
         let mut index = 0;
@@ -865,17 +871,35 @@ impl PerplexityOptions {
                         format!("--activations must be f32 or int8, got `{value}`")
                     })?;
                 }
+                "--weight-group" => {
+                    weight_group = parse_group(
+                        take_value(args, &mut index, "--weight-group")?,
+                        "--weight-group",
+                    )?;
+                }
                 "--activation-group" => {
-                    activation_group = parse_usize(
+                    activation_group = parse_group(
                         take_value(args, &mut index, "--activation-group")?,
                         "--activation-group",
                     )?;
+                }
+                "--activation-outliers" => {
+                    activation_outliers = Some(parse_usize(
+                        take_value(args, &mut index, "--activation-outliers")?,
+                        "--activation-outliers",
+                    )?);
                 }
                 "--logits-activations" => {
                     let value = take_value(args, &mut index, "--logits-activations")?;
                     logits_activations = Some(Activations::parse(&value).ok_or_else(|| {
                         format!("--logits-activations must be f32 or int8, got `{value}`")
                     })?);
+                }
+                "--logits-activation-group" => {
+                    logits_activation_group = Some(parse_group(
+                        take_value(args, &mut index, "--logits-activation-group")?,
+                        "--logits-activation-group",
+                    )?);
                 }
                 "--logits-outliers" => {
                     logits_outliers = Some(parse_usize(
@@ -902,8 +926,11 @@ impl PerplexityOptions {
                 .ok_or_else(|| "missing --expected-perplexity".to_string())?,
             weights,
             activations,
+            weight_group,
             activation_group,
+            activation_outliers,
             logits_activations,
+            logits_activation_group,
             logits_outliers,
             out: out.unwrap_or(default_out),
         })
@@ -935,17 +962,28 @@ fn perplexity_command(args: &[String]) -> Result<i32, String> {
         );
     }
 
-    let mut model = Model::load_with_activations(
+    let mut model = Model::load_with_groups(
         Path::new(&options.model_dir),
         options.weights,
         options.activations,
+        options.weight_group,
     )
     .map_err(|error| format!("{}: {error}", options.model_dir))?;
     model
         .set_activation_group(options.activation_group)
         .map_err(|error| error.to_string())?;
+    if let Some(activation_outliers) = options.activation_outliers {
+        model
+            .set_activation_outliers(activation_outliers)
+            .map_err(|error| error.to_string())?;
+    }
     if let Some(logits_activations) = options.logits_activations {
         model.set_logits_activations(logits_activations);
+    }
+    if let Some(logits_activation_group) = options.logits_activation_group {
+        model
+            .set_logits_activation_group(logits_activation_group)
+            .map_err(|error| error.to_string())?;
     }
     if let Some(logits_outliers) = options.logits_outliers {
         model
@@ -1043,4 +1081,20 @@ fn parse_usize(value: String, flag: &str) -> Result<usize, String> {
     value
         .parse()
         .map_err(|_| format!("{flag} expects a non-negative integer, got `{value}`"))
+}
+
+fn parse_group(value: String, flag: &str) -> Result<usize, String> {
+    if value == "row" {
+        return Ok(0);
+    }
+    let group: usize = value
+        .parse()
+        .map_err(|_| format!("{flag} expects a non-negative integer, got `{value}`"))?;
+    if group == 0 || group.is_multiple_of(8) {
+        Ok(group)
+    } else {
+        Err(format!(
+            "{flag} expects a multiple of 8, row or 0, got `{value}`"
+        ))
+    }
 }

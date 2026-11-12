@@ -7,8 +7,8 @@ use serde_json::json;
 use crate::parallel::Threads;
 use crate::int8_layout;
 use crate::quantize::{
-    quantize_activation_outliers, quantize_activations, quantize_activations_interleaved,
-    GROUP_SIZE,
+    group_size, quantize_activation_outliers, quantize_activations,
+    quantize_activations_interleaved, Rows, GROUP_SIZE,
 };
 use crate::safetensors::SafeTensors;
 use crate::simd::{
@@ -90,7 +90,11 @@ struct QuantizedRowActs<'a> {
 
 enum Matrix {
     F32(Vec<f32>),
-    Int8 { data: Vec<i8>, scale: Vec<f32> },
+    Int8 {
+        data: Vec<i8>,
+        scale: Vec<f32>,
+        group: usize,
+    },
 }
 
 impl Matrix {
@@ -104,7 +108,7 @@ impl Matrix {
     ) {
         match self {
             Matrix::F32(data) => linear_outputs(x, data, None, n_in, outputs, y, Epilogue::Store),
-            Matrix::Int8 { data, scale } => match acts {
+            Matrix::Int8 { data, scale, group } => match acts {
                 Some(acts) => acts.kernels.linear_outputs(
                     acts.data,
                     acts.scale,
@@ -112,6 +116,7 @@ impl Matrix {
                     scale,
                     None,
                     n_in,
+                    *group,
                     acts.group,
                     outputs,
                     y,
@@ -127,7 +132,7 @@ impl Matrix {
                     outputs,
                     y,
                     Epilogue::Store,
-                    GROUP_SIZE,
+                    *group,
                 ),
             },
         }
@@ -141,8 +146,8 @@ impl Matrix {
                     *value = data[start + d] + addend[d];
                 }
             }
-            Matrix::Int8 { data, scale } => {
-                let groups = len.div_ceil(GROUP_SIZE);
+            Matrix::Int8 { data, scale, group } => {
+                let groups = len.div_ceil(*group);
                 let scale = &scale[row * groups..(row + 1) * groups];
                 for block in 0..int8_layout::blocks(len) {
                     let first = block * int8_layout::BLOCK;
@@ -150,7 +155,7 @@ impl Matrix {
                     let at = int8_layout::block_offset(len, row, first);
                     for offset in 0..count {
                         let d = first + offset;
-                        out[d] = data[at + offset] as f32 * scale[d / GROUP_SIZE] + addend[d];
+                        out[d] = data[at + offset] as f32 * scale[d / *group] + addend[d];
                     }
                 }
             }
@@ -164,8 +169,8 @@ impl Matrix {
     fn to_f32(&self, n_in: usize) -> Vec<f32> {
         match self {
             Matrix::F32(data) => data.clone(),
-            Matrix::Int8 { data, scale } => {
-                let groups = n_in.div_ceil(GROUP_SIZE);
+            Matrix::Int8 { data, scale, group } => {
+                let groups = n_in.div_ceil(*group);
                 let rows = scale.len() / groups;
                 let mut values = Vec::with_capacity(rows * n_in);
                 let mut row_bytes = vec![0i8; n_in];
@@ -177,7 +182,7 @@ impl Matrix {
                             .iter()
                             .enumerate()
                             .map(|(column, &value)| {
-                                value as f32 * scale[column / GROUP_SIZE]
+                                value as f32 * scale[column / *group]
                             }),
                     );
                 }
@@ -187,13 +192,13 @@ impl Matrix {
     }
 
     fn pack_int8(&self, n_in: usize) -> Option<Vec<u32>> {
-        let Matrix::Int8 { data, scale } = self else {
+        let Matrix::Int8 { data, scale, group } = self else {
             return None;
         };
         if !n_in.is_multiple_of(4) {
             return None;
         }
-        let groups = n_in.div_ceil(GROUP_SIZE);
+        let groups = n_in.div_ceil(*group);
         let rows = scale.len() / groups;
         let mut words = Vec::with_capacity(rows * n_in / 4);
         let mut row_bytes = vec![0i8; n_in];
@@ -225,23 +230,43 @@ fn load_matrix(
     n_in: usize,
     n_out: usize,
     weights: Weights,
+    weight_group: usize,
 ) -> Result<Matrix, Error> {
     match weights {
         Weights::F32 => Ok(Matrix::F32(
             tensors.load_matrix_transposed(name, n_in, n_out)?,
         )),
         Weights::Int8 => {
-            let groups = n_in.div_ceil(GROUP_SIZE);
+            let group = group_size(weight_group, n_in);
             let (data, scale) = match tensors.load_int8(name, n_out, n_in)? {
-                Some(data) => {
-                    let scale = tensors.load_matrix(&format!("{name}.scales"), n_out, groups)?;
+                Some(data) if group == GROUP_SIZE => {
+                    let scale =
+                        tensors.load_matrix(&format!("{name}.scales"), n_out, n_in.div_ceil(group))?;
                     (data, scale)
                 }
-                None => tensors.quantize_transposed(name, n_in, n_out)?,
+                // A stored file carries one scale per 64 inputs, so a coarser
+                // group is rebuilt from the dequantized row.
+                Some(data) => {
+                    let stored_groups = n_in.div_ceil(GROUP_SIZE);
+                    let stored =
+                        tensors.load_matrix(&format!("{name}.scales"), n_out, stored_groups)?;
+                    let mut quantizer = Rows::new(n_out, n_in, group);
+                    let mut row = vec![0.0f32; n_in];
+                    for output in 0..n_out {
+                        for (column, value) in row.iter_mut().enumerate() {
+                            *value = data[output * n_in + column] as f32
+                                * stored[output * stored_groups + column / GROUP_SIZE];
+                        }
+                        quantizer.push(&row);
+                    }
+                    quantizer.into_parts()
+                }
+                None => tensors.quantize_transposed_group(name, n_in, n_out, group)?,
             };
             Ok(Matrix::Int8 {
                 data: int8_layout::interleave_owned(n_out, n_in, data),
                 scale,
+                group,
             })
         }
     }
@@ -253,21 +278,37 @@ fn load_embedding(
     rows: usize,
     cols: usize,
     weights: Weights,
+    weight_group: usize,
 ) -> Result<Matrix, Error> {
     match weights {
         Weights::F32 => Ok(Matrix::F32(tensors.load_matrix(name, rows, cols)?)),
         Weights::Int8 => {
+            let group = group_size(weight_group, cols);
             let (data, scale) = match tensors.load_int8(name, rows, cols)? {
-                Some(data) => {
-                    let groups = cols.div_ceil(GROUP_SIZE);
-                    let scale = tensors.load_matrix(&format!("{name}.scales"), rows, groups)?;
+                Some(data) if group == GROUP_SIZE => {
+                    let scale = tensors.load_matrix(&format!("{name}.scales"), rows, cols.div_ceil(group))?;
                     (data, scale)
                 }
-                None => tensors.quantize_rows(name, rows, cols)?,
+                Some(data) => {
+                    let stored_groups = cols.div_ceil(GROUP_SIZE);
+                    let stored = tensors.load_matrix(&format!("{name}.scales"), rows, stored_groups)?;
+                    let mut quantizer = Rows::new(rows, cols, group);
+                    let mut row = vec![0.0f32; cols];
+                    for r in 0..rows {
+                        for (column, value) in row.iter_mut().enumerate() {
+                            *value = data[r * cols + column] as f32
+                                * stored[r * stored_groups + column / GROUP_SIZE];
+                        }
+                        quantizer.push(&row);
+                    }
+                    quantizer.into_parts()
+                }
+                None => tensors.quantize_rows_group(name, rows, cols, group)?,
             };
             Ok(Matrix::Int8 {
                 data: int8_layout::interleave_owned(rows, cols, data),
                 scale,
+                group,
             })
         }
     }
@@ -283,7 +324,9 @@ pub struct Model {
     threads: Threads,
     activations: Activations,
     activation_group: usize,
+    activation_outliers: usize,
     logits_activations: Activations,
+    logits_activation_group: usize,
     logits_outliers: usize,
     int8_activation_kernels: Int8ActivationKernels,
     scratch: RefCell<Option<Scratch>>,
@@ -381,10 +424,10 @@ impl Workspace {
         }
         let activation_scale = rows * 4 * n_embd / 16;
         grow(&mut self.activation_scale, activation_scale);
-        if self.outlier_index.len() < rows * n_embd {
-            self.outlier_index.resize(rows * n_embd, 0);
+        if self.outlier_index.len() < rows * 4 * n_embd {
+            self.outlier_index.resize(rows * 4 * n_embd, 0);
         }
-        grow(&mut self.outlier_value, rows * n_embd);
+        grow(&mut self.outlier_value, rows * 4 * n_embd);
     }
 }
 
@@ -512,9 +555,18 @@ impl Model {
         weights: Weights,
         activations: Activations,
     ) -> Result<Model, Error> {
+        Model::load_with_groups(model_dir, weights, activations, GROUP_SIZE)
+    }
+
+    pub fn load_with_groups(
+        model_dir: &Path,
+        weights: Weights,
+        activations: Activations,
+        weight_group: usize,
+    ) -> Result<Model, Error> {
         let config = Config::load(model_dir)?;
         let tensors = SafeTensors::open(&model_dir.join("model.safetensors"))?;
-        Model::from_tensors(config, tensors, weights, activations)
+        Model::from_tensors(config, tensors, weights, activations, weight_group)
     }
 
     pub fn from_bytes(
@@ -531,9 +583,19 @@ impl Model {
         weights: Weights,
         activations: Activations,
     ) -> Result<Model, Error> {
+        Model::from_bytes_with_groups(config_json, weights_bytes, weights, activations, GROUP_SIZE)
+    }
+
+    pub fn from_bytes_with_groups(
+        config_json: &str,
+        weights_bytes: &[u8],
+        weights: Weights,
+        activations: Activations,
+        weight_group: usize,
+    ) -> Result<Model, Error> {
         let config = Config::from_json(config_json)?;
         let tensors = SafeTensors::from_bytes(weights_bytes)?;
-        Model::from_tensors(config, tensors, weights, activations)
+        Model::from_tensors(config, tensors, weights, activations, weight_group)
     }
 
     fn from_tensors(
@@ -541,15 +603,19 @@ impl Model {
         mut tensors: SafeTensors<'_>,
         weights: Weights,
         activations: Activations,
+        weight_group: usize,
     ) -> Result<Model, Error> {
         let n_embd = config.n_embd;
         let n_inner = 4 * n_embd;
+        // The scoring matrix keeps its own granularity: it is the one place where
+        // the activations needed outliers to survive 64-value groups.
         let wte = load_embedding(
             &mut tensors,
             "wte.weight",
             config.vocab_size,
             n_embd,
             weights,
+            GROUP_SIZE,
         )?;
         let wpe = tensors.load_matrix("wpe.weight", config.n_ctx, n_embd)?;
 
@@ -565,6 +631,7 @@ impl Model {
                     n_embd,
                     3 * n_embd,
                     weights,
+                    weight_group,
                 )?,
                 c_attn_bias: tensors
                     .load_vector(&format!("{prefix}.attn.c_attn.bias"), 3 * n_embd)?,
@@ -574,6 +641,7 @@ impl Model {
                     n_embd,
                     n_embd,
                     weights,
+                    weight_group,
                 )?,
                 c_proj_bias: tensors.load_vector(&format!("{prefix}.attn.c_proj.bias"), n_embd)?,
                 ln_2_weight: tensors.load_vector(&format!("{prefix}.ln_2.weight"), n_embd)?,
@@ -584,6 +652,7 @@ impl Model {
                     n_embd,
                     n_inner,
                     weights,
+                    weight_group,
                 )?,
                 c_fc_bias: tensors.load_vector(&format!("{prefix}.mlp.c_fc.bias"), n_inner)?,
                 mlp_c_proj_weight: load_matrix(
@@ -592,6 +661,7 @@ impl Model {
                     n_inner,
                     n_embd,
                     weights,
+                    weight_group,
                 )?,
                 mlp_c_proj_bias: tensors
                     .load_vector(&format!("{prefix}.mlp.c_proj.bias"), n_embd)?,
@@ -611,6 +681,7 @@ impl Model {
             threads: Threads::from_env()?,
             activations,
             activation_group: GROUP_SIZE,
+            activation_outliers: 0,
             // Without removing the largest inputs, quantizing the scoring layer
             // costs 6.3 perplexity on the 124M model; the four it removes are the
             // same dimensions in almost every token and recover all of that.
@@ -619,6 +690,7 @@ impl Model {
             } else {
                 Activations::F32
             },
+            logits_activation_group: GROUP_SIZE,
             logits_outliers: 4,
             int8_activation_kernels: Int8ActivationKernels::detect(),
             scratch: RefCell::new(Some(Scratch::empty())),
@@ -665,10 +737,28 @@ impl Model {
     }
 
     pub fn set_activation_group(&mut self, group: usize) -> Result<(), Error> {
-        if !matches!(group, 16 | 32 | 64) {
-            return Err(Error::new("activation group must be 16, 32 or 64"));
+        if group != 0 && !group.is_multiple_of(8) {
+            return Err(Error::new("activation group must be 0 or a multiple of 8"));
         }
         self.activation_group = group;
+        Ok(())
+    }
+
+    pub fn set_activation_outliers(&mut self, count: usize) -> Result<(), Error> {
+        if count > 4 * self.config.n_embd {
+            return Err(Error::new("activation outliers exceed the widest layer"));
+        }
+        self.activation_outliers = count;
+        Ok(())
+    }
+
+    pub fn set_logits_activation_group(&mut self, group: usize) -> Result<(), Error> {
+        if group != 0 && !group.is_multiple_of(8) {
+            return Err(Error::new(
+                "logits activation group must be 0 or a multiple of 8",
+            ));
+        }
+        self.logits_activation_group = group;
         Ok(())
     }
 
@@ -689,6 +779,16 @@ impl Model {
             Activations::F32 => None,
             Activations::Int8 => Some(ActivationMode {
                 group: self.activation_group,
+                kernels: self.int8_activation_kernels,
+            }),
+        }
+    }
+
+    fn logits_mode(&self) -> Option<ActivationMode> {
+        match self.logits_activations {
+            Activations::F32 => None,
+            Activations::Int8 => Some(ActivationMode {
+                group: group_size(self.logits_activation_group, self.config.n_embd),
                 kernels: self.int8_activation_kernels,
             }),
         }
@@ -966,7 +1066,7 @@ impl Model {
 
         let vocab_size = config.vocab_size;
         let input = &workspace.normed[..rows * n_embd];
-        let mode = self.activation_mode(self.logits_activations);
+        let mode = self.logits_mode();
         let mut outliers = Vec::new();
         let acts = match mode {
             Some(mode) => {
@@ -1004,7 +1104,6 @@ impl Model {
             None => None,
         };
 
-        let weight_groups = n_embd.div_ceil(GROUP_SIZE);
         let wte = &self.wte;
         let mut best = vec![f32::NEG_INFINITY; rows];
         let mut best_token = vec![0u32; rows];
@@ -1023,34 +1122,38 @@ impl Model {
                     part,
                     Epilogue::Store,
                 ),
-                Matrix::Int8 { data, scale } => match acts {
-                    Some(acts) => acts.kernels.linear_rows(
-                        acts.data,
-                        acts.scale,
-                        &data[(start / 2) * int8_layout::pair_stride(n_embd)..],
-                        &scale[start * weight_groups..],
-                        &zero_bias[start..],
-                        rows,
-                        n_embd,
-                        outputs,
-                        acts.group,
-                        part,
-                        Epilogue::Store,
-                        acts.outliers,
-                    ),
-                    None => int8_linear_rows(
-                        input,
-                        &data[start * n_embd..],
-                        &scale[start * weight_groups..],
-                        &zero_bias[start..],
-                        rows,
-                        n_embd,
-                        outputs,
-                        part,
-                        Epilogue::Store,
-                        GROUP_SIZE,
-                    ),
-                },
+                Matrix::Int8 { data, scale, group } => {
+                    let weight_groups = n_embd.div_ceil(*group);
+                    match acts {
+                        Some(acts) => acts.kernels.linear_rows(
+                            acts.data,
+                            acts.scale,
+                            &data[(start / 2) * int8_layout::pair_stride(n_embd)..],
+                            &scale[start * weight_groups..],
+                            &zero_bias[start..],
+                            rows,
+                            n_embd,
+                            outputs,
+                            *group,
+                            acts.group,
+                            part,
+                            Epilogue::Store,
+                            acts.outliers,
+                        ),
+                        None => int8_linear_rows(
+                            input,
+                            &data[start * n_embd..],
+                            &scale[start * weight_groups..],
+                            &zero_bias[start..],
+                            rows,
+                            n_embd,
+                            outputs,
+                            part,
+                            Epilogue::Store,
+                            *group,
+                        ),
+                    }
+                }
             },
             |row, start, values| {
                 for (offset, &value) in values.iter().enumerate() {
@@ -1116,7 +1219,7 @@ impl Model {
             hidden,
         );
 
-        let mode = self.activation_mode(self.logits_activations);
+        let mode = self.logits_mode();
         let acts = match mode {
             Some(mode) => {
                 let groups = n_embd.div_ceil(mode.group);
@@ -1208,6 +1311,9 @@ fn linear(
     mode: Option<ActivationMode>,
     activation_data: &mut [i8],
     activation_scale: &mut [f32],
+    activation_outliers: usize,
+    outlier_index: &mut [u32],
+    outlier_value: &mut [f32],
 ) {
     linear_split(
         threads,
@@ -1222,6 +1328,9 @@ fn linear(
         mode,
         activation_data,
         activation_scale,
+        activation_outliers,
+        outlier_index,
+        outlier_value,
         RowSplit::ByRow,
     );
 }
@@ -1240,6 +1349,9 @@ fn linear_batch(
     mode: Option<ActivationMode>,
     activation_data: &mut [i8],
     activation_scale: &mut [f32],
+    activation_outliers: usize,
+    outlier_index: &mut [u32],
+    outlier_value: &mut [f32],
 ) {
     linear_split(
         threads,
@@ -1254,6 +1366,9 @@ fn linear_batch(
         mode,
         activation_data,
         activation_scale,
+        activation_outliers,
+        outlier_index,
+        outlier_value,
         RowSplit::ByOutput,
     );
 }
@@ -1272,18 +1387,22 @@ fn linear_split(
     mode: Option<ActivationMode>,
     activation_data: &mut [i8],
     activation_scale: &mut [f32],
+    activation_outliers: usize,
+    outlier_index: &mut [u32],
+    outlier_value: &mut [f32],
     split: RowSplit,
 ) {
     match weight {
         Matrix::F32(weight) => linear_f32(
             threads, x, weight, bias, rows, n_in, n_out, y, epilogue, split,
         ),
-        Matrix::Int8 { data, scale } => match mode {
+        Matrix::Int8 { data, scale, group } => match mode {
             Some(mode) => linear_int8_activations(
                 threads,
                 x,
                 data,
                 scale,
+                *group,
                 bias,
                 rows,
                 n_in,
@@ -1293,10 +1412,13 @@ fn linear_split(
                 mode,
                 activation_data,
                 activation_scale,
+                activation_outliers,
+                outlier_index,
+                outlier_value,
                 split,
             ),
             None => linear_int8(
-                threads, x, data, scale, bias, rows, n_in, n_out, y, epilogue, split,
+                threads, x, data, scale, *group, bias, rows, n_in, n_out, y, epilogue, split,
             ),
         },
     }
@@ -1433,6 +1555,7 @@ fn linear_int8(
     x: &[f32],
     weight: &[i8],
     scale: &[f32],
+    weight_group: usize,
     bias: &[f32],
     rows: usize,
     n_in: usize,
@@ -1441,7 +1564,7 @@ fn linear_int8(
     epilogue: Epilogue,
     split: RowSplit,
 ) {
-    let weight_groups = n_in.div_ceil(GROUP_SIZE);
+    let weight_groups = n_in.div_ceil(weight_group);
     if rows == 1 {
         threads.run(y, 1, |start, part| {
             int8_linear_outputs(
@@ -1453,7 +1576,7 @@ fn linear_int8(
                 start..start + part.len(),
                 part,
                 Epilogue::Store,
-                GROUP_SIZE,
+                weight_group,
             );
             apply_epilogue(part, epilogue);
         });
@@ -1469,7 +1592,7 @@ fn linear_int8(
                 outputs,
                 part,
                 Epilogue::Store,
-                GROUP_SIZE,
+                weight_group,
             );
             apply_epilogue(part, epilogue);
         });
@@ -1487,7 +1610,7 @@ fn linear_int8(
                 n_out,
                 part,
                 Epilogue::Store,
-                GROUP_SIZE,
+                weight_group,
             );
             apply_epilogue(part, epilogue);
         });
@@ -1500,6 +1623,7 @@ fn linear_int8_activations(
     x: &[f32],
     weight: &[i8],
     scale: &[f32],
+    weight_group: usize,
     bias: &[f32],
     rows: usize,
     n_in: usize,
@@ -1509,27 +1633,49 @@ fn linear_int8_activations(
     mode: ActivationMode,
     activation_data: &mut [i8],
     activation_scale: &mut [f32],
+    activation_outliers: usize,
+    outlier_index: &mut [u32],
+    outlier_value: &mut [f32],
     split: RowSplit,
 ) {
-    let groups = n_in.div_ceil(mode.group);
+    let group = group_size(mode.group, n_in);
+    let groups = n_in.div_ceil(group);
     let with_gelu = matches!(epilogue, Epilogue::Gelu);
-    let weight_groups = n_in.div_ceil(GROUP_SIZE);
+    let weight_groups = n_in.div_ceil(weight_group);
+    let keep = activation_outliers.min(n_in);
 
     if rows == 1 {
-        quantize_activations(
-            x,
-            rows,
-            n_in,
-            mode.group,
-            &mut activation_data[..rows * n_in],
-            &mut activation_scale[..rows * groups],
-        );
+        let count = if keep > 0 {
+            quantize_activation_outliers(
+                x,
+                group,
+                keep,
+                &mut activation_data[..n_in],
+                &mut activation_scale[..groups],
+                &mut outlier_index[..n_in],
+                &mut outlier_value[..n_in],
+            )
+        } else {
+            quantize_activations(
+                x,
+                rows,
+                n_in,
+                group,
+                &mut activation_data[..n_in],
+                &mut activation_scale[..groups],
+            );
+            0
+        };
+        let outliers = (count > 0).then(|| Outliers {
+            indices: &outlier_index[..count],
+            values: &outlier_value[..count],
+        });
         let acts = QuantizedActs {
             data: &activation_data[..n_in],
             scale: &activation_scale[..groups],
-            group: mode.group,
+            group,
             kernels: mode.kernels,
-            outliers: None,
+            outliers,
         };
         let align = if with_gelu { acts.group } else { 1 };
         threads.run(y, align, |start, part| {
@@ -1540,6 +1686,7 @@ fn linear_int8_activations(
                 scale,
                 Some(&bias[start..start + part.len()]),
                 n_in,
+                weight_group,
                 acts.group,
                 start..start + part.len(),
                 part,
@@ -1554,37 +1701,66 @@ fn linear_int8_activations(
     }
 
     let activation_len = int8_layout::storage_len(rows, n_in);
-    if split == RowSplit::ByOutput {
-        quantize_activations_interleaved(
-            x,
-            rows,
-            n_in,
-            mode.group,
-            activation_data,
-            &mut activation_scale[..rows * groups],
-        );
-        let acts = QuantizedActs {
-            data: &activation_data[..activation_len],
-            scale: &activation_scale[..rows * groups],
-            group: mode.group,
-            kernels: mode.kernels,
-            outliers: None,
+    if split == RowSplit::ByOutput || keep > 0 {
+        let mut outliers = Vec::new();
+        if keep > 0 {
+            let mut counts = Vec::with_capacity(rows);
+            for row in 0..rows {
+                counts.push(quantize_activation_outliers(
+                    &x[row * n_in..(row + 1) * n_in],
+                    group,
+                    keep,
+                    &mut activation_data[row * n_in..(row + 1) * n_in],
+                    &mut activation_scale[row * groups..(row + 1) * groups],
+                    &mut outlier_index[row * n_in..(row + 1) * n_in],
+                    &mut outlier_value[row * n_in..(row + 1) * n_in],
+                ));
+            }
+            int8_layout::interleave_in_place(
+                rows,
+                n_in,
+                &mut activation_data[..activation_len],
+            );
+            for (row, &count) in counts.iter().enumerate() {
+                outliers.push(Outliers {
+                    indices: &outlier_index[row * n_in..row * n_in + count],
+                    values: &outlier_value[row * n_in..row * n_in + count],
+                });
+            }
+        } else {
+            quantize_activations_interleaved(
+                x,
+                rows,
+                n_in,
+                group,
+                activation_data,
+                &mut activation_scale[..rows * groups],
+            );
+        }
+        let data = &activation_data[..activation_len];
+        let scales = &activation_scale[..rows * groups];
+        let row_outliers = if keep > 0 {
+            Some(outliers.as_slice())
+        } else {
+            None
         };
         let stride = int8_layout::pair_stride(n_in);
+        let kernels = mode.kernels;
         run_output_split(threads, rows, n_out, y, |start, outputs, part| {
-            acts.kernels.linear_rows(
-                acts.data,
-                acts.scale,
+            kernels.linear_rows(
+                data,
+                scales,
                 &weight[(start / 2) * stride..],
                 &scale[start * weight_groups..],
                 &bias[start..],
                 rows,
                 n_in,
                 outputs,
-                acts.group,
+                weight_group,
+                group,
                 part,
                 Epilogue::Store,
-                None,
+                row_outliers,
             );
             if with_gelu {
                 for value in part.iter_mut() {
@@ -1614,7 +1790,7 @@ fn linear_int8_activations(
                 &x[first * n_in..(first + count) * n_in],
                 count,
                 n_in,
-                mode.group,
+                group,
                 std::slice::from_raw_parts_mut(targets.data.add(base), len),
                 std::slice::from_raw_parts_mut(targets.scale.add(first * groups), count * groups),
             );
@@ -1635,13 +1811,14 @@ fn linear_int8_activations(
             count,
             n_in,
             n_out,
-            mode.group,
+            weight_group,
+            group,
             part,
             Epilogue::Store,
             None,
         );
         if with_gelu {
-            gelu_quantized(part, mode.group);
+            gelu_quantized(part, group);
         }
     });
 }
@@ -1669,6 +1846,8 @@ impl Layer {
             hidden,
             activation_data,
             activation_scale,
+            outlier_index,
+            outlier_value,
             ..
         } = workspace;
         let projection: &mut [f32] = &mut projected[..n * n_embd];
@@ -1696,6 +1875,9 @@ impl Layer {
             mode,
             activation_data,
             activation_scale,
+            model.activation_outliers,
+            outlier_index,
+            outlier_value,
         );
         cache.store(
             index,
@@ -1728,6 +1910,9 @@ impl Layer {
             mode,
             activation_data,
             activation_scale,
+            model.activation_outliers,
+            outlier_index,
+            outlier_value,
         );
         add_in_place(&mut x[..n * n_embd], &projection[..n * n_embd]);
 
@@ -1754,6 +1939,9 @@ impl Layer {
             mode,
             activation_data,
             activation_scale,
+            model.activation_outliers,
+            outlier_index,
+            outlier_value,
         );
         linear(
             threads,
@@ -1768,6 +1956,9 @@ impl Layer {
             mode,
             activation_data,
             activation_scale,
+            model.activation_outliers,
+            outlier_index,
+            outlier_value,
         );
         add_in_place(&mut x[..n * n_embd], &projection[..n * n_embd]);
     }
@@ -1793,6 +1984,8 @@ impl Layer {
             hidden,
             activation_data,
             activation_scale,
+            outlier_index,
+            outlier_value,
             ..
         } = workspace;
         let projection: &mut [f32] = &mut projected[..rows * n_embd];
@@ -1820,6 +2013,9 @@ impl Layer {
             mode,
             activation_data,
             activation_scale,
+            model.activation_outliers,
+            outlier_index,
+            outlier_value,
         );
         for row in 0..rows {
             let start = caches[row].len;
@@ -1853,6 +2049,9 @@ impl Layer {
             mode,
             activation_data,
             activation_scale,
+            model.activation_outliers,
+            outlier_index,
+            outlier_value,
         );
         add_in_place(&mut x[..rows * n_embd], &projection[..rows * n_embd]);
 
@@ -1879,6 +2078,9 @@ impl Layer {
             mode,
             activation_data,
             activation_scale,
+            model.activation_outliers,
+            outlier_index,
+            outlier_value,
         );
         linear_batch(
             threads,
@@ -1893,6 +2095,9 @@ impl Layer {
             mode,
             activation_data,
             activation_scale,
+            model.activation_outliers,
+            outlier_index,
+            outlier_value,
         );
         add_in_place(&mut x[..rows * n_embd], &projection[..rows * n_embd]);
     }
@@ -2296,6 +2501,7 @@ mod tests {
         let matrix = Matrix::Int8 {
             data: int8_layout::interleave_owned(2, 4, vec![-128, -1, 0, 1, 2, 3, 4, 5]),
             scale: vec![0.5, 0.25],
+            group: 4,
         };
         assert_eq!(
             matrix.to_f32(4),
@@ -2323,6 +2529,7 @@ mod tests {
         let matrix = Matrix::Int8 {
             data: int8_layout::interleave_owned(rows, n_in, plain.clone()),
             scale: scale.clone(),
+            group: n_in,
         };
 
         let dequantized = matrix.to_f32(n_in);
@@ -2352,6 +2559,7 @@ mod tests {
         let matrix = Matrix::Int8 {
             data: int8_layout::interleave_owned(packed_rows, packed_in, packed.clone()),
             scale: vec![0.0f32; packed_rows],
+            group: packed_in,
         };
         let words = matrix.pack_int8(packed_in).expect("packed");
         let mut expected = Vec::new();
@@ -2401,6 +2609,9 @@ mod tests {
                         None,
                         &mut [],
                         &mut [],
+                        0,
+                        &mut [],
+                        &mut [],
                     );
                     let mut expected = vec![0.0; rows * n_out];
                     linear(
@@ -2414,6 +2625,9 @@ mod tests {
                         &mut expected,
                         epilogue,
                         None,
+                        &mut [],
+                        &mut [],
+                        0,
                         &mut [],
                         &mut [],
                     );

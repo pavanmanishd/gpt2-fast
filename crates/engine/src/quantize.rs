@@ -1,5 +1,15 @@
 pub(crate) const GROUP_SIZE: usize = 64;
 
+// Zero selects one group per row.
+#[inline]
+pub(crate) fn group_size(group: usize, n_in: usize) -> usize {
+    if group == 0 {
+        n_in
+    } else {
+        group
+    }
+}
+
 pub(crate) struct Rows {
     group: usize,
     scale: Vec<f32>,
