@@ -7,6 +7,8 @@ pub(crate) enum Epilogue {
 thread_local! {
     static GELU_BOUNDARIES: std::cell::RefCell<Vec<f32>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static F16_SCRATCH: std::cell::RefCell<Vec<f32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[derive(Clone, Copy)]
@@ -294,6 +296,63 @@ fn finish(sum: f32, bias: Option<f32>, with_gelu: bool) -> f32 {
         gelu_exact(value)
     } else {
         value
+    }
+}
+
+// Half weights widened one element at a time. Every target keeps this path:
+// it is the fallback where there is no NEON kernel and the reference the
+// vector kernels are checked against.
+#[allow(dead_code)]
+mod f16_scalar {
+    use std::ops::Range;
+
+    use super::{finish, Epilogue};
+    use crate::half::f16_to_f32;
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_rows(
+        x: &[f32],
+        weight: &[u16],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        y: &mut [f32],
+        epilogue: Epilogue,
+    ) {
+        let with_gelu = matches!(epilogue, Epilogue::Gelu);
+        for i in 0..rows {
+            let x = &x[i * n_in..(i + 1) * n_in];
+            for j in 0..n_out {
+                let sum: f32 = x
+                    .iter()
+                    .zip(&weight[j * n_in..(j + 1) * n_in])
+                    .map(|(&a, &b)| a * f16_to_f32(b))
+                    .sum();
+                y[i * n_out + j] = finish(sum, Some(bias[j]), with_gelu);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_outputs(
+        x: &[f32],
+        weight: &[u16],
+        bias: Option<&[f32]>,
+        n_in: usize,
+        outputs: Range<usize>,
+        y: &mut [f32],
+        epilogue: Epilogue,
+    ) {
+        let with_gelu = matches!(epilogue, Epilogue::Gelu);
+        for (offset, row) in outputs.enumerate() {
+            let sum: f32 = x
+                .iter()
+                .zip(&weight[row * n_in..(row + 1) * n_in])
+                .map(|(&a, &b)| a * f16_to_f32(b))
+                .sum();
+            y[offset] = finish(sum, bias.map(|bias| bias[offset]), with_gelu);
+        }
     }
 }
 
@@ -1555,7 +1614,7 @@ mod neon {
     use std::arch::aarch64::*;
     use std::ops::Range;
 
-    use super::{gelu_exact, Epilogue};
+    use super::{gelu_exact, Epilogue, F16_SCRATCH};
     use crate::int8_layout;
 
     const DECODE_ROWS: usize = 2;
@@ -1600,6 +1659,65 @@ mod neon {
             vcvtq_f32_s32(vmovl_s16(vget_low_s16(low))),
             vcvtq_f32_s32(vmovl_s16(vget_high_s16(low))),
         ]
+    }
+
+    // FCVTL converts without rounding, so the widened values are exactly the
+    // halves the f32 kernels would have seen.
+    // SAFETY: `ptr` points to at least 8 readable halfs.
+    #[inline]
+    unsafe fn widen_halves8(ptr: *const u16) -> [float32x4_t; 2] {
+        let low: float32x4_t;
+        let high: float32x4_t;
+        let wide = vld1q_u16(ptr);
+        std::arch::asm!(
+            "fcvtl {low:v}.4s, {wide:v}.4h",
+            "fcvtl2 {high:v}.4s, {wide:v}.8h",
+            wide = in(vreg) wide,
+            low = out(vreg) low,
+            high = out(vreg) high,
+            options(pure, nomem, nostack)
+        );
+        [low, high]
+    }
+
+    // SAFETY: `ptr` points to at least 4 readable halfs.
+    #[inline]
+    unsafe fn widen_halves4(ptr: *const u16) -> float32x4_t {
+        let out: float32x4_t;
+        let wide = vld1_u16(ptr);
+        std::arch::asm!(
+            "fcvtl {out:v}.4s, {wide:v}.4h",
+            wide = in(vreg) wide,
+            out = out(vreg) out,
+            options(pure, nomem, nostack)
+        );
+        out
+    }
+
+    // SAFETY: `weight` has `rows * n_in` halfs and `scratch` has the same
+    // number of floats.
+    unsafe fn widen_block(weight: &[u16], scratch: &mut [f32], n_in: usize, rows: usize) {
+        let source = weight.as_ptr();
+        let target = scratch.as_mut_ptr();
+        for row in 0..rows {
+            let source = source.add(row * n_in);
+            let target = target.add(row * n_in);
+            let mut p = 0;
+            while p + 8 <= n_in {
+                let w = widen_halves8(source.add(p));
+                vst1q_f32(target.add(p), w[0]);
+                vst1q_f32(target.add(p + 4), w[1]);
+                p += 8;
+            }
+            if p + 4 <= n_in {
+                vst1q_f32(target.add(p), widen_halves4(source.add(p)));
+                p += 4;
+            }
+            while p < n_in {
+                *target.add(p) = crate::half::f16_to_f32(*source.add(p));
+                p += 1;
+            }
+        }
     }
 
     // Every output is one contiguous row of weights, so a decoded token is a
@@ -1798,7 +1916,7 @@ mod neon {
     // Prefill keeps the same stored layout: a tile of input rows is multiplied
     // by a tile of output rows, each output row read contiguously.
     // SAFETY: `x` has `rows * n_in`, `weight` has `n_out * n_in`, `bias` has
-    // `n_out`, and `y` has `rows * n_out` values; `i + R <= rows` and
+    // `n_out`, and `y` has `rows * y_stride` values; `i + R <= rows` and
     // `j + C <= n_out`.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     unsafe fn f32_tile<const R: usize, const C: usize>(
@@ -1806,7 +1924,7 @@ mod neon {
         weight: &[f32],
         bias: &[f32],
         n_in: usize,
-        n_out: usize,
+        y_stride: usize,
         i: usize,
         j: usize,
         with_gelu: bool,
@@ -1837,9 +1955,64 @@ mod neon {
                     sum += *weight.add((j + c) * n_in + q) * *x.add((i + r) * n_in + q);
                     q += 1;
                 }
-                *y.get_unchecked_mut((i + r) * n_out + j + c) =
+                *y.get_unchecked_mut((i + r) * y_stride + j + c) =
                     finish(sum, Some(*bias.get_unchecked(j + c)), with_gelu);
             }
+        }
+    }
+
+    // One block of output rows against every prompt row, so the block's weights
+    // are read once per prompt pass instead of once per tile of rows.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn f32_wide_block(
+        x: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        y: &mut [f32],
+        y_stride: usize,
+        with_gelu: bool,
+    ) {
+        let mut i = 0;
+        while i + PREFILL_TOKENS <= rows {
+            let mut j = 0;
+            while j + PREFILL_OUTPUTS <= n_out {
+                f32_tile::<PREFILL_TOKENS, PREFILL_OUTPUTS>(
+                    x, weight, bias, n_in, y_stride, i, j, with_gelu, y,
+                );
+                j += PREFILL_OUTPUTS;
+            }
+            while j < n_out {
+                f32_tile::<PREFILL_TOKENS, 1>(x, weight, bias, n_in, y_stride, i, j, with_gelu, y);
+                j += 1;
+            }
+            i += PREFILL_TOKENS;
+        }
+        while i + 2 <= rows {
+            let mut j = 0;
+            while j + PREFILL_OUTPUTS <= n_out {
+                f32_tile::<2, PREFILL_OUTPUTS>(x, weight, bias, n_in, y_stride, i, j, with_gelu, y);
+                j += PREFILL_OUTPUTS;
+            }
+            while j < n_out {
+                f32_tile::<2, 1>(x, weight, bias, n_in, y_stride, i, j, with_gelu, y);
+                j += 1;
+            }
+            i += 2;
+        }
+        while i < rows {
+            let mut j = 0;
+            while j + PREFILL_OUTPUTS <= n_out {
+                f32_tile::<1, PREFILL_OUTPUTS>(x, weight, bias, n_in, y_stride, i, j, with_gelu, y);
+                j += PREFILL_OUTPUTS;
+            }
+            while j < n_out {
+                f32_tile::<1, 1>(x, weight, bias, n_in, y_stride, i, j, with_gelu, y);
+                j += 1;
+            }
+            i += 1;
         }
     }
 
@@ -1856,6 +2029,104 @@ mod neon {
         with_gelu: bool,
         y: &mut [f32],
     ) {
+        if rows == 0 || n_out == 0 {
+            return;
+        }
+        let mut block = 0;
+        while block < n_out {
+            let end = (block + PREFILL_OUTPUT_BLOCK).min(n_out);
+            f32_wide_block(
+                x,
+                &weight[block * n_in..],
+                &bias[block..],
+                rows,
+                n_in,
+                end - block,
+                &mut y[block..],
+                n_out,
+                with_gelu,
+            );
+            block = end;
+        }
+    }
+
+    // SAFETY: `x` has `rows * n_in`, `weight` has `n_out * n_in`, `bias` has
+    // `n_out`, and `y` has `rows * n_out` values; `i + R <= rows` and
+    // `j + C <= n_out`.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    unsafe fn f16_tile<const R: usize, const C: usize>(
+        x: &[f32],
+        weight: &[u16],
+        bias: &[f32],
+        n_in: usize,
+        n_out: usize,
+        i: usize,
+        j: usize,
+        with_gelu: bool,
+        y: &mut [f32],
+    ) {
+        let x = x.as_ptr();
+        let weight = weight.as_ptr();
+        let mut acc = [[vdupq_n_f32(0.0); C]; R];
+        let mut p = 0;
+        while p + 8 <= n_in {
+            let mut xv = [[vdupq_n_f32(0.0); 2]; R];
+            for (r, value) in xv.iter_mut().enumerate() {
+                *value = [
+                    vld1q_f32(x.add((i + r) * n_in + p)),
+                    vld1q_f32(x.add((i + r) * n_in + p + 4)),
+                ];
+            }
+            for c in 0..C {
+                let w = widen_halves8(weight.add((j + c) * n_in + p));
+                for (r, value) in xv.iter().enumerate() {
+                    acc[r][c] = vfmaq_f32(acc[r][c], w[0], value[0]);
+                    acc[r][c] = vfmaq_f32(acc[r][c], w[1], value[1]);
+                }
+            }
+            p += 8;
+        }
+        if p + 4 <= n_in {
+            let mut xv = [vdupq_n_f32(0.0); R];
+            for (r, value) in xv.iter_mut().enumerate() {
+                *value = vld1q_f32(x.add((i + r) * n_in + p));
+            }
+            for c in 0..C {
+                let w = widen_halves4(weight.add((j + c) * n_in + p));
+                for (r, value) in xv.iter().enumerate() {
+                    acc[r][c] = vfmaq_f32(acc[r][c], w, *value);
+                }
+            }
+            p += 4;
+        }
+        for (r, acc_r) in acc.iter().enumerate() {
+            for (c, accumulated) in acc_r.iter().enumerate() {
+                let mut sum = vaddvq_f32(*accumulated);
+                let mut q = p;
+                while q < n_in {
+                    sum += crate::half::f16_to_f32(*weight.add((j + c) * n_in + q))
+                        * *x.add((i + r) * n_in + q);
+                    q += 1;
+                }
+                *y.get_unchecked_mut((i + r) * n_out + j + c) =
+                    finish(sum, Some(*bias.get_unchecked(j + c)), with_gelu);
+            }
+        }
+    }
+
+    // SAFETY: `x` has `rows * n_in`, `weight` has `n_out * n_in`, `bias` has
+    // `n_out`, and `y` has `rows * n_out` values.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn f16_prefill(
+        x: &[f32],
+        weight: &[u16],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        with_gelu: bool,
+        y: &mut [f32],
+    ) {
         let mut block = 0;
         while block < n_out {
             let end = (block + PREFILL_OUTPUT_BLOCK).min(n_out);
@@ -1863,13 +2134,13 @@ mod neon {
             while i + PREFILL_TOKENS <= rows {
                 let mut j = block;
                 while j + PREFILL_OUTPUTS <= end {
-                    f32_tile::<PREFILL_TOKENS, PREFILL_OUTPUTS>(
+                    f16_tile::<PREFILL_TOKENS, PREFILL_OUTPUTS>(
                         x, weight, bias, n_in, n_out, i, j, with_gelu, y,
                     );
                     j += PREFILL_OUTPUTS;
                 }
                 while j < end {
-                    f32_tile::<PREFILL_TOKENS, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
+                    f16_tile::<PREFILL_TOKENS, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
                     j += 1;
                 }
                 i += PREFILL_TOKENS;
@@ -1877,13 +2148,13 @@ mod neon {
             while i + 2 <= rows {
                 let mut j = block;
                 while j + PREFILL_OUTPUTS <= end {
-                    f32_tile::<2, PREFILL_OUTPUTS>(
+                    f16_tile::<2, PREFILL_OUTPUTS>(
                         x, weight, bias, n_in, n_out, i, j, with_gelu, y,
                     );
                     j += PREFILL_OUTPUTS;
                 }
                 while j < end {
-                    f32_tile::<2, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
+                    f16_tile::<2, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
                     j += 1;
                 }
                 i += 2;
@@ -1891,18 +2162,177 @@ mod neon {
             while i < rows {
                 let mut j = block;
                 while j + PREFILL_OUTPUTS <= end {
-                    f32_tile::<1, PREFILL_OUTPUTS>(
+                    f16_tile::<1, PREFILL_OUTPUTS>(
                         x, weight, bias, n_in, n_out, i, j, with_gelu, y,
                     );
                     j += PREFILL_OUTPUTS;
                 }
                 while j < end {
-                    f32_tile::<1, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
+                    f16_tile::<1, 1>(x, weight, bias, n_in, n_out, i, j, with_gelu, y);
                     j += 1;
                 }
                 i += 1;
             }
             block = end;
+        }
+    }
+
+    // SAFETY: `x` has `rows * n_in`, `weight` has `n_out * n_in`, `bias` has
+    // `n_out`, and `y` has `rows * n_out` values.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn f16_outputs(
+        x: &[f32],
+        weight: &[u16],
+        bias: Option<&[f32]>,
+        n_in: usize,
+        first: usize,
+        end: usize,
+        with_gelu: bool,
+        y: &mut [f32],
+    ) {
+        let x = x.as_ptr();
+        let weight = weight.as_ptr();
+        let mut row = first;
+        while row + DECODE_ROWS <= end {
+            let mut acc = [[vdupq_n_f32(0.0); DECODE_ACCUMULATORS]; DECODE_ROWS];
+            let mut p = 0;
+            while p + DECODE_ACCUMULATORS * 4 <= n_in {
+                let mut xv = [vdupq_n_f32(0.0); DECODE_ACCUMULATORS];
+                for (a, value) in xv.iter_mut().enumerate() {
+                    *value = vld1q_f32(x.add(p + a * 4));
+                }
+                for (r, acc_r) in acc.iter_mut().enumerate() {
+                    let row_weight = weight.add((row + r) * n_in);
+                    for pair in 0..DECODE_ACCUMULATORS / 2 {
+                        let w = widen_halves8(row_weight.add(p + pair * 8));
+                        acc_r[2 * pair] = vfmaq_f32(acc_r[2 * pair], w[0], xv[2 * pair]);
+                        acc_r[2 * pair + 1] =
+                            vfmaq_f32(acc_r[2 * pair + 1], w[1], xv[2 * pair + 1]);
+                    }
+                }
+                p += DECODE_ACCUMULATORS * 4;
+            }
+            let mut sums = [0.0f32; DECODE_ROWS];
+            for (r, sum) in sums.iter_mut().enumerate() {
+                let row_weight = weight.add((row + r) * n_in);
+                *sum = horizontal4(acc[r]);
+                let mut q = p;
+                while q < n_in {
+                    *sum += crate::half::f16_to_f32(*row_weight.add(q)) * *x.add(q);
+                    q += 1;
+                }
+            }
+            for (r, sum) in sums.iter().enumerate() {
+                *y.get_unchecked_mut(row + r - first) = finish(
+                    *sum,
+                    bias.map(|bias| *bias.get_unchecked(row + r - first)),
+                    with_gelu,
+                );
+            }
+            row += DECODE_ROWS;
+        }
+        while row < end {
+            let row_weight = weight.add(row * n_in);
+            let mut acc = [vdupq_n_f32(0.0); DECODE_ACCUMULATORS];
+            let mut p = 0;
+            while p + DECODE_ACCUMULATORS * 4 <= n_in {
+                for a in 0..DECODE_ACCUMULATORS / 2 {
+                    let w = widen_halves8(row_weight.add(p + a * 8));
+                    acc[2 * a] = vfmaq_f32(acc[2 * a], w[0], vld1q_f32(x.add(p + 2 * a * 4)));
+                    acc[2 * a + 1] =
+                        vfmaq_f32(acc[2 * a + 1], w[1], vld1q_f32(x.add(p + (2 * a + 1) * 4)));
+                }
+                p += DECODE_ACCUMULATORS * 4;
+            }
+            let mut sum = horizontal4(acc);
+            while p < n_in {
+                sum += crate::half::f16_to_f32(*row_weight.add(p)) * *x.add(p);
+                p += 1;
+            }
+            *y.get_unchecked_mut(row - first) = finish(
+                sum,
+                bias.map(|bias| *bias.get_unchecked(row - first)),
+                with_gelu,
+            );
+            row += 1;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn f16_linear_rows(
+        x: &[f32],
+        weight: &[u16],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        y: &mut [f32],
+        epilogue: Epilogue,
+    ) {
+        let with_gelu = matches!(epilogue, Epilogue::Gelu);
+        if rows > PREFILL_TOKENS {
+            F16_SCRATCH.with(|cell| {
+                let mut scratch = cell.borrow_mut();
+                let mut block = 0;
+                while block < n_out {
+                    let end = (block + PREFILL_OUTPUT_BLOCK).min(n_out);
+                    let count = end - block;
+                    if scratch.len() < count * n_in {
+                        scratch.resize(count * n_in, 0.0);
+                    }
+                    let widened = &mut scratch[..count * n_in];
+                    // SAFETY: the slices are sized by the caller for `rows * n_in`,
+                    // `n_out * n_in`, `n_out` and `rows * n_out`, and this block
+                    // widens exactly its own output rows.
+                    unsafe {
+                        widen_block(&weight[block * n_in..], widened, n_in, count);
+                        f32_wide_block(
+                            x,
+                            widened,
+                            &bias[block..],
+                            rows,
+                            n_in,
+                            count,
+                            &mut y[block..],
+                            n_out,
+                            with_gelu,
+                        );
+                    }
+                    block = end;
+                }
+            });
+            return;
+        }
+        // SAFETY: the slices are sized by the caller for `rows * n_in`,
+        // `n_out * n_in`, `n_out` and `rows * n_out`.
+        unsafe {
+            f16_prefill(x, weight, bias, rows, n_in, n_out, with_gelu, y);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn f16_linear_outputs(
+        x: &[f32],
+        weight: &[u16],
+        bias: Option<&[f32]>,
+        n_in: usize,
+        outputs: Range<usize>,
+        y: &mut [f32],
+        epilogue: Epilogue,
+    ) {
+        // SAFETY: `weight` holds `n_out * n_in` values and `y` holds this output
+        // range; `bias` is sliced with the outputs.
+        unsafe {
+            f16_outputs(
+                x,
+                weight,
+                bias,
+                n_in,
+                outputs.start,
+                outputs.end,
+                matches!(epilogue, Epilogue::Gelu),
+                y,
+            );
         }
     }
 
@@ -3086,7 +3516,8 @@ mod scalar {
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) use neon::{
-    dot, dot2, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
+    dot, dot2, f16_linear_outputs, f16_linear_rows, int8_linear_outputs, int8_linear_rows,
+    linear_outputs, linear_rows, weighted_sum,
 };
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -3096,6 +3527,9 @@ pub(crate) use neon::int8_dot;
 pub(crate) use wasm::{
     dot, dot2, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
 };
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub(crate) use f16_scalar::{linear_outputs as f16_linear_outputs, linear_rows as f16_linear_rows};
 
 #[cfg(all(test, target_arch = "wasm32", target_feature = "simd128"))]
 pub(crate) use wasm::int8_dot;
@@ -3107,6 +3541,12 @@ pub(crate) use wasm::int8_dot;
 pub(crate) use scalar::{
     dot, dot2, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
 };
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
+pub(crate) use f16_scalar::{linear_outputs as f16_linear_outputs, linear_rows as f16_linear_rows};
 
 #[cfg(all(
     test,
@@ -3120,8 +3560,9 @@ pub(crate) use scalar::int8_dot;
 #[cfg(test)]
 mod tests {
     use super::{
-        dot, int8_activations, int8_dot, int8_linear_outputs, int8_linear_rows, linear_outputs,
-        linear_rows, weighted_sum, Epilogue, Int8ActivationKernels, Outliers,
+        dot, f16_linear_outputs, f16_linear_rows, int8_activations, int8_dot, int8_linear_outputs,
+        int8_linear_rows, linear_outputs, linear_rows, weighted_sum, Epilogue,
+        Int8ActivationKernels, Outliers,
     };
 
     fn linear(
@@ -3350,6 +3791,114 @@ mod tests {
                 .collect();
             let expected: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
             close(dot(&a, &b), expected);
+        }
+    }
+
+    fn f16_linear(
+        x: &[f32],
+        weight: &[u16],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+    ) -> Vec<f32> {
+        let mut y = vec![0.0; rows * n_out];
+        if rows == 1 {
+            f16_linear_outputs(
+                x,
+                weight,
+                Some(bias),
+                n_in,
+                0..n_out,
+                &mut y,
+                Epilogue::Store,
+            );
+        } else {
+            f16_linear_rows(x, weight, bias, rows, n_in, n_out, &mut y, Epilogue::Store);
+        }
+        y
+    }
+
+    fn f16_cases() -> Vec<(usize, usize, usize)> {
+        vec![
+            (1, 16, 7),
+            (1, 64, 33),
+            (1, 96, 65),
+            (2, 64, 33),
+            (4, 64, 33),
+            (5, 96, 17),
+            (7, 33, 97),
+            (9, 128, 130),
+        ]
+    }
+
+    fn f16_inputs(rows: usize, n_in: usize, n_out: usize) -> (Vec<u16>, Vec<f32>, Vec<f32>) {
+        let weight: Vec<u16> = (0..n_in * n_out)
+            .map(|i| crate::half::f32_to_f16(((i * 53 + 7) % 97) as f32 / 97.0 - 0.5))
+            .collect();
+        let bias: Vec<f32> = (0..n_out).map(|i| i as f32 / 90.0 - 1.0).collect();
+        let x: Vec<f32> = (0..rows * n_in)
+            .map(|i| ((i * 37 + 11) % 101) as f32 / 101.0 - 0.5)
+            .collect();
+        (weight, bias, x)
+    }
+
+    #[test]
+    fn f16_linear_matches_the_f32_kernel_on_widened_weights() {
+        for (rows, n_in, n_out) in f16_cases() {
+            let (weight, bias, x) = f16_inputs(rows, n_in, n_out);
+            let widened: Vec<f32> = weight
+                .iter()
+                .map(|&bits| crate::half::f16_to_f32(bits))
+                .collect();
+            let actual = f16_linear(&x, &weight, &bias, rows, n_in, n_out);
+            let expected = linear(&x, &widened, &bias, rows, n_in, n_out);
+            assert_eq!(actual.len(), expected.len());
+            for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    e.to_bits(),
+                    "rows {rows}, in {n_in}, out {n_out}, element {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f16_linear_matches_the_software_widening_reference() {
+        for (rows, n_in, n_out) in f16_cases() {
+            let (weight, bias, x) = f16_inputs(rows, n_in, n_out);
+            let actual = f16_linear(&x, &weight, &bias, rows, n_in, n_out);
+            let mut expected = vec![0.0; rows * n_out];
+            if rows == 1 {
+                super::f16_scalar::linear_outputs(
+                    &x,
+                    &weight,
+                    Some(&bias),
+                    n_in,
+                    0..n_out,
+                    &mut expected,
+                    Epilogue::Store,
+                );
+            } else {
+                super::f16_scalar::linear_rows(
+                    &x,
+                    &weight,
+                    &bias,
+                    rows,
+                    n_in,
+                    n_out,
+                    &mut expected,
+                    Epilogue::Store,
+                );
+            }
+            for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                close(*a, *e);
+                assert!(
+                    (a - e).abs() <= 1e-5 * e.abs().max(1.0),
+                    "rows {rows}, in {n_in}, out {n_out}, element {index}: {a} vs {e}"
+                );
+            }
         }
     }
 

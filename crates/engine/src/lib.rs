@@ -5,6 +5,7 @@
 
 mod config;
 mod error;
+mod half;
 mod int8_file;
 mod int8_layout;
 mod model;

@@ -42,6 +42,32 @@ fn batched(model: &Model, ids: &[&[u32]], batch: usize, max_new_tokens: usize) -
 }
 
 #[test]
+fn f16_batched_generation_matches_single_sequence_generation() {
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping model test: {} is missing", dir.display());
+        return;
+    }
+    let tokenizer = Tokenizer::load(Path::new(&dir)).expect("tokenizer loads");
+    let prompts = prompt_ids(&tokenizer).expect("prompts.json loads");
+    let ids: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
+
+    let mut model = Model::load_with(&dir, Weights::F16).expect("f16 model loads");
+    model.set_threads(4).expect("thread pool");
+    let references: Vec<Vec<u32>> = ids.iter().map(|prompt| single(&model, prompt, 16)).collect();
+    for batch in [1, 8] {
+        let generated = batched(&model, &ids, batch, 16);
+        for (sequence, tokens) in generated.iter().enumerate() {
+            assert_eq!(
+                tokens,
+                &references[sequence % ids.len()],
+                "batch {batch}, sequence {sequence}"
+            );
+        }
+    }
+}
+
+#[test]
 fn batched_generation_matches_single_sequence_generation() {
     let dir = model_dir();
     if !dir.join("model.safetensors").exists() {

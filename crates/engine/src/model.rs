@@ -12,14 +12,16 @@ use crate::quantize::{
 };
 use crate::safetensors::SafeTensors;
 use crate::simd::{
-    dot, dot2, gelu_exact, gelu_quantized_group, int8_linear_outputs, int8_linear_rows,
-    linear_outputs, linear_rows, weighted_sum, Epilogue, Int8ActivationKernels, Outliers,
+    dot, dot2, f16_linear_outputs, f16_linear_rows, gelu_exact, gelu_quantized_group,
+    int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum, Epilogue,
+    Int8ActivationKernels, Outliers,
 };
 use crate::{argmax, Config, Error};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Weights {
     F32,
+    F16,
     Int8,
 }
 
@@ -27,6 +29,7 @@ impl Weights {
     pub fn parse(name: &str) -> Option<Weights> {
         match name {
             "f32" => Some(Weights::F32),
+            "f16" => Some(Weights::F16),
             "int8" => Some(Weights::Int8),
             _ => None,
         }
@@ -35,6 +38,7 @@ impl Weights {
     pub fn name(self) -> &'static str {
         match self {
             Weights::F32 => "f32",
+            Weights::F16 => "f16",
             Weights::Int8 => "int8",
         }
     }
@@ -90,6 +94,7 @@ struct QuantizedRowActs<'a> {
 
 enum Matrix {
     F32(Vec<f32>),
+    F16(Vec<u16>),
     Int8 {
         data: Vec<i8>,
         scale: Vec<f32>,
@@ -108,6 +113,9 @@ impl Matrix {
     ) {
         match self {
             Matrix::F32(data) => linear_outputs(x, data, None, n_in, outputs, y, Epilogue::Store),
+            Matrix::F16(data) => {
+                f16_linear_outputs(x, data, None, n_in, outputs, y, Epilogue::Store)
+            }
             Matrix::Int8 { data, scale, group } => match acts {
                 Some(acts) => acts.kernels.linear_outputs(
                     acts.data,
@@ -146,6 +154,12 @@ impl Matrix {
                     *value = data[start + d] + addend[d];
                 }
             }
+            Matrix::F16(data) => {
+                let start = row * len;
+                for (d, value) in out.iter_mut().enumerate() {
+                    *value = crate::half::f16_to_f32(data[start + d]) + addend[d];
+                }
+            }
             Matrix::Int8 { data, scale, group } => {
                 let groups = len.div_ceil(*group);
                 let scale = &scale[row * groups..(row + 1) * groups];
@@ -169,6 +183,10 @@ impl Matrix {
     fn to_f32(&self, n_in: usize) -> Vec<f32> {
         match self {
             Matrix::F32(data) => data.clone(),
+            Matrix::F16(data) => data
+                .iter()
+                .map(|&bits| crate::half::f16_to_f32(bits))
+                .collect(),
             Matrix::Int8 { data, scale, group } => {
                 let groups = n_in.div_ceil(*group);
                 let rows = scale.len() / groups;
@@ -218,7 +236,7 @@ impl Matrix {
 
     fn scales(&self) -> Option<&[f32]> {
         match self {
-            Matrix::F32(_) => None,
+            Matrix::F32(_) | Matrix::F16(_) => None,
             Matrix::Int8 { scale, .. } => Some(scale),
         }
     }
@@ -236,6 +254,9 @@ fn load_matrix(
         Weights::F32 => Ok(Matrix::F32(
             tensors.load_matrix_transposed(name, n_in, n_out)?,
         )),
+        Weights::F16 => Ok(Matrix::F16(tensors.load_matrix_transposed_f16(
+            name, n_in, n_out,
+        )?)),
         Weights::Int8 => {
             let group = group_size(weight_group, n_in);
             let (data, scale) = match tensors.load_int8(name, n_out, n_in)? {
@@ -282,6 +303,7 @@ fn load_embedding(
 ) -> Result<Matrix, Error> {
     match weights {
         Weights::F32 => Ok(Matrix::F32(tensors.load_matrix(name, rows, cols)?)),
+        Weights::F16 => Ok(Matrix::F16(tensors.load_matrix_f16(name, rows, cols)?)),
         Weights::Int8 => {
             let group = group_size(weight_group, cols);
             let (data, scale) = match tensors.load_int8(name, rows, cols)? {
@@ -1122,6 +1144,16 @@ impl Model {
                     part,
                     Epilogue::Store,
                 ),
+                Matrix::F16(weight) => f16_linear_rows(
+                    input,
+                    &weight[start * n_embd..],
+                    &zero_bias[start..],
+                    rows,
+                    n_embd,
+                    outputs,
+                    part,
+                    Epilogue::Store,
+                ),
                 Matrix::Int8 { data, scale, group } => {
                     let weight_groups = n_embd.div_ceil(*group);
                     match acts {
@@ -1396,6 +1428,9 @@ fn linear_split(
         Matrix::F32(weight) => linear_f32(
             threads, x, weight, bias, rows, n_in, n_out, y, epilogue, split,
         ),
+        Matrix::F16(weight) => linear_f16(
+            threads, x, weight, bias, rows, n_in, n_out, y, epilogue, split,
+        ),
         Matrix::Int8 { data, scale, group } => match mode {
             Some(mode) => linear_int8_activations(
                 threads,
@@ -1535,6 +1570,65 @@ fn linear_f32(
             let first = start / n_out;
             let count = part.len() / n_out;
             linear_rows(
+                &x[first * n_in..(first + count) * n_in],
+                weight,
+                bias,
+                count,
+                n_in,
+                n_out,
+                part,
+                Epilogue::Store,
+            );
+            apply_epilogue(part, epilogue);
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_f16(
+    threads: &Threads,
+    x: &[f32],
+    weight: &[u16],
+    bias: &[f32],
+    rows: usize,
+    n_in: usize,
+    n_out: usize,
+    y: &mut [f32],
+    epilogue: Epilogue,
+    split: RowSplit,
+) {
+    if rows == 1 {
+        threads.run(y, 1, |start, part| {
+            f16_linear_outputs(
+                x,
+                weight,
+                Some(&bias[start..start + part.len()]),
+                n_in,
+                start..start + part.len(),
+                part,
+                Epilogue::Store,
+            );
+            apply_epilogue(part, epilogue);
+        });
+    } else if split == RowSplit::ByOutput {
+        run_output_split(threads, rows, n_out, y, |start, outputs, part| {
+            f16_linear_rows(
+                x,
+                &weight[start * n_in..],
+                &bias[start..],
+                rows,
+                n_in,
+                outputs,
+                part,
+                Epilogue::Store,
+            );
+            apply_epilogue(part, epilogue);
+        });
+    } else {
+        threads.run(y, n_out, |start, part| {
+            let first = start / n_out;
+            let count = part.len() / n_out;
+            f16_linear_rows(
                 &x[first * n_in..(first + count) * n_in],
                 weight,
                 bias,

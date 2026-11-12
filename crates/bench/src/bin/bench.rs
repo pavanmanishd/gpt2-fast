@@ -80,7 +80,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] [--quantized] [--batch <n>] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>\n  bench perplexity --model-dir <dir> --text <file> --expected-perplexity <file> [--weights f32|int8] [--activations f32|int8] [--weight-group N|row] [--activation-group N|row] [--activation-outliers <n>] [--logits-activations f32|int8] [--logits-activation-group N|row] [--logits-outliers <n>] [--out <file>]\n  bench quantize --model-dir <dir> --out <file>"
+        "usage:\n  bench run --label <L> --prompts <file> --expected <file> --warmup <n> --runs <n> --out <file> [--only <id>] [--max-new-tokens <n>] [--quantized] [--batch <n>] -- <worker command...>\n  bench summarize <dir>\n  bench check-tokenizer --model-dir <dir> --prompts <file> --expected <file>\n  bench perplexity --model-dir <dir> --text <file> --expected-perplexity <file> [--weights f32|f16|int8] [--activations f32|int8] [--weight-group N|row] [--activation-group N|row] [--activation-outliers <n>] [--logits-activations f32|int8] [--logits-activation-group N|row] [--logits-outliers <n>] [--out <file>]\n  bench quantize --model-dir <dir> --out <file>"
     );
 }
 
@@ -862,8 +862,9 @@ impl PerplexityOptions {
                 }
                 "--weights" => {
                     let value = take_value(args, &mut index, "--weights")?;
-                    weights = Weights::parse(&value)
-                        .ok_or_else(|| format!("--weights must be f32 or int8, got `{value}`"))?;
+                    weights = Weights::parse(&value).ok_or_else(|| {
+                        format!("--weights must be f32, f16 or int8, got `{value}`")
+                    })?;
                 }
                 "--activations" => {
                     let value = take_value(args, &mut index, "--activations")?;

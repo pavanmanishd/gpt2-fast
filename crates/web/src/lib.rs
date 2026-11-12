@@ -49,7 +49,7 @@ impl Engine {
         threads: usize,
     ) -> Result<Engine, JsValue> {
         let weights = Weights::parse(weights)
-            .ok_or_else(|| JsValue::from_str("weights must be f32 or int8"))?;
+            .ok_or_else(|| JsValue::from_str("weights must be f32, f16 or int8"))?;
         let mut model = Model::from_bytes(config_json, weights_bytes, weights)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         if threads > 1 {

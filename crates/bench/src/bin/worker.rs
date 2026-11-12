@@ -38,7 +38,9 @@ fn main() {
             "--weights" => match args.next() {
                 Some(value) => match Weights::parse(&value) {
                     Some(parsed) => weights = parsed,
-                    None => fail(&format!("--weights must be f32 or int8, got `{value}`")),
+                    None => fail(&format!(
+                        "--weights must be f32, f16 or int8, got `{value}`"
+                    )),
                 },
                 None => fail("--weights needs a value"),
             },
@@ -107,7 +109,7 @@ fn main() {
         }
     }
     let Some(model_dir) = model_dir else {
-        fail("usage: worker --model-dir <dir> [--weights f32|int8] [--activations f32|int8] [--weight-group N|row] [--activation-group N|row] [--activation-outliers <n>] [--logits-activations f32|int8] [--logits-activation-group N|row] [--logits-outliers <n>]");
+        fail("usage: worker --model-dir <dir> [--weights f32|f16|int8] [--activations f32|int8] [--weight-group N|row] [--activation-group N|row] [--activation-outliers <n>] [--logits-activations f32|int8] [--logits-activation-group N|row] [--logits-outliers <n>]");
     };
 
     let started = Instant::now();

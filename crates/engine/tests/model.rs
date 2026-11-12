@@ -118,6 +118,7 @@ fn reusing_the_scratch_across_prompts_matches_a_fresh_model() {
 
     for (weights, activations) in [
         (Weights::F32, Activations::F32),
+        (Weights::F16, Activations::F32),
         (Weights::Int8, Activations::Int8),
     ] {
         let reused = Model::load_with_activations(&dir, weights, activations).expect("model loads");
@@ -137,6 +138,30 @@ fn reusing_the_scratch_across_prompts_matches_a_fresh_model() {
             activations.name()
         );
     }
+}
+
+#[test]
+fn f16_weights_track_the_f32_logits() {
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping model test: {} is missing", dir.display());
+        return;
+    }
+    let tokenizer = Tokenizer::load(&dir).expect("tokenizer loads");
+    let ids = tokenizer.encode("Hello, my name is");
+
+    let full = Model::load_with(&dir, Weights::F32).expect("f32 model loads");
+    let half = Model::load_with(&dir, Weights::F16).expect("f16 model loads");
+    let expected = full.logits(&ids);
+    let actual = half.logits(&ids);
+    assert_eq!(argmax(&actual), argmax(&expected));
+
+    let max_diff = actual
+        .iter()
+        .zip(&expected)
+        .map(|(a, e)| (a - e).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_diff < 1.0, "logits differ by {max_diff}");
 }
 
 #[test]

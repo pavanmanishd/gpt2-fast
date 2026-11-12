@@ -103,6 +103,37 @@ impl<'a> SafeTensors<'a> {
         Ok(output_major)
     }
 
+    pub(crate) fn load_matrix_f16(
+        &mut self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<u16>, Error> {
+        let mut output = vec![0u16; rows * cols];
+        self.for_each_row(name, rows, cols, |row, values| {
+            let target = &mut output[row * cols..(row + 1) * cols];
+            for (value, &source) in target.iter_mut().zip(values) {
+                *value = crate::half::f32_to_f16(source);
+            }
+        })?;
+        Ok(output)
+    }
+
+    pub(crate) fn load_matrix_transposed_f16(
+        &mut self,
+        name: &str,
+        n_in: usize,
+        n_out: usize,
+    ) -> Result<Vec<u16>, Error> {
+        let mut output = vec![0u16; n_in * n_out];
+        self.for_each_row(name, n_in, n_out, |input, values| {
+            for (output_row, &value) in values.iter().enumerate() {
+                output[output_row * n_in + input] = crate::half::f32_to_f16(value);
+            }
+        })?;
+        Ok(output)
+    }
+
     pub(crate) fn load_int8(
         &mut self,
         name: &str,
@@ -450,6 +481,24 @@ mod tests {
                 .load_matrix_transposed("weight", 2, 2)
                 .expect("transposed f32 matrix"),
             vec![1.0, 3.5, -2.0, 4.25]
+        );
+    }
+
+    #[test]
+    fn stores_matrices_as_output_major_halves() {
+        let bytes = sample();
+        let mut tensors = SafeTensors::from_bytes(&bytes).expect("parse");
+        let half = |value: f32| crate::half::f32_to_f16(value);
+        assert_eq!(
+            tensors.load_matrix_f16("weight", 2, 2).expect("f16 matrix"),
+            vec![half(1.0), half(-2.0), half(3.5), half(4.25)]
+        );
+        let mut tensors = SafeTensors::from_bytes(&bytes).expect("parse");
+        assert_eq!(
+            tensors
+                .load_matrix_transposed_f16("weight", 2, 2)
+                .expect("transposed f16 matrix"),
+            vec![half(1.0), half(3.5), half(-2.0), half(4.25)]
         );
     }
 
