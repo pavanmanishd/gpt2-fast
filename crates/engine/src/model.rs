@@ -345,8 +345,11 @@ thread_local! {
 }
 
 struct KvCache {
+    // One contiguous block per head, so a head's keys (and values) for every
+    // position sit next to each other instead of one n_embd stride apart.
     keys: Vec<Vec<f32>>,
     values: Vec<Vec<f32>>,
+    capacity: usize,
     len: usize,
 }
 
@@ -360,18 +363,39 @@ impl KvCache {
         KvCache {
             keys: vec![vec![0.0; size]; config.n_layer],
             values: vec![vec![0.0; size]; config.n_layer],
+            capacity: positions,
             len: 0,
         }
     }
 
-    fn store(&mut self, layer: usize, start: usize, qkv: &[f32], n: usize, n_embd: usize) {
+    fn head_stride(&self, head_dim: usize) -> usize {
+        self.capacity * head_dim
+    }
+
+    fn store(
+        &mut self,
+        layer: usize,
+        start: usize,
+        qkv: &[f32],
+        n: usize,
+        n_embd: usize,
+        n_head: usize,
+    ) {
+        let head_dim = n_embd / n_head;
+        let head_stride = self.capacity * head_dim;
         for offset in 0..n {
-            let cached = (start + offset) * n_embd..(start + offset + 1) * n_embd;
+            let position = (start + offset) * head_dim;
             let source = offset * 3 * n_embd;
-            self.keys[layer][cached.clone()]
-                .copy_from_slice(&qkv[source + n_embd..source + 2 * n_embd]);
-            self.values[layer][cached]
-                .copy_from_slice(&qkv[source + 2 * n_embd..source + 3 * n_embd]);
+            for head in 0..n_head {
+                let base = head * head_dim;
+                let target = head * head_stride + position;
+                self.keys[layer][target..target + head_dim].copy_from_slice(
+                    &qkv[source + n_embd + base..source + n_embd + base + head_dim],
+                );
+                self.values[layer][target..target + head_dim].copy_from_slice(
+                    &qkv[source + 2 * n_embd + base..source + 2 * n_embd + base + head_dim],
+                );
+            }
         }
     }
 }
@@ -1467,12 +1491,19 @@ impl Layer {
             activation_data,
             activation_scale,
         );
-        cache.store(index, start, &qkv[..n * 3 * n_embd], n, n_embd);
+        cache.store(
+            index,
+            start,
+            &qkv[..n * 3 * n_embd],
+            n,
+            n_embd,
+            config.n_head,
+        );
         attention(
             threads,
             &qkv[..n * 3 * n_embd],
-            &cache.keys[index],
-            &cache.values[index],
+            cache,
+            index,
             n,
             start,
             config,
@@ -1592,6 +1623,7 @@ impl Layer {
                 &qkv[row * 3 * n_embd..(row + 1) * 3 * n_embd],
                 1,
                 n_embd,
+                config.n_head,
             );
         }
         attention_batch(
@@ -1664,6 +1696,7 @@ struct Attention<'a> {
     qkv: &'a [f32],
     keys: &'a [f32],
     values: &'a [f32],
+    head_stride: usize,
     start: usize,
     n_embd: usize,
     head_dim: usize,
@@ -1672,15 +1705,14 @@ struct Attention<'a> {
 
 impl Attention<'_> {
     fn head(&self, scores: &mut [f32], head: usize, row: usize, output: &mut [f32]) {
-        let base = head * self.head_dim;
-        let query = row * 3 * self.n_embd + base;
+        let base = head * self.head_stride;
+        let query = row * 3 * self.n_embd + head * self.head_dim;
         let end = self.start + row + 1;
+        let query = &self.qkv[query..query + self.head_dim];
+        let keys = &self.keys[base..];
         for (past, score) in scores[..end].iter_mut().enumerate() {
-            let key = past * self.n_embd + base;
-            *score = dot(
-                &self.qkv[query..query + self.head_dim],
-                &self.keys[key..key + self.head_dim],
-            ) * self.scale;
+            let key = past * self.head_dim;
+            *score = dot(query, &keys[key..key + self.head_dim]) * self.scale;
         }
 
         let max = scores[..end]
@@ -1696,7 +1728,7 @@ impl Attention<'_> {
             *score /= sum;
         }
 
-        weighted_sum(&self.values[base..], self.n_embd, &scores[..end], output);
+        weighted_sum(&self.values[base..], self.head_dim, &scores[..end], output);
     }
 }
 
@@ -1704,8 +1736,8 @@ impl Attention<'_> {
 fn attention(
     threads: &Threads,
     qkv: &[f32],
-    keys: &[f32],
-    values: &[f32],
+    cache: &KvCache,
+    layer: usize,
     n: usize,
     start: usize,
     config: &Config,
@@ -1715,8 +1747,9 @@ fn attention(
     let head_dim = n_embd / config.n_head;
     let kernel = Attention {
         qkv,
-        keys,
-        values,
+        keys: &cache.keys[layer],
+        values: &cache.values[layer],
+        head_stride: cache.head_stride(head_dim),
         start,
         n_embd,
         head_dim,
@@ -1741,7 +1774,6 @@ fn attention(
         });
         return;
     }
-
     // Row r scores r + 1 keys, so equal row counts make the last thread do almost
     // eight times the work of the first; split at equal cumulative key counts.
     let count = threads.count();
@@ -1790,17 +1822,17 @@ struct BatchAttention<'a> {
 
 impl BatchAttention<'_> {
     fn unit(&self, scores: &mut [f32], row: usize, head: usize, output: &mut [f32]) {
-        let base = head * self.head_dim;
-        let query = row * 3 * self.n_embd + base;
         let cache = &self.caches[row];
+        let head_stride = cache.head_stride(self.head_dim);
+        let base = head * head_stride;
+        let query = row * 3 * self.n_embd + head * self.head_dim;
         let end = cache.len + 1;
         let keys = &cache.keys[self.layer];
+        let query = &self.qkv[query..query + self.head_dim];
+        let keys = &keys[base..];
         for (past, score) in scores[..end].iter_mut().enumerate() {
-            let key = past * self.n_embd + base;
-            *score = dot(
-                &self.qkv[query..query + self.head_dim],
-                &keys[key..key + self.head_dim],
-            ) * self.scale;
+            let key = past * self.head_dim;
+            *score = dot(query, &keys[key..key + self.head_dim]) * self.scale;
         }
 
         let max = scores[..end]
@@ -1818,7 +1850,7 @@ impl BatchAttention<'_> {
 
         weighted_sum(
             &cache.values[self.layer][base..],
-            self.n_embd,
+            self.head_dim,
             &scores[..end],
             output,
         );

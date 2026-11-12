@@ -1393,6 +1393,24 @@ mod neon {
 
         let values = values.as_ptr();
         let mut offset = 0;
+        while offset + 64 <= width {
+            // SAFETY: `offset + 64 <= width <= stride`, so each row read is inside
+            // `values`, and `output` has `width >= offset + 64` elements.
+            unsafe {
+                let mut acc = [vdupq_n_f32(0.0); 16];
+                for (past, &weight) in weights.iter().enumerate() {
+                    let row = values.add(past * stride + offset);
+                    let weight = vdupq_n_f32(weight);
+                    for (c, acc_c) in acc.iter_mut().enumerate() {
+                        *acc_c = vfmaq_f32(*acc_c, weight, vld1q_f32(row.add(c * 4)));
+                    }
+                }
+                for (c, acc_c) in acc.iter().enumerate() {
+                    vst1q_f32(output.as_mut_ptr().add(offset + c * 4), *acc_c);
+                }
+            }
+            offset += 64;
+        }
         while offset + 32 <= width {
             // SAFETY: `offset + 32 <= width <= stride`, so each row read is inside
             // `values`, and `output` has `width >= offset + 32` elements.
