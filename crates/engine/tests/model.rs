@@ -106,6 +106,40 @@ fn next_token_logprobs_match_the_logits_of_each_prefix() {
 }
 
 #[test]
+fn reusing_the_scratch_across_prompts_matches_a_fresh_model() {
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping model test: {} is missing", dir.display());
+        return;
+    }
+    let tokenizer = Tokenizer::load(&dir).expect("tokenizer loads");
+    let first = tokenizer.encode("Hello, my name is");
+    let second = tokenizer.encode("The quick brown fox jumps over the lazy dog");
+
+    for (weights, activations) in [
+        (Weights::F32, Activations::F32),
+        (Weights::Int8, Activations::Int8),
+    ] {
+        let reused = Model::load_with_activations(&dir, weights, activations).expect("model loads");
+        let mut ignored = Vec::new();
+        reused.generate(&first, 8, |token| ignored.push(token));
+        let mut actual = Vec::new();
+        reused.generate(&second, 8, |token| actual.push(token));
+
+        let fresh = Model::load_with_activations(&dir, weights, activations).expect("model loads");
+        let mut expected = Vec::new();
+        fresh.generate(&second, 8, |token| expected.push(token));
+        assert_eq!(
+            actual,
+            expected,
+            "{:?} {:?}",
+            weights.name(),
+            activations.name()
+        );
+    }
+}
+
+#[test]
 fn int8_activations_stay_close_to_int8_weights() {
     let dir = model_dir();
     if !dir.join("model.safetensors").exists() {

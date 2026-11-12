@@ -286,6 +286,8 @@ pub struct Model {
     logits_activations: Activations,
     logits_outliers: usize,
     int8_activation_kernels: Int8ActivationKernels,
+    scratch: RefCell<Option<Scratch>>,
+    batch_scratch: RefCell<Option<BatchScratch>>,
 }
 
 struct Layer {
@@ -343,22 +345,46 @@ struct Workspace {
 }
 
 impl Workspace {
-    fn new(config: &Config, n: usize) -> Workspace {
-        let n_embd = config.n_embd;
+    fn empty() -> Workspace {
         Workspace {
-            x: vec![0.0; n * n_embd],
-            projected: vec![0.0; n * n_embd],
-            normed: vec![0.0; n * n_embd],
-            qkv: vec![0.0; n * 3 * n_embd],
-            hidden: vec![0.0; n * 4 * n_embd],
-            logits: vec![0.0; config.vocab_size],
-            // One padded row plus the bytes that round a row up to whole blocks.
-            activation_data: vec![0; n * 4 * n_embd + 4 * n_embd + 8 * (n + 1)],
-            // Enough scales for the smallest activation group this model allows.
-            activation_scale: vec![0.0; n * 4 * n_embd / 16],
-            outlier_index: vec![0; n * n_embd],
-            outlier_value: vec![0.0; n * n_embd],
+            x: Vec::new(),
+            projected: Vec::new(),
+            normed: Vec::new(),
+            qkv: Vec::new(),
+            hidden: Vec::new(),
+            logits: Vec::new(),
+            activation_data: Vec::new(),
+            activation_scale: Vec::new(),
+            outlier_index: Vec::new(),
+            outlier_value: Vec::new(),
         }
+    }
+
+    // Every buffer is written before it is read, so growing only has to add
+    // capacity, never restore old contents.
+    fn ensure(&mut self, config: &Config, rows: usize) {
+        let n_embd = config.n_embd;
+        let grow = |values: &mut Vec<f32>, len: usize| {
+            if values.len() < len {
+                values.resize(len, 0.0);
+            }
+        };
+        grow(&mut self.x, rows * n_embd);
+        grow(&mut self.projected, rows * n_embd);
+        grow(&mut self.normed, rows * n_embd);
+        grow(&mut self.qkv, rows * 3 * n_embd);
+        grow(&mut self.hidden, rows * 4 * n_embd);
+        grow(&mut self.logits, config.vocab_size);
+        let activation_data = rows * 4 * n_embd + 4 * n_embd + 8 * (rows + 1);
+        if self.activation_data.len() < activation_data {
+            self.activation_data.resize(activation_data, 0);
+        }
+        let activation_scale = rows * 4 * n_embd / 16;
+        grow(&mut self.activation_scale, activation_scale);
+        if self.outlier_index.len() < rows * n_embd {
+            self.outlier_index.resize(rows * n_embd, 0);
+        }
+        grow(&mut self.outlier_value, rows * n_embd);
     }
 }
 
@@ -378,18 +404,25 @@ struct KvCache {
 }
 
 impl KvCache {
-    fn new(config: &Config) -> KvCache {
-        KvCache::with_capacity(config, config.n_ctx)
-    }
-
-    fn with_capacity(config: &Config, positions: usize) -> KvCache {
-        let size = positions * config.n_embd;
+    fn empty() -> KvCache {
         KvCache {
-            keys: vec![vec![0.0; size]; config.n_layer],
-            values: vec![vec![0.0; size]; config.n_layer],
-            capacity: positions,
+            keys: Vec::new(),
+            values: Vec::new(),
+            capacity: 0,
             len: 0,
         }
+    }
+
+    // Every position is written by `store` before attention reads it, so a
+    // reused cache only has to be large enough and reset, never zeroed.
+    fn ensure(&mut self, config: &Config, positions: usize) {
+        if self.capacity < positions {
+            let size = positions * config.n_embd;
+            self.keys = (0..config.n_layer).map(|_| vec![0.0; size]).collect();
+            self.values = (0..config.n_layer).map(|_| vec![0.0; size]).collect();
+            self.capacity = positions;
+        }
+        self.len = 0;
     }
 
     fn head_stride(&self, head_dim: usize) -> usize {
@@ -426,6 +459,34 @@ impl KvCache {
 
 fn weight_entry(tensors: &mut Vec<serde_json::Value>, name: String, shape: Vec<usize>, int8: bool) {
     tensors.push(json!({"name": name, "shape": shape, "int8": int8}));
+}
+
+struct Scratch {
+    cache: KvCache,
+    workspace: Workspace,
+}
+
+impl Scratch {
+    fn empty() -> Scratch {
+        Scratch {
+            cache: KvCache::empty(),
+            workspace: Workspace::empty(),
+        }
+    }
+}
+
+struct BatchScratch {
+    caches: Vec<KvCache>,
+    workspace: Workspace,
+}
+
+impl BatchScratch {
+    fn empty() -> BatchScratch {
+        BatchScratch {
+            caches: Vec::new(),
+            workspace: Workspace::empty(),
+        }
+    }
 }
 
 impl Model {
@@ -551,7 +612,36 @@ impl Model {
             },
             logits_outliers: 4,
             int8_activation_kernels: Int8ActivationKernels::detect(),
+            scratch: RefCell::new(Some(Scratch::empty())),
+            batch_scratch: RefCell::new(Some(BatchScratch::empty())),
         })
+    }
+
+    // Taking the scratch out means a callback that calls back into the model
+    // gets a fresh one instead of a double borrow.
+    fn with_scratch<T>(&self, run: impl FnOnce(&mut KvCache, &mut Workspace) -> T) -> T {
+        let mut scratch = self
+            .scratch
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(Scratch::empty);
+        let result = run(&mut scratch.cache, &mut scratch.workspace);
+        *self.scratch.borrow_mut() = Some(scratch);
+        result
+    }
+
+    fn with_batch_scratch<T>(
+        &self,
+        run: impl FnOnce(&mut Vec<KvCache>, &mut Workspace) -> T,
+    ) -> T {
+        let mut scratch = self
+            .batch_scratch
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(BatchScratch::empty);
+        let result = run(&mut scratch.caches, &mut scratch.workspace);
+        *self.batch_scratch.borrow_mut() = Some(scratch);
+        result
     }
 
     pub fn config(&self) -> &Config {
@@ -726,11 +816,12 @@ impl Model {
             self.config.n_ctx
         );
 
-        let mut cache = KvCache::new(&self.config);
-        let mut workspace = Workspace::new(&self.config, n);
-        self.forward(ids, 0, &mut cache, &mut workspace);
-        self.last_logits(&mut workspace, n);
-        workspace.logits
+        self.with_scratch(|cache, workspace| {
+            cache.ensure(&self.config, n);
+            workspace.ensure(&self.config, n);
+            self.forward(ids, 0, cache, workspace);
+            self.last_logits(workspace, n).to_vec()
+        })
     }
 
     pub fn generate(&self, ids: &[u32], max_new_tokens: usize, mut on_token: impl FnMut(u32)) {
@@ -745,17 +836,19 @@ impl Model {
             return;
         }
 
-        let mut cache = KvCache::new(&self.config);
-        let mut workspace = Workspace::new(&self.config, n);
-        self.forward(ids, 0, &mut cache, &mut workspace);
-        let mut next = argmax(self.last_logits(&mut workspace, n));
-        on_token(next);
-
-        for _ in 1..max_new_tokens {
-            self.forward(&[next], cache.len, &mut cache, &mut workspace);
-            next = argmax(self.last_logits(&mut workspace, 1));
+        self.with_scratch(|cache, workspace| {
+            cache.ensure(&self.config, n + max_new_tokens);
+            workspace.ensure(&self.config, n);
+            self.forward(ids, 0, cache, workspace);
+            let mut next = argmax(self.last_logits(workspace, n));
             on_token(next);
-        }
+
+            for _ in 1..max_new_tokens {
+                self.forward(&[next], cache.len, cache, workspace);
+                next = argmax(self.last_logits(workspace, 1));
+                on_token(next);
+            }
+        });
     }
 
     pub fn generate_batch(
@@ -783,24 +876,29 @@ impl Model {
         }
 
         let capacity = prompts.iter().map(|prompt| prompt.len()).max().unwrap_or(0);
-        let mut workspace = Workspace::new(&self.config, capacity.max(rows));
-        let mut caches: Vec<KvCache> = prompts
-            .iter()
-            .map(|prompt| KvCache::with_capacity(&self.config, prompt.len() + max_new_tokens))
-            .collect();
-        let mut tokens = Vec::with_capacity(rows);
-        for (prompt, cache) in prompts.iter().zip(caches.iter_mut()) {
-            self.forward(prompt, 0, cache, &mut workspace);
-            tokens.push(argmax(self.last_logits(&mut workspace, prompt.len())));
-        }
+        self.with_batch_scratch(|caches, workspace| {
+            while caches.len() < rows {
+                caches.push(KvCache::empty());
+            }
+            for (prompt, cache) in prompts.iter().zip(caches.iter_mut()) {
+                cache.ensure(&self.config, prompt.len() + max_new_tokens);
+            }
+            workspace.ensure(&self.config, capacity.max(rows));
 
-        let zero_bias = vec![0.0; self.config.vocab_size];
-        on_tokens(&tokens);
-        for _ in 1..max_new_tokens {
-            self.forward_batch(&tokens, &mut caches, &mut workspace);
-            self.next_tokens_batch(&mut workspace, rows, &zero_bias, &mut tokens);
+            let mut tokens = Vec::with_capacity(rows);
+            for (prompt, cache) in prompts.iter().zip(caches.iter_mut()) {
+                self.forward(prompt, 0, cache, workspace);
+                tokens.push(argmax(self.last_logits(workspace, prompt.len())));
+            }
+
+            let zero_bias = vec![0.0; self.config.vocab_size];
             on_tokens(&tokens);
-        }
+            for _ in 1..max_new_tokens {
+                self.forward_batch(&tokens, &mut caches[..rows], workspace);
+                self.next_tokens_batch(workspace, rows, &zero_bias, &mut tokens);
+                on_tokens(&tokens);
+            }
+        });
     }
 
     fn forward_batch(&self, tokens: &[u32], caches: &mut [KvCache], workspace: &mut Workspace) {
@@ -1057,20 +1155,17 @@ impl Model {
             return Vec::new();
         }
 
-        let mut cache = KvCache::new(&self.config);
-        let mut workspace = Workspace::new(&self.config, 1);
-        let mut logprobs = Vec::with_capacity(n - 1);
-        for position in 0..n - 1 {
-            self.forward(
-                &ids[position..=position],
-                cache.len,
-                &mut cache,
-                &mut workspace,
-            );
-            let logits = self.last_logits(&mut workspace, 1);
-            logprobs.push(log_probability(logits, ids[position + 1]));
-        }
-        logprobs
+        self.with_scratch(|cache, workspace| {
+            cache.ensure(&self.config, n);
+            workspace.ensure(&self.config, 1);
+            let mut logprobs = Vec::with_capacity(n - 1);
+            for position in 0..n - 1 {
+                self.forward(&ids[position..=position], cache.len, cache, workspace);
+                let logits = self.last_logits(workspace, 1);
+                logprobs.push(log_probability(logits, ids[position + 1]));
+            }
+            logprobs
+        })
     }
 }
 
