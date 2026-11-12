@@ -5,7 +5,11 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::parallel::Threads;
-use crate::quantize::{quantize_activation_outliers, quantize_activations, GROUP_SIZE};
+use crate::int8_layout;
+use crate::quantize::{
+    quantize_activation_outliers, quantize_activations, quantize_activations_interleaved,
+    GROUP_SIZE,
+};
 use crate::safetensors::SafeTensors;
 use crate::simd::{
     dot, gelu_exact, gelu_in_place, int8_linear_outputs, int8_linear_rows, linear_outputs,
@@ -130,9 +134,9 @@ impl Matrix {
     }
 
     fn add_row_to(&self, row: usize, len: usize, addend: &[f32], out: &mut [f32]) {
-        let start = row * len;
         match self {
             Matrix::F32(data) => {
+                let start = row * len;
                 for (d, value) in out.iter_mut().enumerate() {
                     *value = data[start + d] + addend[d];
                 }
@@ -140,8 +144,14 @@ impl Matrix {
             Matrix::Int8 { data, scale } => {
                 let groups = len.div_ceil(GROUP_SIZE);
                 let scale = &scale[row * groups..(row + 1) * groups];
-                for (d, value) in out.iter_mut().enumerate() {
-                    *value = data[start + d] as f32 * scale[d / GROUP_SIZE] + addend[d];
+                for block in 0..int8_layout::blocks(len) {
+                    let first = block * int8_layout::BLOCK;
+                    let count = (len - first).min(int8_layout::BLOCK);
+                    let at = int8_layout::block_offset(len, row, first);
+                    for offset in 0..count {
+                        let d = first + offset;
+                        out[d] = data[at + offset] as f32 * scale[d / GROUP_SIZE] + addend[d];
+                    }
                 }
             }
         }
@@ -156,42 +166,49 @@ impl Matrix {
             Matrix::F32(data) => data.clone(),
             Matrix::Int8 { data, scale } => {
                 let groups = n_in.div_ceil(GROUP_SIZE);
-                data.iter()
-                    .enumerate()
-                    .map(|(index, &value)| {
-                        let column = index % n_in;
-                        let row = index / n_in;
-                        value as f32 * scale[row * groups + column / GROUP_SIZE]
-                    })
-                    .collect()
+                let rows = scale.len() / groups;
+                let mut values = Vec::with_capacity(rows * n_in);
+                let mut row_bytes = vec![0i8; n_in];
+                for row in 0..rows {
+                    int8_layout::read_row(data, n_in, row, &mut row_bytes);
+                    let scale = &scale[row * groups..(row + 1) * groups];
+                    values.extend(
+                        row_bytes
+                            .iter()
+                            .enumerate()
+                            .map(|(column, &value)| {
+                                value as f32 * scale[column / GROUP_SIZE]
+                            }),
+                    );
+                }
+                values
             }
         }
     }
 
     fn pack_int8(&self, n_in: usize) -> Option<Vec<u32>> {
-        let Matrix::Int8 { data, .. } = self else {
+        let Matrix::Int8 { data, scale } = self else {
             return None;
         };
         if !n_in.is_multiple_of(4) {
             return None;
         }
-        let (words, remainder) = data.as_chunks::<4>();
-        if !remainder.is_empty() {
-            return None;
+        let groups = n_in.div_ceil(GROUP_SIZE);
+        let rows = scale.len() / groups;
+        let mut words = Vec::with_capacity(rows * n_in / 4);
+        let mut row_bytes = vec![0i8; n_in];
+        for row in 0..rows {
+            int8_layout::read_row(data, n_in, row, &mut row_bytes);
+            words.extend(row_bytes.as_chunks::<4>().0.iter().map(|bytes| {
+                u32::from_le_bytes([
+                    bytes[0] as u8,
+                    bytes[1] as u8,
+                    bytes[2] as u8,
+                    bytes[3] as u8,
+                ])
+            }));
         }
-        Some(
-            words
-                .iter()
-                .map(|bytes| {
-                    u32::from_le_bytes([
-                        bytes[0] as u8,
-                        bytes[1] as u8,
-                        bytes[2] as u8,
-                        bytes[3] as u8,
-                    ])
-                })
-                .collect(),
-        )
+        Some(words)
     }
 
     fn scales(&self) -> Option<&[f32]> {
@@ -222,7 +239,10 @@ fn load_matrix(
                 }
                 None => tensors.quantize_transposed(name, n_in, n_out)?,
             };
-            Ok(Matrix::Int8 { data, scale })
+            Ok(Matrix::Int8 {
+                data: int8_layout::interleave_owned(n_out, n_in, data),
+                scale,
+            })
         }
     }
 }
@@ -245,7 +265,10 @@ fn load_embedding(
                 }
                 None => tensors.quantize_rows(name, rows, cols)?,
             };
-            Ok(Matrix::Int8 { data, scale })
+            Ok(Matrix::Int8 {
+                data: int8_layout::interleave_owned(rows, cols, data),
+                scale,
+            })
         }
     }
 }
@@ -329,7 +352,8 @@ impl Workspace {
             qkv: vec![0.0; n * 3 * n_embd],
             hidden: vec![0.0; n * 4 * n_embd],
             logits: vec![0.0; config.vocab_size],
-            activation_data: vec![0; n * 4 * n_embd],
+            // One padded row plus the bytes that round a row up to whole blocks.
+            activation_data: vec![0; n * 4 * n_embd + 4 * n_embd + 8 * (n + 1)],
             // Enough scales for the smallest activation group this model allows.
             activation_scale: vec![0.0; n * 4 * n_embd / 16],
             outlier_index: vec![0; n * n_embd],
@@ -852,8 +876,14 @@ impl Model {
                     indices: &workspace.outlier_index[row * n_embd..row * n_embd + count],
                     values: &workspace.outlier_value[row * n_embd..row * n_embd + count],
                 }));
+                let activation_len = int8_layout::storage_len(rows, n_embd);
+                int8_layout::interleave_in_place(
+                    rows,
+                    n_embd,
+                    &mut workspace.activation_data[..activation_len],
+                );
                 Some(QuantizedRowActs {
-                    data: &workspace.activation_data[..rows * n_embd],
+                    data: &workspace.activation_data[..activation_len],
                     scale: &workspace.activation_scale[..rows * groups],
                     group: mode.group,
                     kernels: mode.kernels,
@@ -886,7 +916,7 @@ impl Model {
                     Some(acts) => acts.kernels.linear_rows(
                         acts.data,
                         acts.scale,
-                        &data[start * n_embd..],
+                        &data[(start / 2) * int8_layout::pair_stride(n_embd)..],
                         &scale[start * weight_groups..],
                         &zero_bias[start..],
                         rows,
@@ -1374,17 +1404,33 @@ fn linear_int8_activations(
     split: RowSplit,
 ) {
     let groups = n_in.div_ceil(mode.group);
-    quantize_activations(
-        &x[..rows * n_in],
-        rows,
-        n_in,
-        mode.group,
-        &mut activation_data[..rows * n_in],
-        &mut activation_scale[..rows * groups],
-    );
+    if rows == 1 {
+        quantize_activations(
+            &x[..rows * n_in],
+            rows,
+            n_in,
+            mode.group,
+            &mut activation_data[..rows * n_in],
+            &mut activation_scale[..rows * groups],
+        );
+    } else {
+        quantize_activations_interleaved(
+            &x[..rows * n_in],
+            rows,
+            n_in,
+            mode.group,
+            activation_data,
+            &mut activation_scale[..rows * groups],
+        );
+    }
     let with_gelu = matches!(epilogue, Epilogue::Gelu);
+    let activation_len = if rows == 1 {
+        n_in
+    } else {
+        int8_layout::storage_len(rows, n_in)
+    };
     let acts = QuantizedActs {
-        data: &activation_data[..rows * n_in],
+        data: &activation_data[..activation_len],
         scale: &activation_scale[..rows * groups],
         group: mode.group,
         kernels: mode.kernels,
@@ -1413,11 +1459,12 @@ fn linear_int8_activations(
             }
         });
     } else if split == RowSplit::ByOutput {
+        let stride = int8_layout::pair_stride(n_in);
         run_output_split(threads, rows, n_out, y, |start, outputs, part| {
             acts.kernels.linear_rows(
                 acts.data,
                 acts.scale,
-                &weight[start * n_in..],
+                &weight[(start / 2) * stride..],
                 &scale[start * weight_groups..],
                 &bias[start..],
                 rows,
@@ -1435,11 +1482,13 @@ fn linear_int8_activations(
             }
         });
     } else {
-        threads.run(y, n_out, |start, part| {
+        let stride = int8_layout::pair_stride(n_in);
+        threads.run(y, 2 * n_out, |start, part| {
             let first = start / n_out;
             let count = part.len() / n_out;
+            debug_assert!(first.is_multiple_of(2), "row split must keep pairs whole");
             acts.kernels.linear_rows(
-                &acts.data[first * n_in..(first + count) * n_in],
+                &acts.data[(first / 2) * stride..],
                 &acts.scale[first * groups..(first + count) * groups],
                 weight,
                 scale,
@@ -2036,6 +2085,7 @@ fn layer_norm_into(x: &[f32], weight: &[f32], bias: &[f32], eps: f32, output: &m
 #[cfg(test)]
 mod tests {
     use super::{linear, Matrix};
+    use crate::int8_layout;
     use crate::parallel::Threads;
     use crate::simd::Epilogue;
 
@@ -2083,7 +2133,7 @@ mod tests {
     #[test]
     fn int8_matrices_dequantize_and_pack_for_the_gpu_loader() {
         let matrix = Matrix::Int8 {
-            data: vec![-128, -1, 0, 1, 2, 3, 4, 5],
+            data: int8_layout::interleave_owned(2, 4, vec![-128, -1, 0, 1, 2, 3, 4, 5]),
             scale: vec![0.5, 0.25],
         };
         assert_eq!(
@@ -2099,6 +2149,62 @@ mod tests {
         );
         assert_eq!(matrix.scales(), Some(&[0.5, 0.25][..]));
         assert!(matrix.pack_int8(3).is_none());
+    }
+
+    #[test]
+    fn int8_matrix_accessors_undo_the_pair_layout() {
+        let (rows, n_in) = (5usize, 13usize);
+        let plain: Vec<i8> = (0..rows * n_in)
+            .map(|i| ((i * 37 + 5) % 255) as i32 - 127)
+            .map(|value| value as i8)
+            .collect();
+        let scale = vec![0.25f32; rows];
+        let matrix = Matrix::Int8 {
+            data: int8_layout::interleave_owned(rows, n_in, plain.clone()),
+            scale: scale.clone(),
+        };
+
+        let dequantized = matrix.to_f32(n_in);
+        for row in 0..rows {
+            for column in 0..n_in {
+                assert_eq!(
+                    dequantized[row * n_in + column],
+                    plain[row * n_in + column] as f32 * 0.25
+                );
+            }
+        }
+
+        let addend = vec![1.0f32; n_in];
+        for row in 0..rows {
+            let mut out = vec![0.0f32; n_in];
+            matrix.add_row_to(row, n_in, &addend, &mut out);
+            for column in 0..n_in {
+                assert_eq!(out[column], plain[row * n_in + column] as f32 * 0.25 + 1.0);
+            }
+        }
+
+        let (packed_rows, packed_in) = (3usize, 12usize);
+        let packed: Vec<i8> = (0..packed_rows * packed_in)
+            .map(|i| ((i * 29 + 7) % 255) as i32 - 127)
+            .map(|value| value as i8)
+            .collect();
+        let matrix = Matrix::Int8 {
+            data: int8_layout::interleave_owned(packed_rows, packed_in, packed.clone()),
+            scale: vec![0.0f32; packed_rows],
+        };
+        let words = matrix.pack_int8(packed_in).expect("packed");
+        let mut expected = Vec::new();
+        for row in 0..packed_rows {
+            for column in (0..packed_in).step_by(4) {
+                expected.push(u32::from_le_bytes([
+                    packed[row * packed_in + column] as u8,
+                    packed[row * packed_in + column + 1] as u8,
+                    packed[row * packed_in + column + 2] as u8,
+                    packed[row * packed_in + column + 3] as u8,
+                ]));
+            }
+        }
+        assert_eq!(words, expected);
     }
 
     #[test]

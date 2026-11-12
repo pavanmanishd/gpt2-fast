@@ -155,12 +155,67 @@ pub(crate) fn add_scaled_dot(
 // Removed activations keep their exact value, so they are added back in ascending
 // input order for the scalar and vector kernels to produce the same bits.
 #[inline]
-fn add_outliers(total: f32, outliers: Outliers, weight: &[i8], weight_scale: &[f32]) -> f32 {
+fn add_outliers(
+    total: f32,
+    outliers: Outliers,
+    weight: &[i8],
+    weight_scale: &[f32],
+    n_in: usize,
+    row: usize,
+) -> f32 {
+    let weight_groups = n_in.div_ceil(crate::quantize::GROUP_SIZE);
+    let stride = crate::int8_layout::pair_stride(n_in);
+    let base = (row / 2) * stride + (row % 2) * crate::int8_layout::BLOCK;
+    let scale = &weight_scale[row * weight_groups..(row + 1) * weight_groups];
     let mut total = total;
     for (&index, &value) in outliers.indices.iter().zip(outliers.values) {
         let index = index as usize;
-        let group = index / crate::quantize::GROUP_SIZE;
-        total += value * (weight_scale[group] * weight[index] as f32);
+        let at = base
+            + (index / crate::int8_layout::BLOCK) * 2 * crate::int8_layout::BLOCK
+            + index % crate::int8_layout::BLOCK;
+        total += value
+            * (scale[index / crate::quantize::GROUP_SIZE] * weight[at] as f32);
+    }
+    total
+}
+
+// The two rows of an output pair share every outlier, so one weight block read
+// serves both corrections while each row still adds them in index order. The
+// block offset and weight group of an outlier are the same for every output
+// row, so the caller resolves them once.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn add_outliers_pair(
+    total: [f32; 2],
+    outliers: &[(usize, usize, f32)],
+    weight: &[i8],
+    weight_scale: &[f32],
+    n_in: usize,
+    row: usize,
+) -> [f32; 2] {
+    let weight_groups = n_in.div_ceil(crate::quantize::GROUP_SIZE);
+    let stride = crate::int8_layout::pair_stride(n_in);
+    let base = (row / 2) * stride;
+    let first = &weight_scale[row * weight_groups..(row + 1) * weight_groups];
+    let second = &weight_scale[(row + 1) * weight_groups..(row + 2) * weight_groups];
+    let mut total = total;
+    let apply = |total: &mut [f32; 2], offset: usize, group: usize, value: f32| {
+        let at = base + offset;
+        total[0] += value * (first[group] * weight[at] as f32);
+        total[1] += value * (second[group] * weight[at + crate::int8_layout::BLOCK] as f32);
+    };
+    match outliers {
+        [(o0, g0, v0), (o1, g1, v1), (o2, g2, v2), (o3, g3, v3)] => {
+            apply(&mut total, *o0, *g0, *v0);
+            apply(&mut total, *o1, *g1, *v1);
+            apply(&mut total, *o2, *g2, *v2);
+            apply(&mut total, *o3, *g3, *v3);
+        }
+        _ => {
+            for &(offset, group, value) in outliers {
+                apply(&mut total, offset, group, value);
+            }
+        }
     }
     total
 }
@@ -169,6 +224,7 @@ mod int8_activations {
     use std::ops::Range;
 
     use super::{add_outliers, add_scaled_dot, finish, Epilogue, Outliers};
+    use crate::int8_layout;
     use crate::quantize::GROUP_SIZE;
 
     #[allow(clippy::too_many_arguments)]
@@ -195,18 +251,18 @@ mod int8_activations {
 
         let with_gelu = matches!(epilogue, Epilogue::Gelu);
         for (offset, row) in outputs.enumerate() {
-            let weight_row = &weight[row * n_in..(row + 1) * n_in];
             let scale_row = &weight_scale[row * weight_groups..(row + 1) * weight_groups];
             let mut sum = row_value(
-                activations,
+                |p| activations[p],
                 activation_scale,
-                weight_row,
+                weight,
                 scale_row,
                 n_in,
                 group,
+                row,
             );
             if let Some(outliers) = outliers {
-                sum = add_outliers(sum, outliers, weight_row, scale_row);
+                sum = add_outliers(sum, outliers, weight, weight_scale, n_in, row);
             }
             y[offset] = finish(sum, bias.map(|bias| bias[offset]), with_gelu);
         }
@@ -241,25 +297,24 @@ mod int8_activations {
 
         let with_gelu = matches!(epilogue, Epilogue::Gelu);
         for row in 0..rows {
-            let activation_row = &activations[row * n_in..(row + 1) * n_in];
-            let scale_row =
+            let activation_scale_row =
                 &activation_scale[row * activation_groups..(row + 1) * activation_groups];
             for output in 0..n_out {
+                let weight_scale_row =
+                    &weight_scale[output * weight_groups..(output + 1) * weight_groups];
                 let sum = row_value(
-                    activation_row,
-                    scale_row,
-                    &weight[output * n_in..(output + 1) * n_in],
-                    &weight_scale[output * weight_groups..(output + 1) * weight_groups],
+                    |p| int8_layout::byte(activations, n_in, row, p),
+                    activation_scale_row,
+                    weight,
+                    weight_scale_row,
                     n_in,
                     group,
+                    output,
                 );
                 let sum = match outliers {
-                    Some(outliers) => add_outliers(
-                        sum,
-                        outliers[row],
-                        &weight[output * n_in..(output + 1) * n_in],
-                        &weight_scale[output * weight_groups..(output + 1) * weight_groups],
-                    ),
+                    Some(outliers) => {
+                        add_outliers(sum, outliers[row], weight, weight_scale, n_in, output)
+                    }
                     None => sum,
                 };
                 y[row * n_out + output] = finish(sum, Some(bias[output]), with_gelu);
@@ -267,17 +322,19 @@ mod int8_activations {
         }
     }
 
+    // The closure reads one activation byte; the weights are read through the
+    // pair layout.
     #[inline]
-    pub(super) fn row_value(
-        activations: &[i8],
+    fn row_value(
+        activation: impl Fn(usize) -> i8,
         activation_scale: &[f32],
         weight: &[i8],
         weight_scale: &[f32],
         n_in: usize,
         group: usize,
+        output: usize,
     ) -> f32 {
         let weight_groups = n_in.div_ceil(GROUP_SIZE);
-        debug_assert!(activations.len() >= n_in);
         debug_assert!(activation_scale.len() >= n_in.div_ceil(group));
         debug_assert!(weight.len() >= n_in);
         debug_assert!(weight_scale.len() >= weight_groups);
@@ -299,7 +356,8 @@ mod int8_activations {
                 let group_end = (group_start + group).min(n_in);
                 let mut dot = 0i32;
                 for p in group_start..group_end {
-                    dot += activations[p] as i32 * weight[p] as i32;
+                    dot += activation(p) as i32
+                        * int8_layout::byte(weight, n_in, output, p) as i32;
                 }
                 total = add_scaled_dot(total, dot, weight_scale, activation_scale);
             }
@@ -312,14 +370,240 @@ mod int8_activations {
 mod int8_activations_neon {
     use std::arch::aarch64::*;
 
-    use super::{add_outliers, add_scaled_dot, finish, Outliers};
+    use super::{add_outliers, add_outliers_pair, add_scaled_dot, finish, Outliers};
+    use crate::int8_layout;
     use crate::quantize::GROUP_SIZE;
 
-    const DECODE_ROWS: usize = 4;
-    const PREFILL_ROWS: usize = 2;
-    const PREFILL_OUTPUTS: usize = 8;
+    const DECODE_PAIRS: usize = 4;
     // A block of output rows stays in cache while every prompt row passes over it.
-    const PREFILL_OUTPUT_BLOCK: usize = 16;
+    const PREFILL_OUTPUT_BLOCK: usize = 32;
+    const PREFILL_ROWS: usize = 8;
+    const PREFILL_OUTPUTS: usize = 4;
+
+    #[inline]
+    #[target_feature(enable = "neon,i8mm")]
+    unsafe fn smmla(acc: int32x4_t, left: int8x16_t, right: int8x16_t) -> int32x4_t {
+        let mut out = acc;
+        std::arch::asm!(
+            "smmla {out:v}.4s, {left:v}.16b, {right:v}.16b",
+            out = inout(vreg) out,
+            left = in(vreg) left,
+            right = in(vreg) right,
+            options(pure, nomem, nostack),
+        );
+        out
+    }
+
+    // One output row against one activation row. The activation row is either
+    // `stride` bytes apart per eight columns (8 when plain, 16 when paired).
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn single_output(
+        activations: *const i8,
+        activation_stride: usize,
+        activation_scale: &[f32],
+        weight: &[i8],
+        weight_scale: &[f32],
+        bias: Option<&[f32]>,
+        n_in: usize,
+        group: usize,
+        output: usize,
+        y: &mut [f32],
+        y_base: usize,
+        bias_base: usize,
+        with_gelu: bool,
+        outliers: Option<Outliers>,
+    ) {
+        let stride = int8_layout::pair_stride(n_in);
+        let pair_base = (output / 2) * stride;
+        let half = (output % 2) * int8_layout::BLOCK;
+        let weight_groups = n_in.div_ceil(GROUP_SIZE);
+        let weight_data = weight;
+        let weight = weight.as_ptr();
+        let mut total = 0.0f32;
+
+        for weight_group in 0..weight_groups {
+            let start = weight_group * GROUP_SIZE;
+            let end = (start + GROUP_SIZE).min(n_in);
+            let weight_scale_row = *weight_scale.get_unchecked(output * weight_groups + weight_group);
+            for activation_group in start / group..=(end - 1) / group {
+                let group_start = activation_group * group;
+                let group_end = (group_start + group).min(n_in);
+                let mut acc = vdupq_n_s32(0);
+                let mut p = group_start;
+                while p + int8_layout::BLOCK <= group_end {
+                    let chunk = vld1_s8(activations.add((p / int8_layout::BLOCK) * activation_stride));
+                    let input = vcombine_s8(chunk, chunk);
+                    let weights = vld1q_s8(
+                        weight.add(pair_base + (p / int8_layout::BLOCK) * 2 * int8_layout::BLOCK),
+                    );
+                    acc = vdotq_s32(acc, input, weights);
+                    p += int8_layout::BLOCK;
+                }
+                let dot = if p == group_end {
+                    let sums = vpaddq_s32(acc, acc);
+                    if half == 0 {
+                        vgetq_lane_s32::<0>(sums)
+                    } else {
+                        vgetq_lane_s32::<1>(sums)
+                    }
+                } else {
+                    let mut lanes = [0i32; 4];
+                    vst1q_s32(lanes.as_mut_ptr(), acc);
+                    let mut dots = [lanes[0] + lanes[1], lanes[2] + lanes[3]];
+                    while p < group_end {
+                        let a = *activations.add(
+                            (p / int8_layout::BLOCK) * activation_stride + p % int8_layout::BLOCK,
+                        ) as i32;
+                        let at = pair_base
+                            + (p / int8_layout::BLOCK) * 2 * int8_layout::BLOCK
+                            + p % int8_layout::BLOCK;
+                        dots[0] += a * *weight.add(at) as i32;
+                        dots[1] += a * *weight.add(at + int8_layout::BLOCK) as i32;
+                        p += 1;
+                    }
+                    dots[(half != 0) as usize]
+                };
+                total = add_scaled_dot(
+                    total,
+                    dot,
+                    weight_scale_row,
+                    *activation_scale.get_unchecked(activation_group),
+                );
+            }
+        }
+        let total = match outliers {
+            Some(outliers) => {
+                add_outliers(total, outliers, weight_data, weight_scale, n_in, output)
+            }
+            None => total,
+        };
+        *y.get_unchecked_mut(output - y_base) = finish(
+            total,
+            bias.map(|bias| *bias.get_unchecked(output - bias_base)),
+            with_gelu,
+        );
+    }
+
+    // 2 * P output rows against one activation row, one eight-byte block at a
+    // time. One weight vector holds both rows of an output pair.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn row_outputs<const P: usize>(
+        activations: *const i8,
+        activation_stride: usize,
+        activation_scale: &[f32],
+        weight: &[i8],
+        weight_scale: &[f32],
+        bias: Option<&[f32]>,
+        n_in: usize,
+        group: usize,
+        first: usize,
+        y: &mut [f32],
+        y_base: usize,
+        bias_base: usize,
+        with_gelu: bool,
+        outliers: Option<&[(usize, usize, f32)]>,
+    ) {
+        let stride = int8_layout::pair_stride(n_in);
+        let weight_groups = n_in.div_ceil(GROUP_SIZE);
+        let weight_ptr = weight.as_ptr();
+        let mut total = [vdupq_n_f32(0.0); P];
+
+        for weight_group in 0..weight_groups {
+            let start = weight_group * GROUP_SIZE;
+            let weight_end = (start + GROUP_SIZE).min(n_in);
+            let mut scales = [[0.0f32; 4]; P];
+            for (pair, scale) in scales.iter_mut().enumerate() {
+                let output = first + 2 * pair;
+                let first_scale = *weight_scale.get_unchecked(output * weight_groups + weight_group);
+                let second_scale =
+                    *weight_scale.get_unchecked((output + 1) * weight_groups + weight_group);
+                *scale = [first_scale, second_scale, first_scale, second_scale];
+            }
+            for activation_group in start / group..=(weight_end - 1) / group {
+                let group_start = activation_group * group;
+                let group_end = (group_start + group).min(n_in);
+                let mut acc = [vdupq_n_s32(0); P];
+                let mut p = group_start;
+                while activation_stride == 8 && p + 16 <= group_end {
+                    let x16 = vld1q_s8(activations.add((p / int8_layout::BLOCK) * activation_stride));
+                    let x0 = vcombine_s8(vget_low_s8(x16), vget_low_s8(x16));
+                    let x1 = vcombine_s8(vget_high_s8(x16), vget_high_s8(x16));
+                    for (pair, accumulated) in acc.iter_mut().enumerate() {
+                        let base = ((first / 2) + pair) * stride + (p / int8_layout::BLOCK) * 16;
+                        *accumulated =
+                            vdotq_s32(*accumulated, x0, vld1q_s8(weight_ptr.add(base)));
+                        *accumulated =
+                            vdotq_s32(*accumulated, x1, vld1q_s8(weight_ptr.add(base + 16)));
+                    }
+                    p += 16;
+                }
+                while p + int8_layout::BLOCK <= group_end {
+                    let chunk =
+                        vld1_s8(activations.add((p / int8_layout::BLOCK) * activation_stride));
+                    let input = vcombine_s8(chunk, chunk);
+                    for (pair, accumulated) in acc.iter_mut().enumerate() {
+                        let weights = vld1q_s8(
+                            weight_ptr.add(
+                                ((first / 2) + pair) * stride
+                                    + (p / int8_layout::BLOCK) * 2 * int8_layout::BLOCK,
+                            ),
+                        );
+                        *accumulated = vdotq_s32(*accumulated, input, weights);
+                    }
+                    p += int8_layout::BLOCK;
+                }
+                let scale = *activation_scale.get_unchecked(activation_group);
+                for (pair, accumulated) in acc.iter().enumerate() {
+                    let sums = vpaddq_s32(*accumulated, *accumulated);
+                    let sums = if p == group_end {
+                        vcvtq_f32_s32(sums)
+                    } else {
+                        let mut dots = [0i32; 2];
+                        vst1_s32(dots.as_mut_ptr(), vget_low_s32(sums));
+                        let mut q = p;
+                        while q < group_end {
+                            let a = *activations.add(
+                                (q / int8_layout::BLOCK) * activation_stride
+                                    + q % int8_layout::BLOCK,
+                            ) as i32;
+                            let at = ((first / 2) + pair) * stride
+                                + (q / int8_layout::BLOCK) * 2 * int8_layout::BLOCK
+                                + q % int8_layout::BLOCK;
+                            dots[0] += a * *weight_ptr.add(at) as i32;
+                            dots[1] += a * *weight_ptr.add(at + int8_layout::BLOCK) as i32;
+                            q += 1;
+                        }
+                        vcvtq_f32_s32(vcombine_s32(
+                            vld1_s32(dots.as_ptr()),
+                            vdup_n_s32(0),
+                        ))
+                    };
+                    let combined = vmulq_f32(vld1q_f32(scales[pair].as_ptr()), vdupq_n_f32(scale));
+                    total[pair] = vaddq_f32(total[pair], vmulq_f32(sums, combined));
+                }
+            }
+        }
+
+        for (pair, accumulated) in total.iter().enumerate() {
+            let output = first + 2 * pair;
+            let mut sums = [0.0f32; 4];
+            vst1q_f32(sums.as_mut_ptr(), *accumulated);
+            let mut pair_sums = [sums[0], sums[1]];
+            if let Some(outliers) = outliers {
+                pair_sums = add_outliers_pair(pair_sums, outliers, weight, weight_scale, n_in, output);
+            }
+            for (lane, sum) in pair_sums.iter().enumerate() {
+                let output = output + lane;
+                *y.get_unchecked_mut(output - y_base) = finish(
+                    *sum,
+                    bias.map(|bias| *bias.get_unchecked(output - bias_base)),
+                    with_gelu,
+                );
+            }
+        }
+    }
 
     // SAFETY: the slices cover `n_in` inputs, the selected output rows' weights and
     // scales, and the outputs; the CPU has the dot-product extension.
@@ -339,116 +623,246 @@ mod int8_activations_neon {
         y: &mut [f32],
         outliers: Option<Outliers>,
     ) {
-        let weights = weight;
-        let weight_scales = weight_scale;
+        let prepared: Option<Vec<(usize, usize, f32)>> = outliers.map(|outliers| {
+            outliers
+                .indices
+                .iter()
+                .zip(outliers.values)
+                .map(|(&index, &value)| {
+                    let index = index as usize;
+                    (
+                        (index / int8_layout::BLOCK) * 2 * int8_layout::BLOCK
+                            + index % int8_layout::BLOCK,
+                        index / GROUP_SIZE,
+                        value,
+                    )
+                })
+                .collect()
+        });
+        let prepared = prepared.as_deref();
         let activations = activations.as_ptr();
-        let weight = weight.as_ptr();
-        let weight_scale = weight_scale.as_ptr();
-        let activation_scale = activation_scale.as_ptr();
-        let weight_groups = n_in.div_ceil(GROUP_SIZE);
-
-        let mut row = first;
-        while row + DECODE_ROWS <= end {
-            let mut total = [0.0f32; DECODE_ROWS];
-            for weight_group in 0..weight_groups {
-                let start = weight_group * GROUP_SIZE;
-                let weight_end = (start + GROUP_SIZE).min(n_in);
-                let mut scales = [0.0f32; DECODE_ROWS];
-                for (r, scale) in scales.iter_mut().enumerate() {
-                    *scale = *weight_scale.add((row + r) * weight_groups + weight_group);
-                }
-                for activation_group in start / group..=(weight_end - 1) / group {
-                    let group_start = activation_group * group;
-                    let group_end = (group_start + group).min(n_in);
-                    let mut acc = [vdupq_n_s32(0); DECODE_ROWS];
-                    let mut p = group_start;
-                    while p + 16 <= group_end {
-                        let input = vld1q_s8(activations.add(p));
-                        for (r, acc_r) in acc.iter_mut().enumerate() {
-                            *acc_r = vdotq_s32(
-                                *acc_r,
-                                input,
-                                vld1q_s8(weight.add((row + r) * n_in + p)),
-                            );
-                        }
-                        p += 16;
-                    }
-                    let scale = *activation_scale.add(activation_group);
-                    for (r, accumulated) in acc.iter().enumerate() {
-                        let mut dot = vaddvq_s32(*accumulated);
-                        let mut q = p;
-                        while q < group_end {
-                            dot += *activations.add(q) as i32
-                                * *weight.add((row + r) * n_in + q) as i32;
-                            q += 1;
-                        }
-                        total[r] = add_scaled_dot(total[r], dot, scales[r], scale);
-                    }
-                }
-            }
-            for (r, value) in total.iter().enumerate() {
-                let output = row + r;
-                let value = match outliers {
-                    Some(outliers) => add_outliers(
-                        *value,
-                        outliers,
-                        &weights[output * n_in..(output + 1) * n_in],
-                        &weight_scales[output * weight_groups..(output + 1) * weight_groups],
-                    ),
-                    None => *value,
-                };
-                *y.get_unchecked_mut(output - first) = finish(
-                    value,
-                    bias.map(|bias| *bias.get_unchecked(output - first)),
-                    with_gelu,
-                );
-            }
-            row += DECODE_ROWS;
-        }
-        while row < end {
-            let mut total = 0.0f32;
-            for weight_group in 0..weight_groups {
-                let start = weight_group * GROUP_SIZE;
-                let weight_end = (start + GROUP_SIZE).min(n_in);
-                let scale = *weight_scale.add(row * weight_groups + weight_group);
-                for activation_group in start / group..=(weight_end - 1) / group {
-                    let group_start = activation_group * group;
-                    let group_end = (group_start + group).min(n_in);
-                    let mut acc = vdupq_n_s32(0);
-                    let mut p = group_start;
-                    while p + 16 <= group_end {
-                        acc = vdotq_s32(
-                            acc,
-                            vld1q_s8(activations.add(p)),
-                            vld1q_s8(weight.add(row * n_in + p)),
-                        );
-                        p += 16;
-                    }
-                    let mut dot = vaddvq_s32(acc);
-                    let mut q = p;
-                    while q < group_end {
-                        dot += *activations.add(q) as i32 * *weight.add(row * n_in + q) as i32;
-                        q += 1;
-                    }
-                    total =
-                        add_scaled_dot(total, dot, scale, *activation_scale.add(activation_group));
-                }
-            }
-            let total = match outliers {
-                Some(outliers) => add_outliers(
-                    total,
-                    outliers,
-                    &weights[row * n_in..(row + 1) * n_in],
-                    &weight_scales[row * weight_groups..(row + 1) * weight_groups],
-                ),
-                None => total,
-            };
-            *y.get_unchecked_mut(row - first) = finish(
-                total,
-                bias.map(|bias| *bias.get_unchecked(row - first)),
+        let mut output = first;
+        if output % 2 == 1 {
+            single_output(
+                activations,
+                8,
+                activation_scale,
+                weight,
+                weight_scale,
+                bias,
+                n_in,
+                group,
+                output,
+                y,
+                first,
+                first,
                 with_gelu,
+                outliers,
             );
-            row += 1;
+            output += 1;
+        }
+        while output + 2 * DECODE_PAIRS <= end {
+            row_outputs::<DECODE_PAIRS>(
+                activations,
+                8,
+                activation_scale,
+                weight,
+                weight_scale,
+                bias,
+                n_in,
+                group,
+                output,
+                y,
+                first,
+                first,
+                with_gelu,
+                prepared,
+            );
+            output += 2 * DECODE_PAIRS;
+        }
+        while output + 4 <= end {
+            row_outputs::<2>(
+                activations,
+                8,
+                activation_scale,
+                weight,
+                weight_scale,
+                bias,
+                n_in,
+                group,
+                output,
+                y,
+                first,
+                first,
+                with_gelu,
+                prepared,
+            );
+            output += 4;
+        }
+        while output + 2 <= end {
+            row_outputs::<1>(
+                activations,
+                8,
+                activation_scale,
+                weight,
+                weight_scale,
+                bias,
+                n_in,
+                group,
+                output,
+                y,
+                first,
+                first,
+                with_gelu,
+                prepared,
+            );
+            output += 2;
+        }
+        while output < end {
+            single_output(
+                activations,
+                8,
+                activation_scale,
+                weight,
+                weight_scale,
+                bias,
+                n_in,
+                group,
+                output,
+                y,
+                first,
+                first,
+                with_gelu,
+                outliers,
+            );
+            output += 1;
+        }
+    }
+
+    // SAFETY: as `linear_outputs`, with `rows` activation rows.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,dotprod")]
+    pub(super) unsafe fn linear_rows_dotprod(
+        activations: &[i8],
+        activation_scale: &[f32],
+        weight: &[i8],
+        weight_scale: &[f32],
+        bias: &[f32],
+        rows: usize,
+        n_in: usize,
+        n_out: usize,
+        group: usize,
+        with_gelu: bool,
+        y: &mut [f32],
+        outliers: Option<&[Outliers]>,
+    ) {
+        if rows == 0 {
+            return;
+        }
+        let stride = int8_layout::pair_stride(n_in);
+        let activation_groups = n_in.div_ceil(group);
+        for row in 0..rows {
+            let activations = activations
+                .as_ptr()
+                .add((row / 2) * stride + (row % 2) * int8_layout::BLOCK);
+            let activation_stride = 16;
+            let activation_scale = &activation_scale[row * activation_groups..];
+            let output = &mut y[row * n_out..(row + 1) * n_out];
+            let prepared: Option<Vec<(usize, usize, f32)>> = outliers.map(|outliers| {
+                outliers[row]
+                    .indices
+                    .iter()
+                    .zip(outliers[row].values)
+                    .map(|(&index, &value)| {
+                        let index = index as usize;
+                        (
+                            (index / int8_layout::BLOCK) * 2 * int8_layout::BLOCK
+                                + index % int8_layout::BLOCK,
+                            index / GROUP_SIZE,
+                            value,
+                        )
+                    })
+                    .collect()
+            });
+            let prepared = prepared.as_deref();
+            let outliers = outliers.map(|outliers| outliers[row]);
+            let mut first = 0;
+            while first + 2 * DECODE_PAIRS <= n_out {
+                row_outputs::<DECODE_PAIRS>(
+                    activations,
+                    activation_stride,
+                    activation_scale,
+                    weight,
+                    weight_scale,
+                    Some(bias),
+                    n_in,
+                    group,
+                    first,
+                    output,
+                    0,
+                    0,
+                    with_gelu,
+                    prepared,
+                );
+                first += 2 * DECODE_PAIRS;
+            }
+            while first + 4 <= n_out {
+                row_outputs::<2>(
+                    activations,
+                    activation_stride,
+                    activation_scale,
+                    weight,
+                    weight_scale,
+                    Some(bias),
+                    n_in,
+                    group,
+                    first,
+                    output,
+                    0,
+                    0,
+                    with_gelu,
+                    prepared,
+                );
+                first += 4;
+            }
+            while first + 2 <= n_out {
+                row_outputs::<1>(
+                    activations,
+                    activation_stride,
+                    activation_scale,
+                    weight,
+                    weight_scale,
+                    Some(bias),
+                    n_in,
+                    group,
+                    first,
+                    output,
+                    0,
+                    0,
+                    with_gelu,
+                    prepared,
+                );
+                first += 2;
+            }
+            while first < n_out {
+                single_output(
+                    activations,
+                    activation_stride,
+                    activation_scale,
+                    weight,
+                    weight_scale,
+                    Some(bias),
+                    n_in,
+                    group,
+                    first,
+                    output,
+                    0,
+                    0,
+                    with_gelu,
+                    outliers,
+                );
+                first += 1;
+            }
         }
     }
 
@@ -466,182 +880,144 @@ mod int8_activations_neon {
     }
 
     impl Prefill<'_> {
-        // SAFETY: the slices cover `rows * n_in` activations, `n_out * n_in`
-        // weights, `n_out` biases and `rows * n_out` outputs; `i + R <= rows` and
-        // `j + C <= n_out`.
-        #[inline]
-        unsafe fn tile<const R: usize, const C: usize>(&self, i: usize, j: usize, y: &mut [f32]) {
-            if C == PREFILL_OUTPUTS && self.n_in.is_multiple_of(16) && self.group.is_multiple_of(16)
-            {
-                self.tile_wide::<R>(i, j, y);
-            } else {
-                self.tile_generic::<R, C>(i, j, y);
-            }
-        }
-
-        // Folding four output rows' group sums with pairwise adds and one vector
-        // multiply-add per group costs a fraction of four separate horizontal sums,
-        // and every output still adds its groups in ascending order.
-        // SAFETY: as `tile`, plus `n_in` and `group` are multiples of 16, so every
-        // group is a whole number of 16-byte chunks.
-        #[allow(clippy::needless_range_loop)]
-        #[target_feature(enable = "neon,dotprod")]
-        unsafe fn tile_wide<const R: usize>(&self, i: usize, j: usize, y: &mut [f32]) {
-            const C: usize = PREFILL_OUTPUTS;
-            let activations = self.activations.as_ptr();
-            let weight = self.weight.as_ptr();
-            let weight_groups = self.n_in.div_ceil(GROUP_SIZE);
-            let activation_groups = self.n_in.div_ceil(self.group);
-            let mut total = [[vdupq_n_f32(0.0); C / 4]; R];
-
-            for weight_group in 0..weight_groups {
-                let start = weight_group * GROUP_SIZE;
-                let weight_end = (start + GROUP_SIZE).min(self.n_in);
-                let mut scales = [0.0f32; C];
-                for (c, scale) in scales.iter_mut().enumerate() {
-                    *scale = self.weight_scale[(j + c) * weight_groups + weight_group];
-                }
-                for activation_group in start / self.group..=(weight_end - 1) / self.group {
-                    let group_start = activation_group * self.group;
-                    let group_end = (group_start + self.group).min(self.n_in);
-                    let mut acc = [[vdupq_n_s32(0); C]; R];
-                    let mut p = group_start;
-                    while p + 16 <= group_end {
-                        let mut input = [vdupq_n_s8(0); R];
-                        for (r, value) in input.iter_mut().enumerate() {
-                            *value = vld1q_s8(activations.add((i + r) * self.n_in + p));
-                        }
-                        for c in 0..C {
-                            let weights = vld1q_s8(weight.add((j + c) * self.n_in + p));
-                            for (r, input_r) in input.iter().enumerate() {
-                                acc[r][c] = vdotq_s32(acc[r][c], weights, *input_r);
-                            }
-                        }
-                        p += 16;
-                    }
-                    for (r, acc_r) in acc.iter().enumerate() {
-                        let scale_row =
-                            self.activation_scale[(i + r) * activation_groups + activation_group];
-                        for k in 0..C / 4 {
-                            let sums = vpaddq_s32(
-                                vpaddq_s32(acc_r[4 * k], acc_r[4 * k + 1]),
-                                vpaddq_s32(acc_r[4 * k + 2], acc_r[4 * k + 3]),
-                            );
-                            let combined = vmulq_f32(
-                                vld1q_f32(scales.as_ptr().add(4 * k)),
-                                vdupq_n_f32(scale_row),
-                            );
-                            total[r][k] =
-                                vaddq_f32(total[r][k], vmulq_f32(vcvtq_f32_s32(sums), combined));
-                        }
-                    }
-                }
-            }
-
-            for (r, total_r) in total.iter().enumerate() {
-                for (k, value) in total_r.iter().enumerate() {
-                    let mut sums = [0.0f32; 4];
-                    vst1q_f32(sums.as_mut_ptr(), *value);
-                    for (lane, sum) in sums.iter().enumerate() {
-                        let output = j + 4 * k + lane;
-                        let sum = self.outliers.map_or(*sum, |outliers| {
-                            add_outliers(
-                                *sum,
-                                outliers[i + r],
-                                &self.weight[output * self.n_in..(output + 1) * self.n_in],
-                                &self.weight_scale
-                                    [output * weight_groups..(output + 1) * weight_groups],
-                            )
-                        });
-                        *y.get_unchecked_mut((i + r) * self.n_out + output) =
-                            finish(sum, Some(self.bias[output]), self.with_gelu);
-                    }
-                }
-            }
-        }
-
-        // SAFETY: as `tile`; this path also handles groups that are not whole
-        // 16-byte chunks.
-        #[allow(clippy::needless_range_loop)]
-        #[target_feature(enable = "neon,dotprod")]
-        unsafe fn tile_generic<const R: usize, const C: usize>(
+        // A tile of RP row pairs and CP output pairs. `rows` and `outputs` are the
+        // real counts, so the padded row of a final pair is never stored.
+        // SAFETY: `i + 2 * RP <= rows + 1`, `j + 2 * CP <= n_out + 1`, the
+        // activation and weight slices cover the padded pair layout, and the CPU
+        // has FEAT_I8MM.
+        #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+        #[target_feature(enable = "neon,i8mm")]
+        unsafe fn tile<const RP: usize, const CP: usize>(
             &self,
             i: usize,
             j: usize,
+            rows: usize,
+            outputs: usize,
             y: &mut [f32],
         ) {
-            let activations = self.activations.as_ptr();
-            let weight = self.weight.as_ptr();
+            let stride = int8_layout::pair_stride(self.n_in);
+            let activation_base = (i / 2) * stride;
+            let weight_base = (j / 2) * stride;
             let weight_groups = self.n_in.div_ceil(GROUP_SIZE);
             let activation_groups = self.n_in.div_ceil(self.group);
-            let mut total = [[0.0f32; C]; R];
+            let mut total = [[vdupq_n_f32(0.0); CP]; RP];
 
             for weight_group in 0..weight_groups {
                 let start = weight_group * GROUP_SIZE;
                 let weight_end = (start + GROUP_SIZE).min(self.n_in);
-                let mut scales = [0.0f32; C];
-                for (c, scale) in scales.iter_mut().enumerate() {
-                    *scale = self.weight_scale[(j + c) * weight_groups + weight_group];
+                let mut scales = [[0.0f32; 2]; CP];
+                for (cp, scale) in scales.iter_mut().enumerate() {
+                    if 2 * cp < outputs {
+                        scale[0] = *self
+                            .weight_scale
+                            .get_unchecked((j + 2 * cp) * weight_groups + weight_group);
+                    }
+                    if 2 * cp + 1 < outputs {
+                        scale[1] = *self
+                            .weight_scale
+                            .get_unchecked((j + 2 * cp + 1) * weight_groups + weight_group);
+                    }
                 }
                 for activation_group in start / self.group..=(weight_end - 1) / self.group {
                     let group_start = activation_group * self.group;
                     let group_end = (group_start + self.group).min(self.n_in);
-                    let mut acc = [[vdupq_n_s32(0); C]; R];
-                    let mut p = group_start;
-                    while p + 16 <= group_end {
-                        let mut input = [vdupq_n_s8(0); R];
-                        for (r, value) in input.iter_mut().enumerate() {
-                            *value = vld1q_s8(activations.add((i + r) * self.n_in + p));
+                    let mut acc = [[vdupq_n_s32(0); CP]; RP];
+                    let first_block = group_start / int8_layout::BLOCK;
+                    let last_block = group_end.div_ceil(int8_layout::BLOCK);
+                    for block in first_block..last_block {
+                        let mut input = [vdupq_n_s8(0); RP];
+                        for (rp, value) in input.iter_mut().enumerate() {
+                            *value = vld1q_s8(
+                                self.activations
+                                    .as_ptr()
+                                    .add(activation_base + rp * stride + block * 2 * int8_layout::BLOCK),
+                            );
                         }
-                        for c in 0..C {
-                            let weights = vld1q_s8(weight.add((j + c) * self.n_in + p));
-                            for (r, input_r) in input.iter().enumerate() {
-                                acc[r][c] = vdotq_s32(acc[r][c], weights, *input_r);
+                        for cp in 0..CP {
+                            let weights = vld1q_s8(
+                                self.weight.as_ptr().add(
+                                    weight_base + cp * stride + block * 2 * int8_layout::BLOCK,
+                                ),
+                            );
+                            for rp in 0..RP {
+                                acc[rp][cp] = smmla(acc[rp][cp], input[rp], weights);
                             }
                         }
-                        p += 16;
                     }
-                    for (r, acc_r) in acc.iter().enumerate() {
-                        let scale_row =
-                            self.activation_scale[(i + r) * activation_groups + activation_group];
-                        for (c, accumulated) in acc_r.iter().enumerate() {
-                            let mut dot = vaddvq_s32(*accumulated);
-                            let mut q = p;
-                            while q < group_end {
-                                dot += *activations.add((i + r) * self.n_in + q) as i32
-                                    * *weight.add((j + c) * self.n_in + q) as i32;
-                                q += 1;
-                            }
-                            total[r][c] = add_scaled_dot(total[r][c], dot, scales[c], scale_row);
+                    for (rp, accumulated) in acc.iter().enumerate() {
+                        let row = i + 2 * rp;
+                        let mut activation_scales = [0.0f32; 4];
+                        if 2 * rp < rows {
+                            activation_scales[0] = *self
+                                .activation_scale
+                                .get_unchecked(row * activation_groups + activation_group);
+                            activation_scales[1] = activation_scales[0];
+                        }
+                        if 2 * rp + 1 < rows {
+                            let scale = *self.activation_scale.get_unchecked(
+                                (row + 1) * activation_groups + activation_group,
+                            );
+                            activation_scales[2] = scale;
+                            activation_scales[3] = scale;
+                        }
+                        let activation_scales =
+                            vld1q_f32(activation_scales.as_ptr());
+                        for (cp, value) in accumulated.iter().enumerate() {
+                            let combined = vmulq_f32(
+                                vld1q_f32(
+                                    [
+                                        scales[cp][0],
+                                        scales[cp][1],
+                                        scales[cp][0],
+                                        scales[cp][1],
+                                    ]
+                                    .as_ptr(),
+                                ),
+                                activation_scales,
+                            );
+                            total[rp][cp] = vaddq_f32(
+                                total[rp][cp],
+                                vmulq_f32(vcvtq_f32_s32(*value), combined),
+                            );
                         }
                     }
                 }
             }
 
-            for (r, total_r) in total.iter().enumerate() {
-                for (c, value) in total_r.iter().enumerate() {
-                    let output = j + c;
-                    let sum = self.outliers.map_or(*value, |outliers| {
-                        add_outliers(
-                            *value,
-                            outliers[i + r],
-                            &self.weight[output * self.n_in..(output + 1) * self.n_in],
-                            &self.weight_scale
-                                [output * weight_groups..(output + 1) * weight_groups],
-                        )
-                    });
-                    *y.get_unchecked_mut((i + r) * self.n_out + output) =
-                        finish(sum, Some(self.bias[output]), self.with_gelu);
+            for (rp, total_rp) in total.iter().enumerate() {
+                for (cp, value) in total_rp.iter().enumerate() {
+                    let mut sums = [0.0f32; 4];
+                    vst1q_f32(sums.as_mut_ptr(), *value);
+                    for (lane, sum) in sums.iter().enumerate() {
+                        let row = i + 2 * rp + lane / 2;
+                        let output = j + 2 * cp + lane % 2;
+                        if row >= i + rows || output >= j + outputs {
+                            continue;
+                        }
+                        let sum = match self.outliers {
+                            Some(outliers) => add_outliers(
+                                *sum,
+                                outliers[row],
+                                self.weight,
+                                self.weight_scale,
+                                self.n_in,
+                                output,
+                            ),
+                            None => *sum,
+                        };
+                        *y.get_unchecked_mut(row * self.n_out + output) =
+                            finish(sum, Some(self.bias[output]), self.with_gelu);
+                    }
                 }
             }
         }
     }
 
     // SAFETY: the slices cover `rows * n_in` activations, `n_out * n_in` weights,
-    // `n_out` biases, and `rows * n_out` outputs.
+    // `n_out` biases and `rows * n_out` outputs; activations are pair-interleaved.
     #[allow(clippy::too_many_arguments)]
-    #[target_feature(enable = "neon,dotprod")]
-    pub(super) unsafe fn linear_rows_dotprod(
+    #[target_feature(enable = "neon,i8mm")]
+    pub(super) unsafe fn linear_rows_smmla(
         activations: &[i8],
         activation_scale: &[f32],
         weight: &[i8],
@@ -655,6 +1031,9 @@ mod int8_activations_neon {
         y: &mut [f32],
         outliers: Option<&[Outliers]>,
     ) {
+        if rows == 0 || n_out == 0 {
+            return;
+        }
         let prefill = Prefill {
             activations,
             activation_scale,
@@ -674,24 +1053,84 @@ mod int8_activations_neon {
             while i + PREFILL_ROWS <= rows {
                 let mut j = block;
                 while j + PREFILL_OUTPUTS <= end {
-                    prefill.tile::<PREFILL_ROWS, PREFILL_OUTPUTS>(i, j, y);
+                    prefill.tile::<{ PREFILL_ROWS / 2 }, { PREFILL_OUTPUTS / 2 }>(
+                        i,
+                        j,
+                        PREFILL_ROWS,
+                        PREFILL_OUTPUTS,
+                        y,
+                    );
                     j += PREFILL_OUTPUTS;
                 }
-                while j < end {
-                    prefill.tile::<PREFILL_ROWS, 1>(i, j, y);
-                    j += 1;
+                while j + 2 <= end {
+                    prefill.tile::<{ PREFILL_ROWS / 2 }, 1>(i, j, PREFILL_ROWS, 2, y);
+                    j += 2;
+                }
+                if j < end {
+                    prefill.tile::<{ PREFILL_ROWS / 2 }, 1>(i, j, PREFILL_ROWS, 1, y);
                 }
                 i += PREFILL_ROWS;
+            }
+            while i + 4 <= rows {
+                let mut j = block;
+                while j + PREFILL_OUTPUTS <= end {
+                    prefill.tile::<2, { PREFILL_OUTPUTS / 2 }>(
+                        i,
+                        j,
+                        4,
+                        PREFILL_OUTPUTS,
+                        y,
+                    );
+                    j += PREFILL_OUTPUTS;
+                }
+                while j + 2 <= end {
+                    prefill.tile::<2, 1>(i, j, 4, 2, y);
+                    j += 2;
+                }
+                if j < end {
+                    prefill.tile::<2, 1>(i, j, 4, 1, y);
+                }
+                i += 4;
+            }
+            while i + 2 <= rows {
+                let mut j = block;
+                while j + PREFILL_OUTPUTS <= end {
+                    prefill.tile::<1, { PREFILL_OUTPUTS / 2 }>(
+                        i,
+                        j,
+                        2,
+                        PREFILL_OUTPUTS,
+                        y,
+                    );
+                    j += PREFILL_OUTPUTS;
+                }
+                while j + 2 <= end {
+                    prefill.tile::<1, 1>(i, j, 2, 2, y);
+                    j += 2;
+                }
+                if j < end {
+                    prefill.tile::<1, 1>(i, j, 2, 1, y);
+                }
+                i += 2;
             }
             while i < rows {
                 let mut j = block;
                 while j + PREFILL_OUTPUTS <= end {
-                    prefill.tile::<1, PREFILL_OUTPUTS>(i, j, y);
+                    prefill.tile::<1, { PREFILL_OUTPUTS / 2 }>(
+                        i,
+                        j,
+                        1,
+                        PREFILL_OUTPUTS,
+                        y,
+                    );
                     j += PREFILL_OUTPUTS;
                 }
-                while j < end {
-                    prefill.tile::<1, 1>(i, j, y);
-                    j += 1;
+                while j + 2 <= end {
+                    prefill.tile::<1, 1>(i, j, 1, 2, y);
+                    j += 2;
+                }
+                if j < end {
+                    prefill.tile::<1, 1>(i, j, 1, 1, y);
                 }
                 i += 1;
             }
@@ -705,12 +1144,19 @@ pub(crate) enum Int8ActivationKernels {
     Scalar,
     #[cfg(target_arch = "aarch64")]
     DotProduct,
+    #[cfg(target_arch = "aarch64")]
+    Smmla,
 }
 
 impl Int8ActivationKernels {
     pub(crate) fn detect() -> Int8ActivationKernels {
         #[cfg(target_arch = "aarch64")]
         {
+            if std::arch::is_aarch64_feature_detected!("dotprod")
+                && std::arch::is_aarch64_feature_detected!("i8mm")
+            {
+                return Int8ActivationKernels::Smmla;
+            }
             if std::arch::is_aarch64_feature_detected!("dotprod") {
                 return Int8ActivationKernels::DotProduct;
             }
@@ -741,29 +1187,31 @@ impl Int8ActivationKernels {
         assert!(y.len() >= outputs.len(), "output is too short");
 
         #[cfg(target_arch = "aarch64")]
-        match self {
-            Int8ActivationKernels::DotProduct => {
-                // SAFETY: the lengths are checked above and detection confirmed the
-                // dot-product extension.
-                unsafe {
-                    int8_activations_neon::linear_outputs(
-                        activations,
-                        activation_scale,
-                        weight,
-                        weight_scale,
-                        bias,
-                        n_in,
-                        group,
-                        outputs.start,
-                        outputs.end,
-                        matches!(epilogue, Epilogue::Gelu),
-                        y,
-                        outliers,
-                    );
+        if group.is_multiple_of(crate::int8_layout::BLOCK) {
+            match self {
+                Int8ActivationKernels::DotProduct | Int8ActivationKernels::Smmla => {
+                    // SAFETY: the lengths are checked above and detection confirmed the
+                    // dot-product extension.
+                    unsafe {
+                        int8_activations_neon::linear_outputs(
+                            activations,
+                            activation_scale,
+                            weight,
+                            weight_scale,
+                            bias,
+                            n_in,
+                            group,
+                            outputs.start,
+                            outputs.end,
+                            matches!(epilogue, Epilogue::Gelu),
+                            y,
+                            outliers,
+                        );
+                    }
+                    return;
                 }
-                return;
+                Int8ActivationKernels::Scalar => {}
             }
-            Int8ActivationKernels::Scalar => {}
         }
         int8_activations::linear_outputs(
             activations,
@@ -808,9 +1256,30 @@ impl Int8ActivationKernels {
         }
 
         #[cfg(target_arch = "aarch64")]
-        {
+        if group.is_multiple_of(crate::int8_layout::BLOCK) {
             let with_gelu = matches!(epilogue, Epilogue::Gelu);
             match self {
+                Int8ActivationKernels::Smmla => {
+                    // SAFETY: the lengths are checked above and detection confirmed
+                    // the i8mm extension.
+                    unsafe {
+                        int8_activations_neon::linear_rows_smmla(
+                            activations,
+                            activation_scale,
+                            weight,
+                            weight_scale,
+                            bias,
+                            rows,
+                            n_in,
+                            n_out,
+                            group,
+                            with_gelu,
+                            y,
+                            outliers,
+                        );
+                    }
+                    return;
+                }
                 Int8ActivationKernels::DotProduct => {
                     // SAFETY: the lengths are checked above and detection confirmed
                     // the dot-product extension.
@@ -858,6 +1327,7 @@ mod neon {
     use std::ops::Range;
 
     use super::{gelu_exact, Epilogue};
+    use crate::int8_layout;
 
     const DECODE_ROWS: usize = 2;
     const DECODE_ACCUMULATORS: usize = 4;
@@ -1000,6 +1470,7 @@ mod neon {
         y: &mut [f32],
     ) {
         let x = x.as_ptr();
+        let weight_data = weight;
         let weight = weight.as_ptr();
         let scale = scale.as_ptr();
         let groups = n_in.div_ceil(group);
@@ -1010,31 +1481,40 @@ mod neon {
                 let start = g * group;
                 let group_end = (start + group).min(n_in);
                 let mut acc = [[vdupq_n_f32(0.0); INT8_DECODE_ACCUMULATORS]; INT8_DECODE_ROWS];
+                let mut extra = [0.0f32; INT8_DECODE_ROWS];
                 let mut p = start;
+                while p < group_end && !p.is_multiple_of(int8_layout::BLOCK) {
+                    for (r, extra_r) in extra.iter_mut().enumerate() {
+                        *extra_r += *x.add(p)
+                            * int8_layout::byte(weight_data, n_in, row + r, p) as f32;
+                    }
+                    p += 1;
+                }
                 while p + INT8_DECODE_ACCUMULATORS * 4 <= group_end {
                     let mut xv = [vdupq_n_f32(0.0); INT8_DECODE_ACCUMULATORS];
                     for (a, value) in xv.iter_mut().enumerate() {
                         *value = vld1q_f32(x.add(p + a * 4));
                     }
                     for (r, acc_r) in acc.iter_mut().enumerate() {
-                        let row_weight = weight.add((row + r) * n_in);
                         for h in 0..INT8_DECODE_ACCUMULATORS / 2 {
-                            let w = widen8(row_weight.add(p + h * 8));
+                            let w = widen8(
+                                weight.add(int8_layout::block_offset(n_in, row + r, p + h * 8)),
+                            );
                             acc_r[2 * h] = vfmaq_f32(acc_r[2 * h], w[0], xv[2 * h]);
                             acc_r[2 * h + 1] = vfmaq_f32(acc_r[2 * h + 1], w[1], xv[2 * h + 1]);
                         }
                     }
                     p += INT8_DECODE_ACCUMULATORS * 4;
                 }
-                for (r, acc_r) in acc.iter().enumerate() {
-                    let row_weight = weight.add((row + r) * n_in);
-                    let mut sum = horizontal4(*acc_r);
-                    let mut q = p;
-                    while q < group_end {
-                        sum += (*row_weight.add(q)) as f32 * *x.add(q);
-                        q += 1;
+                while p < group_end {
+                    for (r, extra_r) in extra.iter_mut().enumerate() {
+                        *extra_r += *x.add(p)
+                            * int8_layout::byte(weight_data, n_in, row + r, p) as f32;
                     }
-                    total[r] += sum * *scale.add((row + r) * groups + g);
+                    p += 1;
+                }
+                for (r, acc_r) in acc.iter().enumerate() {
+                    total[r] += (horizontal4(*acc_r) + extra[r]) * *scale.add((row + r) * groups + g);
                 }
             }
             for (r, value) in total.iter().enumerate() {
@@ -1047,28 +1527,32 @@ mod neon {
             row += INT8_DECODE_ROWS;
         }
         while row < end {
-            let row_weight = weight.add(row * n_in);
             let mut total = 0.0;
             for g in 0..groups {
                 let start = g * group;
                 let group_end = (start + group).min(n_in);
                 let mut acc = [vdupq_n_f32(0.0); INT8_DECODE_ACCUMULATORS];
+                let mut extra = 0.0f32;
                 let mut p = start;
+                while p < group_end && !p.is_multiple_of(int8_layout::BLOCK) {
+                    extra += int8_layout::byte(weight_data, n_in, row, p) as f32 * *x.add(p);
+                    p += 1;
+                }
                 while p + INT8_DECODE_ACCUMULATORS * 4 <= group_end {
                     let mut xv = [vdupq_n_f32(0.0); INT8_DECODE_ACCUMULATORS];
                     for (a, value) in xv.iter_mut().enumerate() {
                         *value = vld1q_f32(x.add(p + a * 4));
                     }
                     for h in 0..INT8_DECODE_ACCUMULATORS / 2 {
-                        let w = widen8(row_weight.add(p + h * 8));
+                        let w = widen8(weight.add(int8_layout::block_offset(n_in, row, p + h * 8)));
                         acc[2 * h] = vfmaq_f32(acc[2 * h], w[0], xv[2 * h]);
                         acc[2 * h + 1] = vfmaq_f32(acc[2 * h + 1], w[1], xv[2 * h + 1]);
                     }
                     p += INT8_DECODE_ACCUMULATORS * 4;
                 }
-                let mut sum = horizontal4(acc);
+                let mut sum = horizontal4(acc) + extra;
                 while p < group_end {
-                    sum += (*row_weight.add(p)) as f32 * *x.add(p);
+                    sum += int8_layout::byte(weight_data, n_in, row, p) as f32 * *x.add(p);
                     p += 1;
                 }
                 total += sum * *scale.add(row * groups + g);
@@ -1211,6 +1695,7 @@ mod neon {
         y: &mut [f32],
     ) {
         let x = x.as_ptr();
+        let weight_data = weight;
         let weight = weight.as_ptr();
         let scale = scale.as_ptr();
         let groups = n_in.div_ceil(group);
@@ -1221,6 +1706,15 @@ mod neon {
             let mut acc = [[vdupq_n_f32(0.0); C]; R];
             let mut extra = [[0.0f32; C]; R];
             let mut p = start;
+            while p < group_end && !p.is_multiple_of(int8_layout::BLOCK) {
+                for (r, extra_r) in extra.iter_mut().enumerate() {
+                    for (c, extra_rc) in extra_r.iter_mut().enumerate() {
+                        *extra_rc += *x.add((i + r) * n_in + p)
+                            * int8_layout::byte(weight_data, n_in, j + c, p) as f32;
+                    }
+                }
+                p += 1;
+            }
             while p + 8 <= group_end {
                 let mut xv = [[vdupq_n_f32(0.0); 2]; R];
                 for (r, value) in xv.iter_mut().enumerate() {
@@ -1230,7 +1724,7 @@ mod neon {
                     ];
                 }
                 for c in 0..C {
-                    let w = widen8(weight.add((j + c) * n_in + p));
+                    let w = widen8(weight.add(int8_layout::block_offset(n_in, j + c, p)));
                     for (r, value) in xv.iter().enumerate() {
                         acc[r][c] = vfmaq_f32(acc[r][c], w[0], value[0]);
                         acc[r][c] = vfmaq_f32(acc[r][c], w[1], value[1]);
@@ -1241,8 +1735,8 @@ mod neon {
             while p < group_end {
                 for (r, extra_r) in extra.iter_mut().enumerate() {
                     for (c, extra_rc) in extra_r.iter_mut().enumerate() {
-                        *extra_rc +=
-                            *x.add((i + r) * n_in + p) * (*weight.add((j + c) * n_in + p)) as f32;
+                        *extra_rc += *x.add((i + r) * n_in + p)
+                            * int8_layout::byte(weight_data, n_in, j + c, p) as f32;
                     }
                 }
                 p += 1;
@@ -1449,6 +1943,7 @@ mod neon {
     }
 
     #[cfg(test)]
+    #[cfg(test)]
     pub(crate) fn int8_dot(x: &[f32], weight: &[i8], scale: &[f32], group: usize) -> f32 {
         assert_eq!(x.len(), weight.len(), "dot product needs equal lengths");
         let n = x.len();
@@ -1590,6 +2085,7 @@ mod wasm {
     use std::ptr;
 
     use super::{gelu_exact, Epilogue};
+    use crate::int8_layout;
 
     const DECODE_ACCUMULATORS: usize = 8;
     const PREFILL_TOKENS: usize = 4;
@@ -1808,6 +2304,7 @@ mod wasm {
         y: &mut [f32],
     ) {
         let x = x.as_ptr();
+        let weight_data = weight;
         let weight = weight.as_ptr();
         let groups = n_in.div_ceil(group);
         let mut total = [[0.0f32; C]; R];
@@ -1817,6 +2314,15 @@ mod wasm {
             let mut acc = [[f32x4_splat(0.0); C]; R];
             let mut extra = [[0.0f32; C]; R];
             let mut p = start;
+            while p < group_end && !p.is_multiple_of(int8_layout::BLOCK) {
+                for (r, extra_r) in extra.iter_mut().enumerate() {
+                    for (c, extra_rc) in extra_r.iter_mut().enumerate() {
+                        *extra_rc += *x.add((i + r) * n_in + p)
+                            * int8_layout::byte(weight_data, n_in, j + c, p) as f32;
+                    }
+                }
+                p += 1;
+            }
             while p + 8 <= group_end {
                 let mut xv = [[f32x4_splat(0.0); 2]; R];
                 for (r, value) in xv.iter_mut().enumerate() {
@@ -1826,7 +2332,7 @@ mod wasm {
                     ];
                 }
                 for c in 0..C {
-                    let w = widen8(weight.add((j + c) * n_in + p));
+                    let w = widen8(weight.add(int8_layout::block_offset(n_in, j + c, p)));
                     for (r, value) in xv.iter().enumerate() {
                         acc[r][c] = multiply_add(acc[r][c], w[0], value[0]);
                         acc[r][c] = multiply_add(acc[r][c], w[1], value[1]);
@@ -1837,8 +2343,8 @@ mod wasm {
             while p < group_end {
                 for (r, extra_r) in extra.iter_mut().enumerate() {
                     for (c, extra_rc) in extra_r.iter_mut().enumerate() {
-                        *extra_rc +=
-                            *x.add((i + r) * n_in + p) * (*weight.add((j + c) * n_in + p)) as f32;
+                        *extra_rc += *x.add((i + r) * n_in + p)
+                            * int8_layout::byte(weight_data, n_in, j + c, p) as f32;
                     }
                 }
                 p += 1;
@@ -2013,13 +2519,21 @@ mod wasm {
         let groups = n_in.div_ceil(group);
         let with_gelu = matches!(epilogue, Epilogue::Gelu);
         for (offset, row) in outputs.enumerate() {
-            let row_weight = &weight[row * n_in..(row + 1) * n_in];
-            let row_scale = &scale[row * groups..(row + 1) * groups];
-            let sum = int8_dot(x, row_weight, row_scale, group);
+            let mut sum = 0.0;
+            for g in 0..groups {
+                let start = g * group;
+                let end = (start + group).min(n_in);
+                let mut partial = 0.0;
+                for p in start..end {
+                    partial += x[p] * int8_layout::byte(weight, n_in, row, p) as f32;
+                }
+                sum += partial * scale[row * groups + g];
+            }
             y[offset] = finish(sum, bias.map(|bias| bias[offset]), with_gelu);
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn int8_dot(x: &[f32], weight: &[i8], scale: &[f32], group: usize) -> f32 {
         assert_eq!(x.len(), weight.len(), "dot product needs equal lengths");
         let n = x.len();
@@ -2140,6 +2654,7 @@ mod scalar {
     use std::ops::Range;
 
     use super::{gelu_exact, Epilogue};
+    use crate::int8_layout;
 
     #[inline]
     fn finish(sum: f32, bias: Option<f32>, with_gelu: bool) -> f32 {
@@ -2220,7 +2735,7 @@ mod scalar {
                     let end = (start + group).min(n_in);
                     let mut partial = 0.0;
                     for p in start..end {
-                        partial += x[i * n_in + p] * weight[j * n_in + p] as f32;
+                        partial += x[i * n_in + p] * int8_layout::byte(weight, n_in, j, p) as f32;
                     }
                     sum += partial * scale[j * groups + g];
                 }
@@ -2244,13 +2759,21 @@ mod scalar {
         let with_gelu = matches!(epilogue, Epilogue::Gelu);
         let groups = n_in.div_ceil(group);
         for (offset, row) in outputs.enumerate() {
-            let row_weight = &weight[row * n_in..(row + 1) * n_in];
-            let row_scale = &scale[row * groups..(row + 1) * groups];
-            let sum = int8_dot(x, row_weight, row_scale, group);
+            let mut sum = 0.0;
+            for g in 0..groups {
+                let start = g * group;
+                let end = (start + group).min(n_in);
+                let mut partial = 0.0;
+                for p in start..end {
+                    partial += x[p] * int8_layout::byte(weight, n_in, row, p) as f32;
+                }
+                sum += partial * scale[row * groups + g];
+            }
             y[offset] = finish(sum, bias.map(|bias| bias[offset]), with_gelu);
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn int8_dot(x: &[f32], weight: &[i8], scale: &[f32], group: usize) -> f32 {
         assert_eq!(x.len(), weight.len(), "dot product needs equal lengths");
         let mut total = 0.0;
@@ -2488,10 +3011,11 @@ mod tests {
         group: usize,
     ) -> Vec<f32> {
         let mut y = vec![0.0; rows * n_out];
+        let weight = crate::int8_layout::interleave_owned(n_out, n_in, weight.to_vec());
         if rows == 1 {
             int8_linear_outputs(
                 x,
-                weight,
+                &weight,
                 scale,
                 Some(bias),
                 n_in,
@@ -2502,7 +3026,7 @@ mod tests {
             );
         } else {
             int8_linear_rows(
-                x, weight, scale, bias, rows, n_in, n_out, &mut y, epilogue, group,
+                x, &weight, scale, bias, rows, n_in, n_out, &mut y, epilogue, group,
             );
         }
         y
@@ -2655,7 +3179,8 @@ mod tests {
         let activations = (0..rows * n_in)
             .map(|i| ((i * 37 + 11) % 255) as i32 - 127)
             .map(|value| value as i8)
-            .collect();
+            .collect::<Vec<_>>();
+        let activations = crate::int8_layout::interleave_owned(rows, n_in, activations);
         let activation_groups = n_in.div_ceil(group);
         let activation_scale = (0..rows * activation_groups)
             .map(|i| (i % 9 + 1) as f32 / 200.0)
@@ -2663,7 +3188,8 @@ mod tests {
         let weight = (0..n_out * n_in)
             .map(|i| ((i * 53 + 7) % 255) as i32 - 127)
             .map(|value| value as i8)
-            .collect();
+            .collect::<Vec<_>>();
+        let weight = crate::int8_layout::interleave_owned(n_out, n_in, weight);
         let weight_groups = n_in.div_ceil(crate::quantize::GROUP_SIZE);
         let weight_scale = (0..n_out * weight_groups)
             .map(|i| (i % 11 + 1) as f32 / 300.0)
@@ -2676,6 +3202,12 @@ mod tests {
             weight_scale,
             bias,
         }
+    }
+
+    fn plain_activation(fixture: &ActivationFixture, n_in: usize, row: usize) -> Vec<i8> {
+        let mut plain = vec![0i8; n_in];
+        crate::int8_layout::read_row(&fixture.activations, n_in, row, &mut plain);
+        plain
     }
 
     #[test]
@@ -2790,9 +3322,20 @@ mod tests {
 
             for epilogue in [Epilogue::Store, Epilogue::Gelu] {
                 if rows == 1 {
+                    let plain = plain_activation(
+                        &ActivationFixture {
+                            activations: activations.clone(),
+                            activation_scale: activation_scale.clone(),
+                            weight: weight.clone(),
+                            weight_scale: weight_scale.clone(),
+                            bias: bias.clone(),
+                        },
+                        n_in,
+                        0,
+                    );
                     let mut expected = vec![0.0f32; n_out];
                     int8_activations::linear_outputs(
-                        &activations,
+                        &plain,
                         &activation_scale,
                         &weight,
                         &weight_scale,
@@ -2806,7 +3349,7 @@ mod tests {
                     );
                     let mut actual = vec![0.0f32; n_out];
                     kernels.linear_outputs(
-                        &activations,
+                        &plain,
                         &activation_scale,
                         &weight,
                         &weight_scale,
@@ -2901,6 +3444,165 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn smmla_dotprod_and_scalar_prefill_agree_bit_for_bit() {
+        if !(std::arch::is_aarch64_feature_detected!("dotprod")
+            && std::arch::is_aarch64_feature_detected!("i8mm"))
+        {
+            return;
+        }
+        let kernels = Int8ActivationKernels::detect();
+        for case in [
+            ActivationCase {
+                rows: 2,
+                n_in: 37,
+                n_out: 5,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 3,
+                n_in: 64,
+                n_out: 7,
+                group: 32,
+            },
+            ActivationCase {
+                rows: 5,
+                n_in: 65,
+                n_out: 9,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 8,
+                n_in: 130,
+                n_out: 13,
+                group: 64,
+            },
+            ActivationCase {
+                rows: 9,
+                n_in: 768,
+                n_out: 17,
+                group: 16,
+            },
+            ActivationCase {
+                rows: 7,
+                n_in: 3072,
+                n_out: 11,
+                group: 32,
+            },
+        ] {
+            let ActivationFixture {
+                activations,
+                activation_scale,
+                weight,
+                weight_scale,
+                bias,
+            } = activation_data(&case);
+            let (rows, n_in, n_out, group) = (case.rows, case.n_in, case.n_out, case.group);
+            let per_row: Vec<(Vec<u32>, Vec<f32>)> = (0..rows)
+                .map(|row| {
+                    let indices = (0..3)
+                        .map(|i| ((i * n_in / 3 + row * 5) % n_in) as u32)
+                        .collect();
+                    let values = (0..3).map(|i| (i + row) as f32 - 1.5).collect();
+                    (indices, values)
+                })
+                .collect();
+            let row_outliers: Vec<Outliers> = per_row
+                .iter()
+                .map(|(indices, values)| Outliers { indices, values })
+                .collect();
+
+            for epilogue in [Epilogue::Store, Epilogue::Gelu] {
+                let with_gelu = matches!(epilogue, Epilogue::Gelu);
+                let mut expected = vec![0.0f32; rows * n_out];
+                int8_activations::linear_rows(
+                    &activations,
+                    &activation_scale,
+                    &weight,
+                    &weight_scale,
+                    &bias,
+                    rows,
+                    n_in,
+                    n_out,
+                    group,
+                    &mut expected,
+                    epilogue,
+                    Some(&row_outliers),
+                );
+
+                let mut smmla = vec![0.0f32; rows * n_out];
+                // SAFETY: the fixture sizes match the slices and the CPU has i8mm.
+                unsafe {
+                    super::int8_activations_neon::linear_rows_smmla(
+                        &activations,
+                        &activation_scale,
+                        &weight,
+                        &weight_scale,
+                        &bias,
+                        rows,
+                        n_in,
+                        n_out,
+                        group,
+                        with_gelu,
+                        &mut smmla,
+                        Some(&row_outliers),
+                    );
+                }
+                for (index, (a, e)) in smmla.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        e.to_bits(),
+                        "smmla rows {rows}, in {n_in}, out {n_out}, group {group}, element {index}"
+                    );
+                }
+
+                let mut dotprod = vec![0.0f32; rows * n_out];
+                // SAFETY: the fixture sizes match the slices and the CPU has dotprod.
+                unsafe {
+                    super::int8_activations_neon::linear_rows_dotprod(
+                        &activations,
+                        &activation_scale,
+                        &weight,
+                        &weight_scale,
+                        &bias,
+                        rows,
+                        n_in,
+                        n_out,
+                        group,
+                        with_gelu,
+                        &mut dotprod,
+                        Some(&row_outliers),
+                    );
+                }
+                for (index, (a, e)) in dotprod.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        e.to_bits(),
+                        "dotprod rows {rows}, in {n_in}, out {n_out}, group {group}, element {index}"
+                    );
+                }
+
+                let mut dispatch = vec![0.0f32; rows * n_out];
+                kernels.linear_rows(
+                    &activations,
+                    &activation_scale,
+                    &weight,
+                    &weight_scale,
+                    &bias,
+                    rows,
+                    n_in,
+                    n_out,
+                    group,
+                    &mut dispatch,
+                    epilogue,
+                    Some(&row_outliers),
+                );
+                assert_eq!(dispatch, expected);
+            }
+        }
+    }
+
     fn outliers(n_in: usize, count: usize) -> (Vec<u32>, Vec<f32>) {
         assert!(count <= n_in);
         let indices = (0..count)
@@ -2965,6 +3667,17 @@ mod tests {
                 bias,
             } = activation_data(&case);
             let (n_in, n_out, group) = (case.n_in, case.n_out, case.group);
+            let plain = plain_activation(
+                &ActivationFixture {
+                    activations: activations.clone(),
+                    activation_scale: activation_scale.clone(),
+                    weight: weight.clone(),
+                    weight_scale: weight_scale.clone(),
+                    bias: bias.clone(),
+                },
+                n_in,
+                0,
+            );
             for count in [0usize, 4, 8] {
                 if count > 0 && n_in < 8 {
                     continue;
@@ -2976,7 +3689,7 @@ mod tests {
                 });
                 let mut expected = vec![0.0f32; n_out];
                 int8_activations::linear_outputs(
-                    &activations,
+                    &plain,
                     &activation_scale,
                     &weight,
                     &weight_scale,
@@ -2990,7 +3703,7 @@ mod tests {
                 );
                 let mut actual = vec![0.0f32; n_out];
                 kernels.linear_outputs(
-                    &activations,
+                    &plain,
                     &activation_scale,
                     &weight,
                     &weight_scale,
@@ -3110,9 +3823,20 @@ mod tests {
                 }
 
                 if rows == 1 {
+                    let plain = plain_activation(
+                        &ActivationFixture {
+                            activations: activations.clone(),
+                            activation_scale: activation_scale.clone(),
+                            weight: weight.clone(),
+                            weight_scale: weight_scale.clone(),
+                            bias: bias.clone(),
+                        },
+                        n_in,
+                        0,
+                    );
                     let mut one = vec![0.0f32; n_out];
                     kernels.linear_outputs(
-                        &activations,
+                        &plain,
                         &activation_scale,
                         &weight,
                         &weight_scale,
@@ -3148,6 +3872,7 @@ mod tests {
             .map(|i| ((i * 53 + 7) % 255) as i32 - 127)
             .map(|value| value as i8)
             .collect();
+        let weight = crate::int8_layout::interleave_owned(n_out, n_in, weight);
         let weight_scale: Vec<f32> = (0..n_out * n_in.div_ceil(64))
             .map(|i| (i % 11 + 1) as f32 / 300.0)
             .collect();
@@ -3223,6 +3948,7 @@ mod tests {
             .map(|i| ((i * 53 + 7) % 255) as i32 - 127)
             .map(|value| value as i8)
             .collect();
+        let weight = crate::int8_layout::interleave_owned(n_out, n_in, weight);
         let weight_scale: Vec<f32> = (0..n_out * n_in.div_ceil(64))
             .map(|i| (i % 11 + 1) as f32 / 300.0)
             .collect();
@@ -3276,7 +4002,10 @@ mod tests {
                     let start = activation_group * group;
                     let end = (start + group).min(n_in);
                     let dot: i64 = (start..end)
-                        .map(|p| data[p] as i64 * weight[output * n_in + p] as i64)
+                        .map(|p| {
+                            data[p] as i64
+                                * crate::int8_layout::byte(&weight, n_in, output, p) as i64
+                        })
                         .sum();
                     expected += dot as f64
                         * (weight_scale[output * weight_groups + weight_group] as f64
@@ -3287,7 +4016,7 @@ mod tests {
                 let index = index as usize;
                 expected += value as f64
                     * (weight_scale[output * weight_groups + index / 64] as f64
-                        * weight[output * n_in + index] as f64);
+                        * crate::int8_layout::byte(&weight, n_in, output, index) as f64);
             }
             expected += bias[output] as f64;
             let tolerance = 1e-4 * expected.abs().max(1.0);
@@ -3317,11 +4046,13 @@ mod tests {
                 .iter()
                 .map(|value| (value * 127.0) as i8)
                 .collect();
+            let quantized = crate::int8_layout::interleave_owned(rows, n_in, quantized);
             let activation_scale = vec![0.01f32; rows * groups];
             let weight: Vec<i8> = (0..n_out * n_in)
                 .map(|i| ((i * 43 + 5) % 255) as i32 - 127)
                 .map(|value| value as i8)
                 .collect();
+            let weight = crate::int8_layout::interleave_owned(n_out, n_in, weight);
             let weight_scale = vec![0.01f32; n_out * groups];
             let bias: Vec<f32> = (0..n_out).map(|i| i as f32 / 1000.0).collect();
             let mut y = vec![0.0f32; rows * n_out];
@@ -3358,13 +4089,14 @@ mod tests {
                         }
                     });
                 } else {
-                    threads.run(&mut y, n_out, |start, part| {
+                    threads.run(&mut y, 2 * n_out, |start, part| {
                         let first = start / n_out;
                         let count = part.len() / n_out;
+                        let stride = crate::int8_layout::pair_stride(n_in);
                         let scales = &activation_scale[first * groups..(first + count) * groups];
                         if new {
                             kernels.linear_rows(
-                                &quantized[first * n_in..(first + count) * n_in],
+                                &quantized[(first / 2) * stride..],
                                 scales,
                                 &weight,
                                 &weight_scale,
@@ -3443,6 +4175,7 @@ mod batch_identity {
                 .map(|i| ((i * 37 + 11) % 255) as i32 - 127)
                 .map(|v| v as i8)
                 .collect();
+            let activations = crate::int8_layout::interleave_owned(rows, n_in, activations);
             let activation_groups = n_in.div_ceil(group);
             let activation_scale: Vec<f32> = (0..rows * activation_groups)
                 .map(|i| (i % 9 + 1) as f32 / 200.0)
@@ -3451,6 +4184,7 @@ mod batch_identity {
                 .map(|i| ((i * 53 + 7) % 255) as i32 - 127)
                 .map(|v| v as i8)
                 .collect();
+            let weight = crate::int8_layout::interleave_owned(n_out, n_in, weight);
             let weight_groups = n_in.div_ceil(64);
             let weight_scale: Vec<f32> = (0..n_out * weight_groups)
                 .map(|i| (i % 11 + 1) as f32 / 300.0)
@@ -3487,8 +4221,10 @@ mod batch_identity {
             );
             for row in 0..rows {
                 let mut expected = vec![0.0f32; n_out];
+                let mut plain = vec![0i8; n_in];
+                crate::int8_layout::read_row(&activations, n_in, row, &mut plain);
                 kernels.linear_outputs(
-                    &activations[row * n_in..(row + 1) * n_in],
+                    &plain,
                     &activation_scale[row * activation_groups..(row + 1) * activation_groups],
                     &weight,
                     &weight_scale,

@@ -76,6 +76,56 @@ pub(crate) fn quantize_activations(
     }
 }
 
+// Same quantization and scale bits as `quantize_activations`, written into the
+// pair-interleaved layout the int8 prompt kernels read.
+pub(crate) fn quantize_activations_interleaved(
+    x: &[f32],
+    rows: usize,
+    n_in: usize,
+    group: usize,
+    values: &mut [i8],
+    scales: &mut [f32],
+) {
+    assert!(group > 0, "activation group must be positive");
+    let groups = n_in.div_ceil(group);
+    assert!(x.len() >= rows * n_in, "activation input is too short");
+    assert!(
+        values.len() >= crate::int8_layout::storage_len(rows, n_in),
+        "activation output is too short"
+    );
+    assert!(
+        scales.len() >= rows * groups,
+        "activation scales are too short"
+    );
+
+    let aligned = group.is_multiple_of(crate::int8_layout::BLOCK);
+    for (row, values_row) in x[..rows * n_in].chunks(n_in).enumerate() {
+        for (group_index, chunk) in values_row.chunks(group).enumerate() {
+            let max = chunk.iter().fold(0.0f32, |max, value| max.max(value.abs()));
+            let scale = max / 127.0;
+            scales[row * groups + group_index] = scale;
+            let group_start = group_index * group;
+            if aligned {
+                for (block_index, block) in chunk.chunks(crate::int8_layout::BLOCK).enumerate() {
+                    let column = group_start + block_index * crate::int8_layout::BLOCK;
+                    let at = crate::int8_layout::block_offset(n_in, row, column);
+                    let mut bytes = [0i8; crate::int8_layout::BLOCK];
+                    for (byte, &value) in bytes.iter_mut().zip(block) {
+                        *byte = round(value, scale);
+                    }
+                    values[at..at + block.len()].copy_from_slice(&bytes[..block.len()]);
+                }
+            } else {
+                for (offset, &value) in chunk.iter().enumerate() {
+                    values[crate::int8_layout::byte_offset(n_in, row, group_start + offset)] =
+                        round(value, scale);
+                }
+            }
+        }
+    }
+    crate::int8_layout::clear_padding(rows, n_in, values);
+}
+
 // The largest magnitudes are moved out of the vector so one value cannot flatten
 // the resolution of the whole group it sits in; they are added back exactly.
 fn select_outliers(x: &[f32], keep: usize, indices: &mut [u32], removed: &mut [f32]) -> usize {
@@ -164,7 +214,10 @@ pub(crate) fn quantize_activation_outliers(
 
 #[cfg(test)]
 mod tests {
-    use super::{quantize_activation_outliers, quantize_activations, Rows};
+    use super::{
+        quantize_activation_outliers, quantize_activations, quantize_activations_interleaved, Rows,
+    };
+    use crate::int8_layout;
 
     fn check_round_trip(
         data: &[i8],
@@ -182,6 +235,55 @@ mod tests {
                 original[index],
                 scale[group]
             );
+        }
+    }
+
+    #[test]
+    fn interleaved_quantization_matches_the_plain_quantizer() {
+        for (rows, n_in, group) in [
+            (1usize, 37usize, 16usize),
+            (2, 37, 16),
+            (3, 64, 32),
+            (5, 130, 16),
+            (4, 96, 64),
+            (7, 7, 7),
+            (5, 768, 64),
+        ] {
+            let values: Vec<f32> = (0..rows * n_in)
+                .map(|i| ((i * 41 + 13) % 157) as f32 / 23.0 - 3.0)
+                .collect();
+            let groups = n_in.div_ceil(group);
+            let mut plain = vec![0i8; rows * n_in];
+            let mut plain_scale = vec![0.0f32; rows * groups];
+            quantize_activations(&values, rows, n_in, group, &mut plain, &mut plain_scale);
+
+            let mut interleaved = vec![1i8; int8_layout::storage_len(rows, n_in)];
+            let mut scale = vec![0.0f32; rows * groups];
+            quantize_activations_interleaved(
+                &values,
+                rows,
+                n_in,
+                group,
+                &mut interleaved,
+                &mut scale,
+            );
+
+            for index in 0..rows * groups {
+                assert_eq!(
+                    scale[index].to_bits(),
+                    plain_scale[index].to_bits(),
+                    "rows {rows}, n_in {n_in}, group {group}, scale {index}"
+                );
+            }
+            for row in 0..rows {
+                for column in 0..n_in {
+                    assert_eq!(
+                        int8_layout::byte(&interleaved, n_in, row, column),
+                        plain[row * n_in + column],
+                        "rows {rows}, n_in {n_in}, group {group}, row {row}, column {column}"
+                    );
+                }
+            }
         }
     }
 

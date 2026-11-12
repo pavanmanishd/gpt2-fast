@@ -6,6 +6,7 @@
 mod config;
 mod error;
 mod int8_file;
+mod int8_layout;
 mod model;
 mod parallel;
 mod quantize;
