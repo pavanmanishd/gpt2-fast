@@ -50,7 +50,45 @@ RUN cmake -S /opt/llama-worker -B /opt/llama-worker/build \
     && cmake --build /opt/llama-worker/build --target llama-worker -j"$(nproc)" \
     && install -m 0755 /opt/llama-worker/build/llama-worker /usr/local/bin/llama-worker
 
+FROM base AS onnx
+
+ARG ONNXRUNTIME_VERSION=1.31.1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL \
+        "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-aarch64-${ONNXRUNTIME_VERSION}.tgz" \
+        -o /tmp/onnxruntime.tgz \
+    && tar -xzf /tmp/onnxruntime.tgz -C /opt \
+    && mv "/opt/onnxruntime-linux-aarch64-${ONNXRUNTIME_VERSION}" /opt/onnxruntime \
+    && rm /tmp/onnxruntime.tgz \
+    && cp -a /opt/onnxruntime/lib/libonnxruntime.so* /usr/local/lib/ \
+    && cp -a /opt/onnxruntime/include/* /usr/local/include/ \
+    && ldconfig
+
+COPY bench/engines/onnxruntime /opt/onnx-worker
+
+RUN g++ -O3 -march=armv8.6-a+dotprod+i8mm -std=c++17 \
+        -I/usr/local/include /opt/onnx-worker/worker.cpp \
+        -L/usr/local/lib -lonnxruntime \
+        -Wl,-rpath,/usr/local/lib \
+        -o /usr/local/bin/onnx-worker
+
 FROM base AS app
+
+# onnx 1.19.1, onnxruntime 1.31.1, protobuf 4.25.8, ml_dtypes 0.5.4,
+# flatbuffers 25.12.19, PyYAML 6.0.2, ctranslate2 4.6.2
+RUN pip install --no-cache-dir \
+        numpy==2.1.3 \
+        onnx==1.19.1 \
+        onnxruntime==1.31.1 \
+        protobuf==4.25.8 \
+        ml_dtypes==0.5.4 \
+        flatbuffers==25.12.19 \
+        PyYAML==6.0.2 \
+        ctranslate2==4.6.2
 
 COPY --from=llama /usr/local/bin/llama-worker /usr/local/bin/llama-worker
 COPY --from=llama /usr/local/bin/llama-quantize /usr/local/bin/llama-quantize
@@ -61,6 +99,10 @@ COPY --from=llama /opt/llama.cpp/conversion /opt/llama.cpp/conversion
 COPY --from=llama /opt/llama.cpp/gguf-py /opt/llama.cpp/gguf-py
 RUN ldconfig \
     && pip install --no-cache-dir --no-deps /opt/llama.cpp/gguf-py
+
+COPY --from=onnx /usr/local/bin/onnx-worker /usr/local/bin/onnx-worker
+COPY --from=onnx /usr/local/lib/libonnxruntime.so* /usr/local/lib/
+RUN ldconfig
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/bench/Cargo.toml crates/bench/Cargo.toml
