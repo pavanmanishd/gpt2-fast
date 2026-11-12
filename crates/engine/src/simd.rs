@@ -10,16 +10,129 @@ pub(crate) struct Outliers<'a> {
     pub values: &'a [f32],
 }
 
-fn gelu(x: f32) -> f32 {
+pub(crate) fn gelu_exact(x: f32) -> f32 {
     let coefficient = (2.0 / std::f32::consts::PI).sqrt();
     0.5 * x * (1.0 + (coefficient * (x + 0.044715 * x * x * x)).tanh())
+}
+
+#[cfg(target_arch = "aarch64")]
+const GELU_COEFFICIENT: f32 = 0.7978845608028654;
+
+// tanh(y) for |y| <= 0.75 is y times a degree-6 polynomial in y^2; beyond it,
+// 1 - 2/(exp(2|y|) + 1) with the exponential range-reduced to [-ln2/2, ln2/2].
+// Worst error against f64 tanh is one f32 ulp, and libm's tanhf costs roughly
+// two hundred cycles more per value.
+#[cfg(target_arch = "aarch64")]
+const TANH_SMALL: [f32; 7] = [
+    1.0000000000e+00,
+    -3.3333332411e-01,
+    1.3333223298e-01,
+    -5.3938657908e-02,
+    2.1621819977e-02,
+    -7.9409813272e-03,
+    1.9129803016e-03,
+];
+
+#[cfg(target_arch = "aarch64")]
+const EXP: [f32; 9] = [
+    1.0000000000e+00,
+    1.0000000000e+00,
+    4.9999999981e-01,
+    1.6666666680e-01,
+    4.1666700572e-02,
+    8.3333087795e-03,
+    1.3882306881e-03,
+    1.9893930896e-04,
+    2.8073170020e-05,
+];
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn gelu_in_place(y: &mut [f32]) {
+    use std::arch::aarch64::*;
+
+    let (chunks, tail) = y.as_chunks_mut::<4>();
+    // SAFETY: each chunk holds exactly four floats; the constants are compile-time.
+    unsafe {
+        let coefficient = vdupq_n_f32(GELU_COEFFICIENT);
+        let cubic = vdupq_n_f32(0.044715);
+        let two = vdupq_n_f32(2.0);
+        let one = vdupq_n_f32(1.0);
+        let half = vdupq_n_f32(0.5);
+        let limit = vdupq_n_f32(0.75);
+        let clamp = vdupq_n_f32(40.0);
+        let log2 = vdupq_n_f32(std::f32::consts::LOG2_E);
+        let ln2 = vdupq_n_f32(std::f32::consts::LN_2);
+        let bias = vdupq_n_s32(127);
+        let mut small = [vdupq_n_f32(0.0); 7];
+        for (value, coefficient) in small.iter_mut().zip(TANH_SMALL) {
+            *value = vdupq_n_f32(coefficient);
+        }
+        let mut exp = [vdupq_n_f32(0.0); 9];
+        for (value, coefficient) in exp.iter_mut().zip(EXP) {
+            *value = vdupq_n_f32(coefficient);
+        }
+
+        for chunk in chunks {
+            let x = vld1q_f32(chunk.as_ptr());
+            let cube = vmulq_f32(vmulq_f32(x, x), x);
+            let argument = vmulq_f32(coefficient, vfmaq_f32(x, cubic, cube));
+
+            let magnitude = vabsq_f32(argument);
+            let squared = vmulq_f32(argument, argument);
+            let mut polynomial = small[6];
+            for value in small[..6].iter().rev() {
+                polynomial = vfmaq_f32(*value, polynomial, squared);
+            }
+            let near = vmulq_f32(argument, polynomial);
+
+            let reduced = vminq_f32(vmulq_f32(magnitude, two), clamp);
+            let exponent = vcvtnq_s32_f32(vmulq_f32(reduced, log2));
+            let remainder = vfmaq_f32(
+                reduced,
+                vcvtq_f32_s32(exponent),
+                vnegq_f32(ln2),
+            );
+            let mut series = exp[8];
+            for value in exp[..8].iter().rev() {
+                series = vfmaq_f32(*value, series, remainder);
+            }
+            let power = vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(exponent, bias), 23));
+            let exponential = vmulq_f32(series, power);
+            let magnitude_tanh = vsubq_f32(
+                one,
+                vdivq_f32(two, vaddq_f32(exponential, one)),
+            );
+            let sign = vandq_u32(
+                vreinterpretq_u32_f32(argument),
+                vdupq_n_u32(0x8000_0000),
+            );
+            let far = vreinterpretq_f32_u32(vorrq_u32(
+                vreinterpretq_u32_f32(magnitude_tanh),
+                sign,
+            ));
+
+            let tanh = vbslq_f32(vcleq_f32(magnitude, limit), near, far);
+            let value = vmulq_f32(vmulq_f32(half, x), vaddq_f32(one, tanh));
+            vst1q_f32(chunk.as_mut_ptr(), value);
+        }
+    }
+    for value in tail {
+        *value = gelu_exact(*value);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) fn gelu_in_place(y: &mut [f32]) {
+    for value in y.iter_mut() {
+        *value = gelu_exact(*value);
+    }
 }
 
 #[inline]
 fn finish(sum: f32, bias: Option<f32>, with_gelu: bool) -> f32 {
     let value = sum + bias.unwrap_or(0.0);
     if with_gelu {
-        gelu(value)
+        gelu_exact(value)
     } else {
         value
     }
@@ -744,7 +857,7 @@ mod neon {
     use std::arch::aarch64::*;
     use std::ops::Range;
 
-    use super::{gelu, Epilogue};
+    use super::{gelu_exact, Epilogue};
 
     const DECODE_ROWS: usize = 2;
     const DECODE_ACCUMULATORS: usize = 4;
@@ -759,7 +872,7 @@ mod neon {
     fn finish(sum: f32, bias: Option<f32>, with_gelu: bool) -> f32 {
         let value = sum + bias.unwrap_or(0.0);
         if with_gelu {
-            gelu(value)
+            gelu_exact(value)
         } else {
             value
         }
@@ -1476,7 +1589,7 @@ mod wasm {
     use std::ops::Range;
     use std::ptr;
 
-    use super::{gelu, Epilogue};
+    use super::{gelu_exact, Epilogue};
 
     const DECODE_ACCUMULATORS: usize = 8;
     const PREFILL_TOKENS: usize = 4;
@@ -1488,7 +1601,7 @@ mod wasm {
     fn finish(sum: f32, bias: Option<f32>, with_gelu: bool) -> f32 {
         let value = sum + bias.unwrap_or(0.0);
         if with_gelu {
-            gelu(value)
+            gelu_exact(value)
         } else {
             value
         }
@@ -2026,13 +2139,13 @@ mod wasm {
 mod scalar {
     use std::ops::Range;
 
-    use super::{gelu, Epilogue};
+    use super::{gelu_exact, Epilogue};
 
     #[inline]
     fn finish(sum: f32, bias: Option<f32>, with_gelu: bool) -> f32 {
         let value = sum + bias.unwrap_or(0.0);
         if with_gelu {
-            gelu(value)
+            gelu_exact(value)
         } else {
             value
         }
@@ -2271,6 +2384,25 @@ mod tests {
     }
 
     #[test]
+    fn gelu_in_place_matches_the_libm_tanh_within_a_few_ulps() {
+        let values: Vec<f32> = (-30000..30000)
+            .map(|i| i as f32 / 1000.0)
+            .chain([-1e6, -1e4, -100.0, -33.0, 33.0, 100.0, 1e4, 1e6])
+            .collect();
+        let mut actual = values.clone();
+        super::gelu_in_place(&mut actual);
+        for (input, got) in values.iter().zip(&actual) {
+            let expected = super::gelu_exact(*input);
+            let error = (got - expected).abs();
+            let tolerance = 4.0 * f32::EPSILON * expected.abs().max(1.0);
+            assert!(
+                error <= tolerance,
+                "gelu({input}): expected {expected}, got {got}"
+            );
+        }
+    }
+
+    #[test]
     fn linear_matches_reference_on_odd_sizes() {
         for (rows, n_in, n_out) in [
             (1, 1, 1),
@@ -2404,7 +2536,7 @@ mod tests {
                 }
                 let value = sum as f32 + bias[j];
                 y[i * n_out + j] = if gelu_epilogue {
-                    super::gelu(value)
+                    super::gelu_exact(value)
                 } else {
                     value
                 };

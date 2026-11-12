@@ -8,8 +8,8 @@ use crate::parallel::Threads;
 use crate::quantize::{quantize_activation_outliers, quantize_activations, GROUP_SIZE};
 use crate::safetensors::SafeTensors;
 use crate::simd::{
-    dot, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
-    Epilogue, Int8ActivationKernels, Outliers,
+    dot, gelu_exact, gelu_in_place, int8_linear_outputs, int8_linear_rows, linear_outputs,
+    linear_rows, weighted_sum, Epilogue, Int8ActivationKernels, Outliers,
 };
 use crate::{argmax, Config, Error};
 
@@ -1252,8 +1252,9 @@ fn linear_f32(
                 n_in,
                 start..start + part.len(),
                 part,
-                epilogue,
+                Epilogue::Store,
             );
+            apply_epilogue(part, epilogue);
         });
     } else if split == RowSplit::ByOutput {
         run_output_split(threads, rows, n_out, y, |start, outputs, part| {
@@ -1265,8 +1266,9 @@ fn linear_f32(
                 n_in,
                 outputs,
                 part,
-                epilogue,
+                Epilogue::Store,
             );
+            apply_epilogue(part, epilogue);
         });
     } else {
         threads.run(y, n_out, |start, part| {
@@ -1280,8 +1282,9 @@ fn linear_f32(
                 n_in,
                 n_out,
                 part,
-                epilogue,
+                Epilogue::Store,
             );
+            apply_epilogue(part, epilogue);
         });
     }
 }
@@ -1311,9 +1314,10 @@ fn linear_int8(
                 n_in,
                 start..start + part.len(),
                 part,
-                epilogue,
+                Epilogue::Store,
                 GROUP_SIZE,
             );
+            apply_epilogue(part, epilogue);
         });
     } else if split == RowSplit::ByOutput {
         run_output_split(threads, rows, n_out, y, |start, outputs, part| {
@@ -1326,9 +1330,10 @@ fn linear_int8(
                 n_in,
                 outputs,
                 part,
-                epilogue,
+                Epilogue::Store,
                 GROUP_SIZE,
             );
+            apply_epilogue(part, epilogue);
         });
     } else {
         threads.run(y, n_out, |start, part| {
@@ -1343,9 +1348,10 @@ fn linear_int8(
                 n_in,
                 n_out,
                 part,
-                epilogue,
+                Epilogue::Store,
                 GROUP_SIZE,
             );
+            apply_epilogue(part, epilogue);
         });
     }
 }
@@ -1376,6 +1382,7 @@ fn linear_int8_activations(
         &mut activation_data[..rows * n_in],
         &mut activation_scale[..rows * groups],
     );
+    let with_gelu = matches!(epilogue, Epilogue::Gelu);
     let acts = QuantizedActs {
         data: &activation_data[..rows * n_in],
         scale: &activation_scale[..rows * groups],
@@ -1386,7 +1393,8 @@ fn linear_int8_activations(
     let weight_groups = n_in.div_ceil(GROUP_SIZE);
 
     if rows == 1 {
-        threads.run(y, 1, |start, part| {
+        let align = if with_gelu { acts.group } else { 1 };
+        threads.run(y, align, |start, part| {
             acts.kernels.linear_outputs(
                 acts.data,
                 acts.scale,
@@ -1397,9 +1405,12 @@ fn linear_int8_activations(
                 acts.group,
                 start..start + part.len(),
                 part,
-                epilogue,
+                Epilogue::Store,
                 acts.outliers,
             );
+            if with_gelu {
+                gelu_quantized(part, acts.group);
+            }
         });
     } else if split == RowSplit::ByOutput {
         run_output_split(threads, rows, n_out, y, |start, outputs, part| {
@@ -1414,9 +1425,14 @@ fn linear_int8_activations(
                 outputs,
                 acts.group,
                 part,
-                epilogue,
+                Epilogue::Store,
                 None,
             );
+            if with_gelu {
+                for value in part.iter_mut() {
+                    *value = gelu_exact(*value);
+                }
+            }
         });
     } else {
         threads.run(y, n_out, |start, part| {
@@ -1433,9 +1449,12 @@ fn linear_int8_activations(
                 n_out,
                 acts.group,
                 part,
-                epilogue,
+                Epilogue::Store,
                 None,
             );
+            if with_gelu {
+                gelu_quantized(part, acts.group);
+            }
         });
     }
 }
@@ -1947,6 +1966,59 @@ fn add_in_place(x: &mut [f32], y: &[f32]) {
     }
 }
 
+// GELU runs after the vector kernel so the libm call neither spills the tile's
+// accumulators nor blocks vectorization of the bias add.
+fn apply_epilogue(y: &mut [f32], epilogue: Epilogue) {
+    if matches!(epilogue, Epilogue::Gelu) {
+        for value in y.iter_mut() {
+            *value = gelu_exact(*value);
+        }
+    }
+}
+
+// GELU in front of an int8 activation quantizer: the vector kernel's result is
+// kept except where its last bits could decide a quantized value or the group's
+// scale, and those elements are recomputed with libm's tanhf.
+fn gelu_quantized(y: &mut [f32], group: usize) {
+    for chunk in y.chunks_mut(group) {
+        gelu_quantized_group(chunk);
+    }
+}
+
+fn gelu_quantized_group(chunk: &mut [f32]) {
+    const CAPACITY: usize = 64;
+    debug_assert!(chunk.len() <= CAPACITY, "activation group is wider than 64");
+    let mut before = [0.0f32; CAPACITY];
+    before[..chunk.len()].copy_from_slice(chunk);
+    let before = &before[..chunk.len()];
+
+    gelu_in_place(chunk);
+    let mut largest = 0.0f32;
+    for value in chunk.iter() {
+        largest = largest.max(value.abs());
+    }
+    if largest == 0.0 {
+        return;
+    }
+
+    let near_largest = largest * (1.0 - 1e-5);
+    let mut exact_largest = 0.0f32;
+    for (value, &source) in chunk.iter_mut().zip(before) {
+        if value.abs() >= near_largest {
+            *value = gelu_exact(source);
+            exact_largest = exact_largest.max(value.abs());
+        }
+    }
+
+    let scale = exact_largest / 127.0;
+    for (value, &source) in chunk.iter_mut().zip(before) {
+        let scaled = *value / scale;
+        if (scaled - scaled.round()).abs() > 0.5 - 1e-4 {
+            *value = gelu_exact(source);
+        }
+    }
+}
+
 fn layer_norm_into(x: &[f32], weight: &[f32], bias: &[f32], eps: f32, output: &mut [f32]) {
     let count = x.len() as f32;
     let mean = x.iter().sum::<f32>() / count;
@@ -1976,6 +2048,36 @@ mod tests {
             .collect();
         let bias = (0..n_out).map(|i| i as f32 / 9.0 - 1.0).collect();
         (x, weight, bias)
+    }
+
+    #[test]
+    fn quantized_gelu_keeps_the_values_the_activation_quantizer_can_see() {
+        use super::{gelu_exact, gelu_quantized};
+        use crate::quantize::quantize_activations;
+
+        for group in [16usize, 32, 64] {
+            let rows = 7;
+            let n_in: usize = 4 * 768;
+            let values: Vec<f32> = (0..rows * n_in)
+                .map(|i| ((i * 61 + 17) % 211) as f32 / 19.0 - 5.0)
+                .collect();
+            let mut fast = values.clone();
+            gelu_quantized(&mut fast, group);
+            let mut exact: Vec<f32> = values.iter().map(|&value| gelu_exact(value)).collect();
+
+            let groups = n_in.div_ceil(group);
+            let mut fast_data = vec![0i8; rows * n_in];
+            let mut fast_scale = vec![0.0f32; rows * groups];
+            quantize_activations(&fast, rows, n_in, group, &mut fast_data, &mut fast_scale);
+            let mut exact_data = vec![0i8; rows * n_in];
+            let mut exact_scale = vec![0.0f32; rows * groups];
+            quantize_activations(&exact, rows, n_in, group, &mut exact_data, &mut exact_scale);
+
+            assert_eq!(fast_data, exact_data, "group {group}");
+            for (a, e) in fast_scale.iter().zip(&exact_scale) {
+                assert_eq!(a.to_bits(), e.to_bits(), "group {group} scale");
+            }
+        }
     }
 
     #[test]
