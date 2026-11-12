@@ -12,7 +12,7 @@ use crate::quantize::{
 };
 use crate::safetensors::SafeTensors;
 use crate::simd::{
-    dot, gelu_exact, gelu_in_place, int8_linear_outputs, int8_linear_rows, linear_outputs,
+    dot, dot2, gelu_exact, gelu_in_place, int8_linear_outputs, int8_linear_rows, linear_outputs,
     linear_rows, weighted_sum, Epilogue, Int8ActivationKernels, Outliers,
 };
 use crate::{argmax, Config, Error};
@@ -461,6 +461,15 @@ fn weight_entry(tensors: &mut Vec<serde_json::Value>, name: String, shape: Vec<u
     tensors.push(json!({"name": name, "shape": shape, "int8": int8}));
 }
 
+// Each worker quantizes the activation rows it is about to multiply.
+struct ActivationBuffers {
+    data: *mut i8,
+    scale: *mut f32,
+}
+
+// SAFETY: the row ranges handed to the threads are disjoint.
+unsafe impl Sync for ActivationBuffers {}
+
 struct Scratch {
     cache: KvCache,
     workspace: Workspace,
@@ -620,6 +629,7 @@ impl Model {
     // Taking the scratch out means a callback that calls back into the model
     // gets a fresh one instead of a double borrow.
     fn with_scratch<T>(&self, run: impl FnOnce(&mut KvCache, &mut Workspace) -> T) -> T {
+        *self.batch_scratch.borrow_mut() = Some(BatchScratch::empty());
         let mut scratch = self
             .scratch
             .borrow_mut()
@@ -634,6 +644,7 @@ impl Model {
         &self,
         run: impl FnOnce(&mut Vec<KvCache>, &mut Workspace) -> T,
     ) -> T {
+        *self.scratch.borrow_mut() = Some(Scratch::empty());
         let mut scratch = self
             .batch_scratch
             .borrow_mut()
@@ -772,6 +783,8 @@ impl Model {
         self.layers.clear();
         self.ln_f_weight = Vec::new();
         self.ln_f_bias = Vec::new();
+        *self.scratch.get_mut() = Some(Scratch::empty());
+        *self.batch_scratch.get_mut() = Some(BatchScratch::empty());
     }
 
     fn matrix(&self, name: &str) -> Option<(usize, usize, &Matrix)> {
@@ -1499,41 +1512,25 @@ fn linear_int8_activations(
     split: RowSplit,
 ) {
     let groups = n_in.div_ceil(mode.group);
+    let with_gelu = matches!(epilogue, Epilogue::Gelu);
+    let weight_groups = n_in.div_ceil(GROUP_SIZE);
+
     if rows == 1 {
         quantize_activations(
-            &x[..rows * n_in],
+            x,
             rows,
             n_in,
             mode.group,
             &mut activation_data[..rows * n_in],
             &mut activation_scale[..rows * groups],
         );
-    } else {
-        quantize_activations_interleaved(
-            &x[..rows * n_in],
-            rows,
-            n_in,
-            mode.group,
-            activation_data,
-            &mut activation_scale[..rows * groups],
-        );
-    }
-    let with_gelu = matches!(epilogue, Epilogue::Gelu);
-    let activation_len = if rows == 1 {
-        n_in
-    } else {
-        int8_layout::storage_len(rows, n_in)
-    };
-    let acts = QuantizedActs {
-        data: &activation_data[..activation_len],
-        scale: &activation_scale[..rows * groups],
-        group: mode.group,
-        kernels: mode.kernels,
-        outliers: None,
-    };
-    let weight_groups = n_in.div_ceil(GROUP_SIZE);
-
-    if rows == 1 {
+        let acts = QuantizedActs {
+            data: &activation_data[..n_in],
+            scale: &activation_scale[..groups],
+            group: mode.group,
+            kernels: mode.kernels,
+            outliers: None,
+        };
         let align = if with_gelu { acts.group } else { 1 };
         threads.run(y, align, |start, part| {
             acts.kernels.linear_outputs(
@@ -1553,7 +1550,26 @@ fn linear_int8_activations(
                 gelu_quantized(part, acts.group);
             }
         });
-    } else if split == RowSplit::ByOutput {
+        return;
+    }
+
+    let activation_len = int8_layout::storage_len(rows, n_in);
+    if split == RowSplit::ByOutput {
+        quantize_activations_interleaved(
+            x,
+            rows,
+            n_in,
+            mode.group,
+            activation_data,
+            &mut activation_scale[..rows * groups],
+        );
+        let acts = QuantizedActs {
+            data: &activation_data[..activation_len],
+            scale: &activation_scale[..rows * groups],
+            group: mode.group,
+            kernels: mode.kernels,
+            outliers: None,
+        };
         let stride = int8_layout::pair_stride(n_in);
         run_output_split(threads, rows, n_out, y, |start, outputs, part| {
             acts.kernels.linear_rows(
@@ -1576,31 +1592,58 @@ fn linear_int8_activations(
                 }
             }
         });
-    } else {
-        let stride = int8_layout::pair_stride(n_in);
-        threads.run(y, 2 * n_out, |start, part| {
-            let first = start / n_out;
-            let count = part.len() / n_out;
-            debug_assert!(first.is_multiple_of(2), "row split must keep pairs whole");
-            acts.kernels.linear_rows(
-                &acts.data[(first / 2) * stride..],
-                &acts.scale[first * groups..(first + count) * groups],
-                weight,
-                scale,
-                bias,
+        return;
+    }
+
+    let stride = int8_layout::pair_stride(n_in);
+    let targets = ActivationBuffers {
+        data: activation_data.as_mut_ptr(),
+        scale: activation_scale.as_mut_ptr(),
+    };
+    let targets = &targets;
+    threads.run(y, 2 * n_out, |start, part| {
+        let first = start / n_out;
+        let count = part.len() / n_out;
+        let base = (first / 2) * stride;
+        let len = int8_layout::storage_len(count, n_in);
+        debug_assert!(first.is_multiple_of(2), "row split must keep pairs whole");
+        // SAFETY: `first` is even and every thread owns a disjoint row range, so
+        // its data and scale slices do not overlap another thread's.
+        unsafe {
+            quantize_activations_interleaved(
+                &x[first * n_in..(first + count) * n_in],
                 count,
                 n_in,
-                n_out,
-                acts.group,
-                part,
-                Epilogue::Store,
-                None,
+                mode.group,
+                std::slice::from_raw_parts_mut(targets.data.add(base), len),
+                std::slice::from_raw_parts_mut(targets.scale.add(first * groups), count * groups),
             );
-            if with_gelu {
-                gelu_quantized(part, acts.group);
-            }
-        });
-    }
+        }
+        // SAFETY: the thread finishes writing its rows before reading them back.
+        let (data, scales) = unsafe {
+            (
+                std::slice::from_raw_parts(targets.data.add(base), len),
+                std::slice::from_raw_parts(targets.scale.add(first * groups), count * groups),
+            )
+        };
+        mode.kernels.linear_rows(
+            data,
+            scales,
+            weight,
+            scale,
+            bias,
+            count,
+            n_in,
+            n_out,
+            mode.group,
+            part,
+            Epilogue::Store,
+            None,
+        );
+        if with_gelu {
+            gelu_quantized(part, mode.group);
+        }
+    });
 }
 
 impl Layer {
@@ -1866,6 +1909,18 @@ struct Attention<'a> {
     scale: f32,
 }
 
+fn softmax(scores: &mut [f32]) {
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0;
+    for score in scores.iter_mut() {
+        *score = (*score - max).exp();
+        sum += *score;
+    }
+    for score in scores.iter_mut() {
+        *score /= sum;
+    }
+}
+
 impl Attention<'_> {
     fn head(&self, scores: &mut [f32], head: usize, row: usize, output: &mut [f32]) {
         let base = head * self.head_stride;
@@ -1878,20 +1933,45 @@ impl Attention<'_> {
             *score = dot(query, &keys[key..key + self.head_dim]) * self.scale;
         }
 
-        let max = scores[..end]
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0;
-        for score in &mut scores[..end] {
-            *score = (*score - max).exp();
-            sum += *score;
-        }
-        for score in &mut scores[..end] {
-            *score /= sum;
-        }
+        softmax(&mut scores[..end]);
 
         weighted_sum(&self.values[base..], self.head_dim, &scores[..end], output);
+    }
+
+    fn head_pair(
+        &self,
+        scores0: &mut [f32],
+        scores1: &mut [f32],
+        head: usize,
+        row: usize,
+        output0: &mut [f32],
+        output1: &mut [f32],
+    ) {
+        let base = head * self.head_stride;
+        let query0 = row * 3 * self.n_embd + head * self.head_dim;
+        let query1 = query0 + 3 * self.n_embd;
+        let end0 = self.start + row + 1;
+        let end1 = end0 + 1;
+        let query = [
+            &self.qkv[query0..query0 + self.head_dim],
+            &self.qkv[query1..query1 + self.head_dim],
+        ];
+        let keys = &self.keys[base..];
+        for past in 0..end0 {
+            let key = past * self.head_dim;
+            let pair = dot2(query, &keys[key..key + self.head_dim]);
+            scores0[past] = pair[0] * self.scale;
+            scores1[past] = pair[1] * self.scale;
+        }
+        let key = end0 * self.head_dim;
+        scores1[end0] = dot(query[1], &keys[key..key + self.head_dim]) * self.scale;
+
+        softmax(&mut scores0[..end0]);
+        softmax(&mut scores1[..end1]);
+
+        let values = &self.values[base..];
+        weighted_sum(values, self.head_dim, &scores0[..end0], output0);
+        weighted_sum(values, self.head_dim, &scores1[..end1], output1);
     }
 }
 
@@ -1957,17 +2037,37 @@ fn attention(
     threads.run_at(output, &starts, |offset, part| {
         SCORES.with(|buffer| {
             let mut buffer = buffer.borrow_mut();
-            if buffer.len() < start + n {
-                buffer.resize(config.n_ctx, 0.0);
+            if buffer.len() < 2 * config.n_ctx {
+                buffer.resize(2 * config.n_ctx, 0.0);
             }
-            let scores = &mut buffer[..start + n];
+            let (scores0, scores1) = buffer.split_at_mut(config.n_ctx);
             let first = offset / n_embd;
             let rows = part.len() / n_embd;
-            for row in first..first + rows {
-                let output = &mut part[(row - first) * n_embd..][..n_embd];
-                for head in 0..config.n_head {
-                    let base = head * head_dim;
-                    kernel.head(scores, head, row, &mut output[base..base + head_dim]);
+            let mut row = first;
+            while row < first + rows {
+                let local = (row - first) * n_embd;
+                if row + 1 < first + rows {
+                    let (pair, _) = part[local..].split_at_mut(2 * n_embd);
+                    let (output0, output1) = pair.split_at_mut(n_embd);
+                    for head in 0..config.n_head {
+                        let base = head * head_dim;
+                        kernel.head_pair(
+                            scores0,
+                            scores1,
+                            head,
+                            row,
+                            &mut output0[base..base + head_dim],
+                            &mut output1[base..base + head_dim],
+                        );
+                    }
+                    row += 2;
+                } else {
+                    let output = &mut part[local..][..n_embd];
+                    for head in 0..config.n_head {
+                        let base = head * head_dim;
+                        kernel.head(scores0, head, row, &mut output[base..base + head_dim]);
+                    }
+                    row += 1;
                 }
             }
         });

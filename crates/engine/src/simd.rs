@@ -2048,6 +2048,41 @@ mod neon {
         }
     }
 
+    pub(crate) fn dot2(a: [&[f32]; 2], b: &[f32]) -> [f32; 2] {
+        assert!(
+            a[0].len() == b.len() && a[1].len() == b.len(),
+            "dot product needs equal lengths"
+        );
+        let n = b.len();
+        let a0 = a[0].as_ptr();
+        let a1 = a[1].as_ptr();
+        let b = b.as_ptr();
+
+        // SAFETY: every load stays within `0..n`, and the scalar tail handles the rest.
+        unsafe {
+            let mut acc0 = [vdupq_n_f32(0.0); 8];
+            let mut acc1 = [vdupq_n_f32(0.0); 8];
+            let mut i = 0;
+            while i + 32 <= n {
+                for k in 0..8 {
+                    let bv = vld1q_f32(b.add(i + k * 4));
+                    acc0[k] = vfmaq_f32(acc0[k], vld1q_f32(a0.add(i + k * 4)), bv);
+                    acc1[k] = vfmaq_f32(acc1[k], vld1q_f32(a1.add(i + k * 4)), bv);
+                }
+                i += 32;
+            }
+            let mut sum0 = horizontal8(acc0);
+            let mut sum1 = horizontal8(acc1);
+            while i < n {
+                let bv = *b.add(i);
+                sum0 += *a0.add(i) * bv;
+                sum1 += *a1.add(i) * bv;
+                i += 1;
+            }
+            [sum0, sum1]
+        }
+    }
+
     pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len(), "dot product needs equal lengths");
         let n = a.len();
@@ -2620,6 +2655,10 @@ mod wasm {
         }
     }
 
+    pub(crate) fn dot2(a: [&[f32]; 2], b: &[f32]) -> [f32; 2] {
+        [dot(a[0], b), dot(a[1], b)]
+    }
+
     pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len(), "dot product needs equal lengths");
         let n = a.len();
@@ -2790,6 +2829,10 @@ mod scalar {
         total
     }
 
+    pub(crate) fn dot2(a: [&[f32]; 2], b: &[f32]) -> [f32; 2] {
+        [dot(a[0], b), dot(a[1], b)]
+    }
+
     pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len(), "dot product needs equal lengths");
         a.iter().zip(b).map(|(x, y)| x * y).sum()
@@ -2814,7 +2857,7 @@ mod scalar {
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) use neon::{
-    dot, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
+    dot, dot2, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
 };
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -2822,7 +2865,7 @@ pub(crate) use neon::int8_dot;
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 pub(crate) use wasm::{
-    dot, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
+    dot, dot2, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
 };
 
 #[cfg(all(test, target_arch = "wasm32", target_feature = "simd128"))]
@@ -2833,7 +2876,7 @@ pub(crate) use wasm::int8_dot;
     all(target_arch = "wasm32", target_feature = "simd128")
 )))]
 pub(crate) use scalar::{
-    dot, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
+    dot, dot2, int8_linear_outputs, int8_linear_rows, linear_outputs, linear_rows, weighted_sum,
 };
 
 #[cfg(all(
