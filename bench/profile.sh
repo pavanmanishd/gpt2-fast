@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: bench/profile.sh <label> <prompt-id> <max_new_tokens> [--expected <file>] [--quantized] -- <worker command...>" >&2
+    echo "usage: bench/profile.sh <label> <prompt-id> <max_new_tokens> [--expected <file>] [--batch N] [--quantized] -- <worker command...>" >&2
     exit 1
 }
 
@@ -13,12 +13,18 @@ max_new_tokens=$3
 shift 3
 
 expected=reference/expected.json
+batch=
 quantized=
 while [[ $# -gt 0 ]]; do
     case $1 in
         --expected)
             [[ $# -ge 2 ]] || usage
             expected=$2
+            shift 2
+            ;;
+        --batch)
+            [[ $# -ge 2 ]] || usage
+            batch=$2
             shift 2
             ;;
         --quantized)
@@ -41,6 +47,14 @@ worker=("$@")
     echo "max_new_tokens must be a positive integer" >&2
     exit 1
 }
+if [[ -n $batch ]]; then
+    [[ $batch =~ ^[0-9]+$ ]] && (( batch >= 1 )) || {
+        echo "--batch must be a positive integer" >&2
+        exit 1
+    }
+fi
+batch_args=
+[[ -z $batch ]] || batch_args="--batch $batch"
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -58,7 +72,7 @@ image="gpt2-fast-bench:${commit}"
 docker build --platform linux/arm64 -t "$image" -f bench/Dockerfile .
 mkdir -p "results/runs/$label"
 
-inner="perf record -e cpu-clock -F 999 -g --call-graph dwarf -o /tmp/perf.data -- bench run --label $(printf '%q' "$label") --prompts bench/prompts.json --expected $(printf '%q' "$expected") --only $(printf '%q' "$prompt_id") --max-new-tokens $max_new_tokens --warmup 0 --runs 1 $quantized --out $(printf '%q' "results/runs/$label/profile.json") --"
+inner="perf record -e cpu-clock -F 999 -g --call-graph dwarf -o /tmp/perf.data -- bench run --label $(printf '%q' "$label") --prompts bench/prompts.json --expected $(printf '%q' "$expected") --only $(printf '%q' "$prompt_id") --max-new-tokens $max_new_tokens --warmup 0 --runs 1 $quantized $batch_args --out $(printf '%q' "results/runs/$label/profile.json") --"
 for argument in "${worker[@]}"; do
     inner+=" $(printf '%q' "$argument")"
 done

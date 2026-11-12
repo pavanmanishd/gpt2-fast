@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: bench/run.sh <label> <sessions> [--warmup N] [--runs N] [--expected <file>] [--quantized] -- <worker command...>" >&2
+    echo "usage: bench/run.sh <label> <sessions> [--warmup N] [--runs N] [--batch N] [--expected <file>] [--quantized] -- <worker command...>" >&2
     exit 1
 }
 
@@ -13,6 +13,7 @@ shift 2
 
 warmup=1
 runs=5
+batch=
 expected=reference/expected.json
 quantized=
 while [[ $# -gt 0 ]]; do
@@ -25,6 +26,11 @@ while [[ $# -gt 0 ]]; do
         --runs)
             [[ $# -ge 2 ]] || usage
             runs=$2
+            shift 2
+            ;;
+        --batch)
+            [[ $# -ge 2 ]] || usage
+            batch=$2
             shift 2
             ;;
         --expected)
@@ -60,6 +66,14 @@ worker=("$@")
     echo "--runs must be a positive integer" >&2
     exit 1
 }
+if [[ -n $batch ]]; then
+    [[ $batch =~ ^[0-9]+$ ]] && (( batch >= 1 )) || {
+        echo "--batch must be a positive integer" >&2
+        exit 1
+    }
+fi
+batch_args=
+[[ -z $batch ]] || batch_args="--batch $batch"
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -84,7 +98,7 @@ for session in $(seq 1 "$sessions"); do
         -v "$PWD/results/runs:/work/results/runs" \
         "$image" \
         bench run --label "$label" --prompts bench/prompts.json --expected "$expected" \
-        --warmup "$warmup" --runs "$runs" $quantized \
+        --warmup "$warmup" --runs "$runs" $quantized $batch_args \
         --out "results/runs/$label/session-$session.json" \
         -- "${worker[@]}"
 done
