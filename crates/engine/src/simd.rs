@@ -128,6 +128,158 @@ pub(crate) fn gelu_in_place(y: &mut [f32]) {
     }
 }
 
+// GELU in front of an int8 activation quantizer: the vector result is kept
+// except where its last bits could decide a quantized value or the group's
+// scale, and those elements are recomputed with libm's tanhf. Both tests run
+// four values at a time; the scalar form walks the elements one by one.
+pub(crate) fn gelu_quantized_group(chunk: &mut [f32]) {
+    const CAPACITY: usize = 64;
+    debug_assert!(chunk.len() <= CAPACITY, "activation group is wider than 64");
+    let length = chunk.len();
+    let mut before = [0.0f32; CAPACITY];
+    before[..length].copy_from_slice(chunk);
+    let before = &before[..length];
+
+    gelu_in_place(chunk);
+    let largest = max_abs(chunk);
+    if largest == 0.0 {
+        return;
+    }
+
+    let near_largest = largest * (1.0 - 1e-5);
+    let exact_largest = exact_largest_and_fix(chunk, before, near_largest);
+    let scale = exact_largest / 127.0;
+    fix_boundaries(chunk, before, scale);
+}
+
+// Recomputes the elements that set the group's scale, and returns that scale's
+// numerator.
+#[cfg(target_arch = "aarch64")]
+fn exact_largest_and_fix(chunk: &mut [f32], before: &[f32], near_largest: f32) -> f32 {
+    use std::arch::aarch64::*;
+    let length = chunk.len();
+    let mut exact_largest = 0.0f32;
+    // SAFETY: every vector load reads four floats below `length`; the scalar
+    // tail covers the rest.
+    unsafe {
+        let values = chunk.as_mut_ptr();
+        let near = vdupq_n_f32(near_largest);
+        let mut at = 0;
+        while at + 4 <= length {
+            let magnitude = vabsq_f32(vld1q_f32(values.add(at)));
+            if vmaxvq_u32(vcageq_f32(magnitude, near)) != 0 {
+                for lane in 0..4 {
+                    let index = at + lane;
+                    let value = *values.add(index);
+                    if value.abs() >= near_largest {
+                        let exact = gelu_exact(before[index]);
+                        *values.add(index) = exact;
+                        exact_largest = exact_largest.max(exact.abs());
+                    }
+                }
+            }
+            at += 4;
+        }
+        while at < length {
+            let value = *values.add(at);
+            if value.abs() >= near_largest {
+                let exact = gelu_exact(before[at]);
+                *values.add(at) = exact;
+                exact_largest = exact_largest.max(exact.abs());
+            }
+            at += 1;
+        }
+    }
+    exact_largest
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn exact_largest_and_fix(chunk: &mut [f32], before: &[f32], near_largest: f32) -> f32 {
+    let mut exact_largest = 0.0f32;
+    for (value, &source) in chunk.iter_mut().zip(before) {
+        if value.abs() >= near_largest {
+            *value = gelu_exact(source);
+            exact_largest = exact_largest.max(value.abs());
+        }
+    }
+    exact_largest
+}
+
+// Recomputes the elements close enough to a quantizer rounding boundary that
+// the vector result's last bits could pick the neighbouring value.
+#[cfg(target_arch = "aarch64")]
+fn fix_boundaries(chunk: &mut [f32], before: &[f32], scale: f32) {
+    use std::arch::aarch64::*;
+    let length = chunk.len();
+    let limit = 0.5 - 1e-4;
+    // SAFETY: every vector load reads four floats below `length`; the scalar
+    // tail covers the rest.
+    unsafe {
+        let values = chunk.as_mut_ptr();
+        let scale_vector = vdupq_n_f32(scale);
+        let mut at = 0;
+        while at + 4 <= length {
+            let scaled = vdivq_f32(vld1q_f32(values.add(at)), scale_vector);
+            let rounded = vrndaq_f32(scaled);
+            let distance = vabsq_f32(vsubq_f32(scaled, rounded));
+            if vmaxvq_f32(distance) > limit {
+                for lane in 0..4 {
+                    let index = at + lane;
+                    let scaled = *values.add(index) / scale;
+                    if (scaled - scaled.round()).abs() > limit {
+                        *values.add(index) = gelu_exact(before[index]);
+                    }
+                }
+            }
+            at += 4;
+        }
+        while at < length {
+            let scaled = *values.add(at) / scale;
+            if (scaled - scaled.round()).abs() > limit {
+                *values.add(at) = gelu_exact(before[at]);
+            }
+            at += 1;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn fix_boundaries(chunk: &mut [f32], before: &[f32], scale: f32) {
+    for (value, &source) in chunk.iter_mut().zip(before) {
+        let scaled = *value / scale;
+        if (scaled - scaled.round()).abs() > 0.5 - 1e-4 {
+            *value = gelu_exact(source);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn max_abs(values: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let (chunks, tail) = values.as_chunks::<4>();
+    // SAFETY: each chunk holds exactly four floats.
+    let mut largest = unsafe {
+        let mut max = vdupq_n_f32(0.0);
+        for chunk in chunks {
+            max = vmaxq_f32(max, vabsq_f32(vld1q_f32(chunk.as_ptr())));
+        }
+        vmaxvq_f32(max)
+    };
+    for value in tail {
+        largest = largest.max(value.abs());
+    }
+    largest
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn max_abs(values: &[f32]) -> f32 {
+    let mut largest = 0.0f32;
+    for value in values {
+        largest = largest.max(value.abs());
+    }
+    largest
+}
+
 #[inline]
 fn finish(sum: f32, bias: Option<f32>, with_gelu: bool) -> f32 {
     let value = sum + bias.unwrap_or(0.0);

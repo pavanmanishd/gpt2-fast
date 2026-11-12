@@ -12,8 +12,8 @@ use crate::quantize::{
 };
 use crate::safetensors::SafeTensors;
 use crate::simd::{
-    dot, dot2, gelu_exact, gelu_in_place, int8_linear_outputs, int8_linear_rows, linear_outputs,
-    linear_rows, weighted_sum, Epilogue, Int8ActivationKernels, Outliers,
+    dot, dot2, gelu_exact, gelu_quantized_group, int8_linear_outputs, int8_linear_rows,
+    linear_outputs, linear_rows, weighted_sum, Epilogue, Int8ActivationKernels, Outliers,
 };
 use crate::{argmax, Config, Error};
 
@@ -2226,40 +2226,6 @@ fn apply_epilogue(y: &mut [f32], epilogue: Epilogue) {
 fn gelu_quantized(y: &mut [f32], group: usize) {
     for chunk in y.chunks_mut(group) {
         gelu_quantized_group(chunk);
-    }
-}
-
-fn gelu_quantized_group(chunk: &mut [f32]) {
-    const CAPACITY: usize = 64;
-    debug_assert!(chunk.len() <= CAPACITY, "activation group is wider than 64");
-    let mut before = [0.0f32; CAPACITY];
-    before[..chunk.len()].copy_from_slice(chunk);
-    let before = &before[..chunk.len()];
-
-    gelu_in_place(chunk);
-    let mut largest = 0.0f32;
-    for value in chunk.iter() {
-        largest = largest.max(value.abs());
-    }
-    if largest == 0.0 {
-        return;
-    }
-
-    let near_largest = largest * (1.0 - 1e-5);
-    let mut exact_largest = 0.0f32;
-    for (value, &source) in chunk.iter_mut().zip(before) {
-        if value.abs() >= near_largest {
-            *value = gelu_exact(source);
-            exact_largest = exact_largest.max(value.abs());
-        }
-    }
-
-    let scale = exact_largest / 127.0;
-    for (value, &source) in chunk.iter_mut().zip(before) {
-        let scaled = *value / scale;
-        if (scaled - scaled.round()).abs() > 0.5 - 1e-4 {
-            *value = gelu_exact(source);
-        }
     }
 }
 
