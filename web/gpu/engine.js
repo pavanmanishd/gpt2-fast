@@ -196,6 +196,29 @@ export class GpuEngine {
         uniform(6),
       ]),
       argmax: layout([readOnly(0), uniform(1)]),
+      sampleReset: layout([readWrite(0)]),
+      samplePenalty: layout([
+        readWrite(0),
+        readOnly(1),
+        readWrite(2),
+        readWrite(3),
+        uniform(4),
+      ]),
+      sampleBucket: layout([readOnly(0), readWrite(1), uniform(2)]),
+      sampleGather: layout([
+        readOnly(0),
+        readOnly(1),
+        readWrite(2),
+        readWrite(3),
+        uniform(4),
+      ]),
+      sampleToken: layout([
+        readOnly(0),
+        readOnly(1),
+        readWrite(2),
+        readWrite(3),
+        uniform(4),
+      ]),
     };
   }
 
@@ -235,6 +258,26 @@ export class GpuEngine {
         [step, this.int8 ? layouts.headInt8 : layouts.headF32],
       ),
       argmax: await build(shaders.argmax, [step, layouts.argmax]),
+      sampleReset: await build(shaders.sampleReset, [
+        step,
+        layouts.sampleReset,
+      ]),
+      samplePenalty: await build(shaders.samplePenalty, [
+        step,
+        layouts.samplePenalty,
+      ]),
+      sampleBucket: await build(shaders.sampleBucket, [
+        step,
+        layouts.sampleBucket,
+      ]),
+      sampleGather: await build(shaders.sampleGather, [
+        step,
+        layouts.sampleGather,
+      ]),
+      sampleToken: await build(shaders.sampleToken, [
+        step,
+        layouts.sampleToken,
+      ]),
     };
   }
 
@@ -530,6 +573,29 @@ export class GpuEngine {
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
     this.bytes.staging += this.logitsStaging.size;
+
+    this.keys = scalar(vocab_size);
+    this.history = scalar(vocab_size);
+    this.histogram = scalar(65536);
+    this.selectState = scalar(4);
+    this.candidateCount = scalar(4);
+    this.candidates = scalar(256);
+    this.bytes.activations +=
+      this.keys.size +
+      this.history.size +
+      this.histogram.size +
+      this.selectState.size +
+      this.candidateCount.size +
+      this.candidates.size;
+    this.sampleParams = [];
+    for (let slot = 0; slot < this.depth; slot += 1) {
+      this.sampleParams.push(
+        this.device.createBuffer({
+          size: 32,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        }),
+      );
+    }
   }
 
   bindGroup(layout, entries) {
@@ -745,6 +811,43 @@ export class GpuEngine {
       ]),
       width: 1,
     };
+
+    this.sampleResetGroup = this.bindGroup(layouts.sampleReset, [
+      entry(0, this.histogram),
+    ]);
+    this.sampleGroups = [];
+    for (let slot = 0; slot < this.depth; slot += 1) {
+      const params = this.sampleParams[slot];
+      this.sampleGroups.push({
+        penalty: this.bindGroup(layouts.samplePenalty, [
+          entry(0, this.logitsBuffer),
+          entry(1, this.history),
+          entry(2, this.histogram),
+          entry(3, this.keys),
+          entry(4, params),
+        ]),
+        bucket: this.bindGroup(layouts.sampleBucket, [
+          entry(0, this.histogram),
+          entry(1, this.selectState),
+          entry(2, params),
+        ]),
+        gather: this.bindGroup(layouts.sampleGather, [
+          entry(0, this.keys),
+          entry(1, this.selectState),
+          entry(2, this.candidates),
+          entry(3, this.candidateCount),
+          entry(4, params),
+        ]),
+        token: this.bindGroup(layouts.sampleToken, [
+          entry(0, this.logitsBuffer),
+          entry(1, this.candidates),
+          entry(2, this.candidateCount),
+          entry(3, this.history),
+          entry(4, params),
+        ]),
+      });
+    }
+    this.sampleWorkgroups = Math.ceil(vocab / 256);
   }
 
   writeStep(slot, start, rows) {
@@ -762,7 +865,7 @@ export class GpuEngine {
     this.device.queue.writeBuffer(this.finalParams[slot], 0, final);
   }
 
-  encodeForward(encoder, slot, rows, includeArgmax) {
+  encodeForward(encoder, slot, rows, includeArgmax, includeSample = false) {
     const pass = encoder.beginComputePass();
     const stepGroup = this.stepBindGroups[slot];
     const run = (item, x, y, group) => {
@@ -777,10 +880,37 @@ export class GpuEngine {
     }
     run(this.finalPass, 1, 1, this.finalBindGroups[slot]);
     run(this.headPass, this.headPass.width, 1);
-    if (includeArgmax) {
+    if (includeSample) {
+      const groups = this.sampleGroups[slot];
+      const sample = (pipeline, group, workgroups) => {
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, stepGroup);
+        pass.setBindGroup(1, group);
+        pass.dispatchWorkgroups(workgroups, 1, 1);
+      };
+      sample(this.pipelines.sampleReset, this.sampleResetGroup, 256);
+      sample(this.pipelines.samplePenalty, groups.penalty, this.sampleWorkgroups);
+      sample(this.pipelines.sampleBucket, groups.bucket, 1);
+      sample(this.pipelines.sampleGather, groups.gather, this.sampleWorkgroups);
+      sample(this.pipelines.sampleToken, groups.token, 1);
+    } else if (includeArgmax) {
       run(this.argmaxPass, 1, 1);
     }
     pass.end();
+  }
+
+  writeSample(slot, counter, sampling) {
+    const bytes = new ArrayBuffer(32);
+    const view = new DataView(bytes);
+    view.setFloat32(0, sampling.temperature, true);
+    view.setUint32(4, Math.min(Math.max(Math.round(sampling.topK), 1), 256), true);
+    view.setFloat32(8, sampling.topP, true);
+    view.setFloat32(12, sampling.repetitionPenalty, true);
+    view.setUint32(16, sampling.seed >>> 0, true);
+    view.setUint32(20, counter, true);
+    view.setUint32(24, this.config.vocab_size, true);
+    view.setUint32(28, 256, true);
+    this.device.queue.writeBuffer(this.sampleParams[slot], 0, bytes);
   }
 
   writeTokens(ids) {
@@ -811,7 +941,7 @@ export class GpuEngine {
     return values;
   }
 
-  async generate(ids, maxNewTokens, onToken) {
+  async generate(ids, maxNewTokens, onToken, sampling = null) {
     if (ids.length === 0) {
       throw new Error("generate requires at least one token id");
     }
@@ -822,6 +952,13 @@ export class GpuEngine {
       return;
     }
     this.writeTokens(ids);
+    if (sampling) {
+      const counts = new Uint32Array(this.config.vocab_size);
+      for (const id of ids) {
+        counts[id] += 1;
+      }
+      this.device.queue.writeBuffer(this.history, 0, counts);
+    }
     const pending = [];
     let submitted = 0;
     const submit = () => {
@@ -830,8 +967,11 @@ export class GpuEngine {
       const start = index === 0 ? 0 : ids.length + index - 1;
       const rows = index === 0 ? ids.length : 1;
       this.writeStep(slot, start, rows);
+      if (sampling) {
+        this.writeSample(slot, index, sampling);
+      }
       const encoder = this.device.createCommandEncoder();
-      this.encodeForward(encoder, slot, rows, true);
+      this.encodeForward(encoder, slot, rows, !sampling, sampling !== null);
       encoder.copyBufferToBuffer(
         this.tokens,
         (start + rows) * 4,
@@ -856,9 +996,16 @@ export class GpuEngine {
     for (let index = 0; index < Math.min(this.depth, maxNewTokens); index += 1) {
       submit();
     }
+    let stopped = false;
     while (pending.length > 0) {
       const token = await pending.shift();
-      onToken(token);
+      if (stopped) {
+        continue;
+      }
+      if (onToken(token) === false) {
+        stopped = true;
+        continue;
+      }
       if (submitted < maxNewTokens) {
         submit();
       }

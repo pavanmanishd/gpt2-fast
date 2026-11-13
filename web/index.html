@@ -64,19 +64,58 @@
 
         <div class="prompt-block">
           <label for="prompt">Prompt</label>
-          <textarea id="prompt" rows="5" spellcheck="false">When I wrote the following pages, or rather the bulk of them, I lived alone, in the woods, a mile from any neighbor, in a house which I had built myself, on the shore of Walden Pond, in Concord, Massachusetts, and earned my living by the labor of my hands only. I lived</textarea>
+          <textarea id="prompt" rows="5" spellcheck="false">The house stood at the end of a long gravel road, and nobody had lived in it for thirty years. The letter that arrived on Monday was addressed to</textarea>
+          <div id="prompt-examples" class="prompt-examples" aria-label="Example prompts">
+            <span class="prompt-examples-label">Try</span>
+            <button
+              type="button"
+              class="chip"
+              data-prompt="The house stood at the end of a long gravel road, and nobody had lived in it for thirty years. The letter that arrived on Monday was addressed to"
+            >
+              A story
+            </button>
+            <button
+              type="button"
+              class="chip"
+              data-prompt="When I wrote the following pages, or rather the bulk of them, I lived alone, in the woods, a mile from any neighbor, in a house which I had built myself, on the shore of Walden Pond, in Concord, Massachusetts, and earned my living by the labor of my hands only. I lived"
+            >
+              Walden
+            </button>
+            <button
+              type="button"
+              class="chip"
+              data-prompt="A spectre is haunting Europe&mdash;the spectre of Communism. All the Powers of old Europe have entered into a holy alliance to exorcise this spectre:"
+            >
+              Manifesto
+            </button>
+            <button
+              type="button"
+              class="chip"
+              data-prompt="In the summer of 1969, a small team of engineers gathered in a rented office in Menlo Park. Their job was to build a machine that could"
+            >
+              Moon landing
+            </button>
+          </div>
         </div>
 
         <div class="demo-controls">
           <button id="generate" type="button" disabled>Generate</button>
           <button id="stop" type="button" class="secondary" disabled>Stop</button>
           <label class="select-label" for="max-tokens">
-            New tokens
+            Max tokens
             <select id="max-tokens">
-              <option value="32">32</option>
               <option value="64">64</option>
-              <option value="128" selected>128</option>
+              <option value="128">128</option>
+              <option value="200" selected>200</option>
               <option value="256">256</option>
+              <option value="512">512</option>
+            </select>
+          </label>
+          <label class="select-label" for="decode-mode">
+            Mode
+            <select id="decode-mode">
+              <option value="sample" selected>Sampling</option>
+              <option value="greedy">Greedy (exact)</option>
             </select>
           </label>
           <label class="select-label" for="backend-mode">
@@ -88,6 +127,73 @@
             </select>
           </label>
         </div>
+
+        <details id="sampling-settings" class="settings">
+          <summary id="settings-summary">Sampling</summary>
+          <div class="settings-fields">
+            <label class="setting">
+              <span>Temperature</span>
+              <input
+                id="temperature"
+                type="number"
+                min="0"
+                max="2"
+                step="0.05"
+                value="0.8"
+                inputmode="decimal"
+              />
+            </label>
+            <label class="setting">
+              <span>Top-k</span>
+              <input
+                id="top-k"
+                type="number"
+                min="1"
+                max="100"
+                step="1"
+                value="40"
+                inputmode="numeric"
+              />
+            </label>
+            <label class="setting">
+              <span>Top-p</span>
+              <input
+                id="top-p"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                value="0.95"
+                inputmode="decimal"
+              />
+            </label>
+            <label class="setting">
+              <span>Repetition penalty</span>
+              <input
+                id="repetition-penalty"
+                type="number"
+                min="1"
+                max="2"
+                step="0.05"
+                value="1.2"
+                inputmode="decimal"
+              />
+            </label>
+            <label class="setting">
+              <span>Seed</span>
+              <input
+                id="seed"
+                type="number"
+                min="0"
+                max="4294967295"
+                step="1"
+                placeholder="random each run"
+                inputmode="numeric"
+              />
+            </label>
+            <button id="new-seed" type="button" class="secondary small">New seed</button>
+          </div>
+        </details>
 
         <dl class="meter" aria-label="Live generation meter">
           <div class="meter-cell">
@@ -118,8 +224,12 @@
 
         <p id="backend-note" class="fine" hidden></p>
         <p class="fine">
-          Greedy decoding: the same prompt always gives the same text. Stop ends
-          the worker; the next load comes from the browser's cache.
+          Sampling draws from the model's distribution, so the text keeps moving
+          instead of looping: temperature, top-k, top-p and a repetition penalty
+          shape each draw. Greedy always takes the single most likely token and
+          is what the device benchmark below uses. Generation stops at GPT-2's
+          end-of-text token, at the Max tokens limit, or when you press Stop; the
+          limit is clamped to what is left of the model's 1,024-token context.
         </p>
       </section>
 

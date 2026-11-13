@@ -115,6 +115,7 @@ async function generate() {
         ids: encoded.ids,
         maxNewTokens: MAX_NEW_TOKENS,
         stream: true,
+        endToken: 50256,
       },
       (message) => {
         const now = performance.now();

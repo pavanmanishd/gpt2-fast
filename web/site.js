@@ -20,7 +20,17 @@ const els = {
   generate: document.getElementById("generate"),
   stop: document.getElementById("stop"),
   maxTokens: document.getElementById("max-tokens"),
+  decodeMode: document.getElementById("decode-mode"),
   backendMode: document.getElementById("backend-mode"),
+  settings: document.getElementById("sampling-settings"),
+  settingsSummary: document.getElementById("settings-summary"),
+  temperature: document.getElementById("temperature"),
+  topK: document.getElementById("top-k"),
+  topP: document.getElementById("top-p"),
+  penalty: document.getElementById("repetition-penalty"),
+  seed: document.getElementById("seed"),
+  newSeed: document.getElementById("new-seed"),
+  examples: document.getElementById("prompt-examples"),
   output: document.getElementById("output"),
   meterSpeed: document.getElementById("meter-speed"),
   meterTtft: document.getElementById("meter-ttft"),
@@ -442,9 +452,77 @@ function updateControls() {
   els.stop.disabled = !generating;
   els.prompt.disabled = busy;
   els.maxTokens.disabled = busy;
+  els.decodeMode.disabled = loading || busy;
   els.backendMode.disabled = loading || busy;
+  for (const input of [
+    els.temperature,
+    els.topK,
+    els.topP,
+    els.penalty,
+    els.seed,
+    els.newSeed,
+  ]) {
+    input.disabled = loading || busy;
+  }
+  for (const chip of els.examples.querySelectorAll(".chip")) {
+    chip.disabled = loading || busy;
+  }
   els.runBench.disabled =
     modelReady === null || busy || benchRunning || !deviceBench;
+}
+
+function samplingSettings() {
+  const number = (input, fallback, min, max) => {
+    const value = Number.parseFloat(input.value);
+    if (!Number.isFinite(value)) {
+      return fallback;
+    }
+    return Math.min(max, Math.max(min, value));
+  };
+  return {
+    temperature: number(els.temperature, 0.8, 0, 2),
+    topK: Math.round(number(els.topK, 40, 1, 100)),
+    topP: number(els.topP, 0.95, 0, 1),
+    repetitionPenalty: number(els.penalty, 1.2, 1, 2),
+  };
+}
+
+function randomSeed() {
+  if (globalThis.crypto?.getRandomValues) {
+    return crypto.getRandomValues(new Uint32Array(1))[0];
+  }
+  return Math.floor(Math.random() * 4294967296) >>> 0;
+}
+
+function seedForRun() {
+  const typed = Number.parseInt(els.seed.value, 10);
+  if (Number.isFinite(typed) && typed >= 0) {
+    return typed >>> 0;
+  }
+  return randomSeed();
+}
+
+function updateSamplingSummary() {
+  const seed = els.seed.value.trim();
+  if (els.decodeMode.value === "greedy") {
+    els.settingsSummary.textContent =
+      "Greedy exact: always the single most likely token";
+    return;
+  }
+  const settings = samplingSettings();
+  els.settingsSummary.textContent = [
+    `temperature ${settings.temperature}`,
+    `top-k ${settings.topK}`,
+    `top-p ${settings.topP}`,
+    `penalty ${settings.repetitionPenalty}`,
+    seed.length > 0 ? `seed ${seed}` : "random seed each run",
+    `max ${els.maxTokens.value} tokens`,
+  ].join(" \u00b7 ");
+}
+
+function updateSettingsVisibility() {
+  els.settings.hidden = els.decodeMode.value === "greedy";
+  updateSamplingSummary();
 }
 
 function setRunningState() {
@@ -617,6 +695,7 @@ function stopGeneration() {
     return;
   }
   stopRequested = true;
+  const engineLabel = modelReady ? describeEngine(modelReady) : null;
   if (pageClient) {
     pageClient.terminate();
     pageClient = null;
@@ -633,7 +712,9 @@ function stopGeneration() {
   els.loadStatus.textContent = "Stopped. Load the model again to continue.";
   els.demoStatus.textContent =
     lastTokenCount > 0
-      ? `Stopped after ${formatCount(lastTokenCount)} tokens.`
+      ? `Generated ${formatCount(lastTokenCount)} tokens${
+          engineLabel ? ` on ${engineLabel}` : ""
+        } (stopped).`
       : "Stopped before the first token.";
   els.benchStatus.textContent = "Load the model above to run the benchmark.";
   els.backendNote.hidden = true;
@@ -687,6 +768,11 @@ async function generate() {
 
   let count = 0;
   let firstAt = 0;
+  const sampling =
+    els.decodeMode.value === "sample"
+      ? { ...samplingSettings(), seed: seedForRun() }
+      : null;
+  updateSamplingSummary();
 
   try {
     const encoded = await pageClient.request({ type: "encode", text });
@@ -695,12 +781,25 @@ async function generate() {
     }
     els.demoStatus.textContent = "Prefilling the prompt.";
     const startedAt = performance.now();
+    const contextLimit = Number(modelReady.nCtx) || 1024;
+    if (encoded.ids.length >= contextLimit) {
+      throw new Error(
+        `The prompt uses ${formatCount(encoded.ids.length)} tokens and fills the ` +
+          `${formatCount(contextLimit)}-token context.`,
+      );
+    }
+    const maxNewTokens = Math.min(
+      Number(els.maxTokens.value) || 0,
+      contextLimit - encoded.ids.length,
+    );
     const done = await pageClient.request(
       {
         type: "generate",
         ids: encoded.ids,
-        maxNewTokens: Number(els.maxTokens.value),
+        maxNewTokens,
         stream: true,
+        sampling,
+        endToken: 50256,
       },
       (message) => {
         const now = performance.now();
@@ -742,9 +841,22 @@ async function generate() {
       }
     }
     const speed = els.meterSpeed.textContent;
-    els.demoStatus.textContent = `Generated ${formatCount(tokenCount)} tokens${
+    const reason =
+      done.reason === "end of text"
+        ? "end of text"
+        : done.reason === "stopped"
+          ? "stopped"
+          : "max tokens";
+    const seedText =
+      done.seed === null || done.seed === undefined
+        ? ""
+        : ` Seed ${done.seed}.`;
+    els.demoStatus.textContent = `Generated ${formatCount(
+      tokenCount,
+    )} tokens${
       speed !== "\u2013" ? ` at ${speed} tokens/s` : ""
-    } on ${describeEngine(modelReady)}.`;
+    } on ${describeEngine(modelReady)} (${reason}).${seedText}`;
+    updateSamplingSummary();
   } catch (error) {
     if (!stopRequested) {
       els.demoStatus.textContent = `Generation failed: ${describeError(error)}`;
@@ -1981,6 +2093,29 @@ function wireEvents() {
   els.stop.addEventListener("click", stopGeneration);
   els.runBench.addEventListener("click", runBenchmark);
   els.backendMode.addEventListener("change", handleBackendChange);
+  els.decodeMode.addEventListener("change", updateSettingsVisibility);
+  els.newSeed.addEventListener("click", () => {
+    els.seed.value = String(randomSeed());
+    updateSamplingSummary();
+  });
+  for (const input of [
+    els.temperature,
+    els.topK,
+    els.topP,
+    els.penalty,
+    els.seed,
+  ]) {
+    input.addEventListener("input", updateSamplingSummary);
+  }
+  els.maxTokens.addEventListener("change", updateSamplingSummary);
+  els.examples.addEventListener("click", (event) => {
+    const chip = event.target.closest(".chip");
+    if (!chip || chip.disabled) {
+      return;
+    }
+    els.prompt.value = chip.dataset.prompt ?? "";
+    els.prompt.focus();
+  });
   window.addEventListener("resize", () => {
     for (const container of [els.nativeChart, els.webChart]) {
       scheduleChart(container);
@@ -2005,6 +2140,7 @@ function init() {
   wireEvents();
   linkRepo();
   observeCharts();
+  updateSettingsVisibility();
 
   const initial = new URLSearchParams(location.search).get("backend");
   if (initial === "cpu" || initial === "webgpu") {

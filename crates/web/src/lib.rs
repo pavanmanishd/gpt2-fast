@@ -1,6 +1,13 @@
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use wasm_bindgen::prelude::*;
 
 use gpt2_engine::{Model, Tokenizer, Weights};
+
+use crate::sample::{Sampler, Sampling};
+
+mod sample;
 
 #[wasm_bindgen]
 pub fn simd_enabled() -> bool {
@@ -92,6 +99,98 @@ impl Engine {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    pub fn generate_until(
+        &self,
+        ids: &[u32],
+        max_new_tokens: usize,
+        end_token: u32,
+        on_token: &js_sys::Function,
+    ) -> Result<bool, JsValue> {
+        let mut failure = None;
+        let ended = Cell::new(false);
+        self.model.generate_with(
+            ids,
+            max_new_tokens,
+            |logits| {
+                let token = gpt2_engine::argmax(logits);
+                if token == end_token {
+                    ended.set(true);
+                    None
+                } else {
+                    Some(token)
+                }
+            },
+            |token| {
+                if failure.is_none() {
+                    if let Err(error) = on_token.call1(&JsValue::NULL, &JsValue::from(token)) {
+                        failure = Some(error);
+                    }
+                }
+            },
+        );
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(ended.get()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_sampled(
+        &self,
+        ids: &[u32],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        repetition_penalty: f32,
+        seed: u32,
+        end_token: u32,
+        on_token: &js_sys::Function,
+    ) -> Result<bool, JsValue> {
+        let failure = Rc::new(RefCell::new(None));
+        let pick_failure = Rc::clone(&failure);
+        let ended = Cell::new(false);
+        let mut sampler = Sampler::new(
+            self.model.config().vocab_size,
+            Sampling {
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty,
+                seed,
+            },
+        );
+        sampler.observe(ids);
+        self.model.generate_with(
+            ids,
+            max_new_tokens,
+            |logits| {
+                if pick_failure.borrow().is_some() {
+                    return None;
+                }
+                let token = sampler.pick(logits);
+                if token == end_token {
+                    ended.set(true);
+                    None
+                } else {
+                    Some(token)
+                }
+            },
+            |token| {
+                if failure.borrow().is_none() {
+                    if let Err(error) = on_token.call1(&JsValue::NULL, &JsValue::from(token)) {
+                        *failure.borrow_mut() = Some(error);
+                    }
+                }
+            },
+        );
+        let outcome = match failure.borrow_mut().take() {
+            Some(error) => Err(error),
+            None => Ok(ended.get()),
+        };
+        outcome
     }
 
     pub fn weight_manifest(&self) -> String {

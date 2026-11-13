@@ -18,7 +18,7 @@ framework, bundler, external JavaScript, web fonts or analytics.
 | `dev.html` | The old development page, driven by `main.js`. |
 | `worker.js` | Shared Web Worker: loads weights, encodes text, generates and streams tokens. Used by the site, the dev page and the benchmark. |
 | `gpu/engine.js` | The WebGPU backend: buffers, pipelines, weight upload, decode loop and readback. |
-| `gpu/shaders.js` | WGSL compute shaders for embeddings, layer norm, linear layers, attention, residual adds, the tied head and argmax. |
+| `gpu/shaders.js` | WGSL compute shaders for embeddings, layer norm, linear layers, attention, residual adds, the tied head, argmax and the sampling passes. |
 | `thread.js` | The pool worker for the threaded build: joins the engine's shared memory and runs its worker loop. |
 | `bench.html`, `bench.js` | The browser benchmark page. |
 | `build_site.py` | Assembles the deployable static site in `web/dist`, including the split weights and `_headers`. |
@@ -54,6 +54,36 @@ Changing the engine starts a fresh worker, but the weights stay in the Cache
 API: the worker reads them from cache, so a switch does not download them again.
 The weights are `models/gpt2/model-int8.safetensors`, int8, about 135 MB in
 development and split into `model/*.part` files in the built site.
+
+### Decoding
+
+The **Mode** control picks how the next token is chosen:
+
+- **Sampling** is the default. Temperature (0.8), top-k (40), top-p (0.95)
+  and a repetition penalty (1.2) shape the draw. They live in the
+  **Sampling** settings row under the controls; the summary shows the values in
+  use. The penalty divides the logits of tokens that already appear in the
+  prompt and the generated text when they are positive and multiplies them when
+  they are negative, the CTRL rule. The seed is random on every run while the
+  field is empty, and the status line shows the seed used; type a seed, or press
+  **New seed** to fill one in, to reproduce a run.
+- **Greedy (exact)** always takes the single most likely token. It is the
+  behaviour the engine is checked against the reference with, and it is what
+  the device benchmark below uses.
+
+Both modes stop when the model picks GPT-2's end-of-text token (id 50256); the
+token is not printed and the status line says `end of text` instead of
+`max tokens`. The **Max tokens** setting is the upper limit either way (200 by
+default), is clamped to what is left of the 1,024-token context, and Stop still
+ends a run immediately with `stopped` in the status line.
+
+The WebGPU engine samples on the device: a top-k pass over the logits (after
+the repetition penalty, with the token history kept in a GPU buffer), then the
+softmax, the nucleus cut and the draw from a per-step counter-based random
+number, all in compute shaders. The chosen token still goes into the same
+buffer the argmax pass writes, so decode steps keep pipelining and the logits
+are never copied back. The CPU engine samples in `crates/web` from each step's
+logits, so sampling stays within a few percent of greedy decoding there too.
 
 The device benchmark runs prompt `p064` for 64 new tokens with one warm-up and
 one timed run on each engine the device supports: CPU first, then WebGPU if the
@@ -254,14 +284,17 @@ available. The worker still uses the WebAssembly engine to parse the
 safetensors file and to tokenize; the weights are uploaded to storage buffers
 once. Every layer runs on the GPU: the KV cache, activations and the chosen
 token id stay there, and only the token id is copied back after each step (the
-full logits are copied only for a `logits` request).
+full logits are copied only for a `logits` request). Sampling adds five small
+passes per step: the histogram reset, the repetition penalty plus the 16-bit
+logit histogram, the bucket selection, the candidate gather and the draw, which
+writes the token into the same slot the argmax pass uses.
 
 `wte` is 154 MB at f32 and can exceed the adapter's default 128 MB storage
 binding limit, so the adapter's limits are requested and the table is split
 across two bindings when needed; `maxBufferSize` is checked as well. The decode
 loop submits up to `pipeline=4` steps before it waits for the first token, so
-the argmax pass can feed the next step's embedding without a round trip. Use
-`pipeline=1` for the simple wait-after-each-step version.
+the argmax or sampling pass can feed the next step's embedding without a round
+trip. Use `pipeline=1` for the simple wait-after-each-step version.
 
 If `navigator.gpu` is missing, no adapter is returned, the adapter is a
 software fallback, or the limits are too small, the worker builds the usual

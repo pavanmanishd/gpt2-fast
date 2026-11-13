@@ -10,6 +10,19 @@ struct Step {
 @group(0) @binding(1) var<storage, read_write> tokens: array<u32>;
 `;
 
+const SAMPLE = `
+struct SampleParams {
+  temperature: f32,
+  top_k: u32,
+  top_p: f32,
+  penalty: f32,
+  seed: u32,
+  counter: u32,
+  vocab: u32,
+  capacity: u32,
+};
+`;
+
 const GELU = `
 fn gelu(value: f32) -> f32 {
   let inner = 0.7978845608028654 * (value + 0.044715 * value * value * value);
@@ -747,6 +760,224 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>) {
   }
   if (lane == 0u) {
     tokens[step.start + step.n] = best_index[0];
+  }
+}
+`;
+
+export const sampleReset = `
+@group(1) @binding(0) var<storage, read_write> hist: array<atomic<u32>>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x;
+  if (index < 65536u) {
+    atomicStore(&hist[index], 0u);
+  }
+}
+`;
+
+export const samplePenalty = `
+${STEP}
+${SAMPLE}
+
+@group(1) @binding(0) var<storage, read_write> logits: array<f32>;
+@group(1) @binding(1) var<storage, read> counts: array<u32>;
+@group(1) @binding(2) var<storage, read_write> hist: array<atomic<u32>>;
+@group(1) @binding(3) var<storage, read_write> keys: array<u32>;
+@group(1) @binding(4) var<uniform> params: SampleParams;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x;
+  if (index >= params.vocab) {
+    return;
+  }
+  var value = logits[index];
+  if (counts[index] > 0u) {
+    if (value > 0.0) {
+      value = value / params.penalty;
+    } else {
+      value = value * params.penalty;
+    }
+  }
+  logits[index] = value;
+  let word = bitcast<u32>(value);
+  let key = select(word | 0x80000000u, ~word, (word & 0x80000000u) != 0u);
+  keys[index] = key;
+  atomicAdd(&hist[key >> 16u], 1u);
+}
+`;
+
+export const sampleBucket = `
+${SAMPLE}
+
+@group(1) @binding(0) var<storage, read> hist: array<u32>;
+@group(1) @binding(1) var<storage, read_write> state: array<u32>;
+@group(1) @binding(2) var<uniform> params: SampleParams;
+
+var<workgroup> regions: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) local: vec3<u32>) {
+  let lane = local.x;
+  var total = 0u;
+  for (var index = 0u; index < 256u; index = index + 1u) {
+    total = total + hist[lane * 256u + index];
+  }
+  regions[lane] = total;
+  workgroupBarrier();
+  if (lane == 0u) {
+    let need = min(max(params.top_k, 1u), params.vocab);
+    var cumulative = 0u;
+    var boundary = 0u;
+    var above = 0u;
+    var found = false;
+    for (var index = 0u; index < 256u; index = index + 1u) {
+      let region = 255u - index;
+      let count = regions[region];
+      if (cumulative + count >= need) {
+        var inner = 0u;
+        for (var slot = 0u; slot < 256u; slot = slot + 1u) {
+          let bin = 255u - slot;
+          let in_bin = hist[region * 256u + bin];
+          if (inner + in_bin >= need - cumulative) {
+            boundary = region * 256u + bin;
+            above = cumulative + inner;
+            found = true;
+            break;
+          }
+          inner = inner + in_bin;
+        }
+        if (found) {
+          break;
+        }
+      }
+      cumulative = cumulative + count;
+    }
+    state[0] = boundary;
+    state[1] = above;
+    state[2] = need;
+  }
+}
+`;
+
+export const sampleGather = `
+${SAMPLE}
+
+@group(1) @binding(0) var<storage, read> keys: array<u32>;
+@group(1) @binding(1) var<storage, read> state: array<u32>;
+@group(1) @binding(2) var<storage, read_write> candidates: array<u32>;
+@group(1) @binding(3) var<storage, read_write> count: array<atomic<u32>>;
+@group(1) @binding(4) var<uniform> params: SampleParams;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x;
+  if (index >= params.vocab) {
+    return;
+  }
+  if ((keys[index] >> 16u) >= state[0]) {
+    let slot = atomicAdd(&count[0], 1u);
+    if (slot < params.capacity) {
+      candidates[slot] = index;
+    }
+  }
+}
+`;
+
+export const sampleToken = `
+${STEP}
+${SAMPLE}
+
+@group(1) @binding(0) var<storage, read> logits: array<f32>;
+@group(1) @binding(1) var<storage, read> candidates: array<u32>;
+@group(1) @binding(2) var<storage, read_write> count: array<atomic<u32>>;
+@group(1) @binding(3) var<storage, read_write> counts: array<atomic<u32>>;
+@group(1) @binding(4) var<uniform> params: SampleParams;
+
+var<workgroup> values: array<f32, 256>;
+var<workgroup> indices: array<u32, 256>;
+var<workgroup> sorted_values: array<f32, 256>;
+var<workgroup> sorted_indices: array<u32, 256>;
+
+fn better(value: f32, index: u32, other_value: f32, other_index: u32) -> bool {
+  return value > other_value || (value == other_value && index < other_index);
+}
+
+fn draw(seed: u32, counter: u32) -> f32 {
+  var x = seed ^ (0x9e3779b9u * (counter + 1u));
+  x = x ^ (x >> 16u);
+  x = x * 0x7feb352du;
+  x = x ^ (x >> 15u);
+  x = x * 0x846ca68bu;
+  x = x ^ (x >> 16u);
+  return f32(x >> 8u) * (1.0 / 16777216.0);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) local: vec3<u32>) {
+  let lane = local.x;
+  let available = min(atomicLoad(&count[0]), params.capacity);
+  let limit = min(max(params.top_k, 1u), available);
+  if (lane < available) {
+    let token = candidates[lane];
+    indices[lane] = token;
+    values[lane] = logits[token];
+  }
+  workgroupBarrier();
+  var chosen = 0u;
+  if (lane < available) {
+    var rank = 0u;
+    for (var index = 0u; index < available; index = index + 1u) {
+      if (better(values[index], indices[index], values[lane], indices[lane])) {
+        rank = rank + 1u;
+      }
+    }
+    if (rank < limit) {
+      sorted_values[rank] = values[lane];
+      sorted_indices[rank] = indices[lane];
+    }
+  }
+  workgroupBarrier();
+  if (lane == 0u && limit > 0u) {
+    if (params.temperature <= 0.0) {
+      chosen = sorted_indices[0];
+    } else {
+      let scale = 1.0 / params.temperature;
+      let highest = sorted_values[0];
+      var total = 0.0;
+      for (var rank = 0u; rank < limit; rank = rank + 1u) {
+        let probability = exp((sorted_values[rank] - highest) * scale);
+        sorted_values[rank] = probability;
+        total = total + probability;
+      }
+      var keep = limit;
+      var cutoff = 1.0;
+      if (params.top_p < 1.0) {
+        var cumulative = 0.0;
+        for (var rank = 0u; rank < limit; rank = rank + 1u) {
+          cumulative = cumulative + sorted_values[rank] / total;
+          keep = rank + 1u;
+          if (cumulative >= params.top_p) {
+            break;
+          }
+        }
+        cutoff = cumulative;
+      }
+      let point = draw(params.seed, params.counter) * cutoff;
+      var running = 0.0;
+      chosen = sorted_indices[keep - 1u];
+      for (var rank = 0u; rank < keep; rank = rank + 1u) {
+        running = running + sorted_values[rank] / total;
+        if (point < running) {
+          chosen = sorted_indices[rank];
+          break;
+        }
+      }
+    }
+    tokens[step.start + step.n] = chosen;
+    atomicAdd(&counts[chosen], 1u);
+    atomicStore(&count[0], 0u);
   }
 }
 `;

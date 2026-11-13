@@ -986,6 +986,45 @@ impl Model {
         });
     }
 
+    pub fn generate_with(
+        &self,
+        ids: &[u32],
+        max_new_tokens: usize,
+        mut pick: impl FnMut(&[f32]) -> Option<u32>,
+        mut on_token: impl FnMut(u32),
+    ) {
+        let n = ids.len();
+        assert!(n > 0, "generate_with requires at least one token id");
+        assert!(
+            n + max_new_tokens <= self.config.n_ctx,
+            "prompt of {n} tokens plus {max_new_tokens} generated tokens exceeds context length {}",
+            self.config.n_ctx
+        );
+        if max_new_tokens == 0 {
+            return;
+        }
+
+        self.with_scratch(|cache, workspace| {
+            cache.ensure(&self.config, n + max_new_tokens);
+            workspace.ensure(&self.config, n);
+            self.forward(ids, 0, cache, workspace);
+            let mut next = match pick(self.last_logits(workspace, n)) {
+                Some(token) => token,
+                None => return,
+            };
+            on_token(next);
+
+            for _ in 1..max_new_tokens {
+                self.forward(&[next], cache.len, cache, workspace);
+                next = match pick(self.last_logits(workspace, 1)) {
+                    Some(token) => token,
+                    None => return,
+                };
+                on_token(next);
+            }
+        });
+    }
+
     pub fn generate_batch(
         &self,
         prompts: &[&[u32]],

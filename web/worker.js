@@ -26,6 +26,7 @@ let gpu = null;
 let backend = "cpu";
 let fallback = null;
 let gpuQueue = Promise.resolve();
+let nCtx = 1024;
 
 self.onmessage = async (event) => {
   const message = event.data;
@@ -104,6 +105,7 @@ async function load(weights) {
   await importEngine();
   const buildStart = performance.now();
   const config = JSON.parse(TEXT_DECODER.decode(files["config.json"]));
+  nCtx = Number(config.n_ctx) || nCtx;
   const gpuRequested = REQUESTED_BACKEND === "webgpu";
   const cpuThreads = threads;
   engine = new Engine(
@@ -144,6 +146,7 @@ async function load(weights) {
     type: "ready",
     weights,
     backend,
+    nCtx,
     requestedBackend: REQUESTED_BACKEND,
     fallback,
     pkg: backend === "webgpu" ? "webgpu" : enginePkg,
@@ -702,7 +705,30 @@ async function generate(message) {
   const started = performance.now();
   const tokens = [];
   const timings = [];
+  const sampling = message.sampling ?? null;
+  const endToken = Number.isInteger(message.endToken) ? message.endToken : null;
+  let reason = "max tokens";
+  const ids = Uint32Array.from(message.ids);
+  if (ids.length === 0) {
+    throw new Error("generate requires at least one token id");
+  }
+  if (ids.length >= nCtx) {
+    throw new Error(
+      `the prompt uses ${ids.length} tokens, more than the ${nCtx}-token context`,
+    );
+  }
+  const maxNewTokens = Math.max(
+    0,
+    Math.min(
+      Math.floor(Number(message.maxNewTokens) || 0),
+      nCtx - ids.length,
+    ),
+  );
   const onToken = (token) => {
+    if (endToken !== null && token === endToken) {
+      reason = "end of text";
+      return false;
+    }
     timings.push(performance.now() - started);
     tokens.push(token);
     if (message.stream) {
@@ -713,18 +739,44 @@ async function generate(message) {
         text: engine.decode(Uint32Array.from(tokens)),
       });
     }
+    return true;
   };
-  const ids = Uint32Array.from(message.ids);
   if (gpu) {
-    await gpu.generate(ids, message.maxNewTokens, onToken);
+    await gpu.generate(ids, maxNewTokens, onToken, sampling);
+  } else if (sampling) {
+    const ended = engine.generate_sampled(
+      ids,
+      maxNewTokens,
+      sampling.temperature,
+      Math.max(1, Math.round(sampling.topK)),
+      sampling.topP,
+      sampling.repetitionPenalty,
+      sampling.seed >>> 0,
+      endToken ?? 0xffffffff,
+      (token) => {
+        onToken(token);
+      },
+    );
+    if (ended) {
+      reason = "end of text";
+    }
+  } else if (endToken === null) {
+    engine.generate(ids, maxNewTokens, onToken);
   } else {
-    engine.generate(ids, message.maxNewTokens, onToken);
+    const ended = engine.generate_until(ids, maxNewTokens, endToken, (token) => {
+      onToken(token);
+    });
+    if (ended) {
+      reason = "end of text";
+    }
   }
   self.postMessage({
     type: "done",
     id: message.id,
     timings,
     tokens,
+    reason,
+    seed: sampling ? sampling.seed >>> 0 : null,
   });
 }
 
