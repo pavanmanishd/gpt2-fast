@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N15","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":816.312,"prefill_tok_s":2156.0,"ttft_ms":29.382,"peak_mb":208.414,"matches_reference":false,"token_match_rate":0.464063,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N15/summary.json

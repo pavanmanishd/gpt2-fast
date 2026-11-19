@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"W2-f32","title":"<title>","commit":"<commit>","model":"gpt2","target":"wasm-simd","decode_tok_s":112.113,"prefill_tok_s":285.51,"ttft_ms":218.86,"peak_mb":null,"matches_reference":true,"token_match_rate":1.0,"sessions":3,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/W2-f32/summary.json

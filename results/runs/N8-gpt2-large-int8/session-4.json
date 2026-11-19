@@ -1,7 +1,7 @@
 {
   "label": "N8-gpt2-large-int8",
   "model": "gpt2-large",
-  "commit": "4dc76db",
+  "commit": "34de806",
   "started_at": "2026-11-10T05:01:49Z",
   "host": {
     "nproc": 4,

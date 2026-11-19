@@ -60,7 +60,7 @@ The token embedding alone accounts for the whole loss; quantizing all four layer
 
 - One scale per output column: +5.6% perplexity, as above.
 - Wider tiles in the int8 kernels: 16 columns per block is fastest for decode (91 tok/s single thread, against 84 at 32 and 66 at 64 columns). For prompts the grouped kernel had to drop from 16 to 8 columns to fit the extra accumulators in registers, which costs about 7% of prefill.
-- The flame graph couldn't be recorded in the same run: the profiling script stopped on the expected token mismatches. It was fixed to accept quantized runs and the profile was recorded afterwards from commit `0ef867e`, whose int8 code is the same as `n7`.
+- The flame graph couldn't be recorded in the same run: the profiling script stopped on the expected token mismatches. It was fixed to accept quantized runs and the profile was recorded afterwards from commit `734c385`, whose int8 code is the same as `n7`.
 
 ## Post draft
 

@@ -1,0 +1,13 @@
+{
+  "label": "N17-gpt2-medium-int8",
+  "model": "gpt2-medium",
+  "target": "cpu-linux",
+  "decode_tok_s": 269.52907906894666,
+  "prefill_tok_s": 697.8150125787313,
+  "ttft_ms": 90.482319,
+  "peak_mb": 567.01953125,
+  "matches_reference": false,
+  "near_tie_mismatch": true,
+  "token_match_rate": 0.0703125,
+  "sessions": 5
+}

@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N17-gpt2-medium-int8","title":"<title>","commit":"<commit>","model":"gpt2-medium","target":"cpu-linux","decode_tok_s":269.529,"prefill_tok_s":697.815,"ttft_ms":90.482,"peak_mb":567.02,"matches_reference":false,"token_match_rate":0.070313,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N17-gpt2-medium-int8/summary.json

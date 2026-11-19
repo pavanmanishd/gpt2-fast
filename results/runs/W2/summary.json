@@ -1,0 +1,13 @@
+{
+  "label": "W2",
+  "model": "gpt2",
+  "target": "wasm-simd",
+  "decode_tok_s": 77.23721860886417,
+  "prefill_tok_s": 166.662326506053,
+  "ttft_ms": 381.294999986887,
+  "peak_mb": null,
+  "matches_reference": false,
+  "near_tie_mismatch": false,
+  "token_match_rate": 0.4640625,
+  "sessions": 1
+}

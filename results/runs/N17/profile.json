@@ -1,0 +1,58 @@
+{
+  "label": "N17",
+  "model": "gpt2",
+  "commit": "b414ae8",
+  "started_at": "2026-11-12T04:04:07Z",
+  "target": "cpu-linux",
+  "host": {
+    "nproc": 4,
+    "cpu": "unknown",
+    "memory_limit": "8589934592",
+    "kernel": "7.2.9-orbstack-00391-g2b298d05fbd4"
+  },
+  "worker_cmd": [
+    "worker",
+    "--model-dir",
+    "models/gpt2",
+    "--weights",
+    "int8",
+    "--activations",
+    "int8"
+  ],
+  "load_ms": 829.228042,
+  "peak_mb": 202.51953125,
+  "warmup": 0,
+  "runs": 1,
+  "prompts": [
+    {
+      "id": "p064",
+      "n_prompt": 64,
+      "logit_max_abs_diff": 1.55712890625,
+      "matched_tokens": 36,
+      "total_tokens": 128,
+      "first_mismatch": 35,
+      "near_tie": false,
+      "runs": [
+        {
+          "ttft_ms": 32.160173,
+          "prefill_tok_s": 1990.0390461208028,
+          "decode_tok_s": 857.7666879876848,
+          "total_ms": 180.21908200000001,
+          "matches": false
+        }
+      ],
+      "medians": {
+        "decode_tok_s": 857.7666879876848,
+        "prefill_tok_s": 1990.0390461208028,
+        "ttft_ms": 32.160173
+      }
+    }
+  ],
+  "session_medians": {
+    "decode_tok_s": 857.7666879876848,
+    "prefill_tok_s": 1990.0390461208028,
+    "ttft_ms": 32.160173
+  },
+  "matches_reference": false,
+  "near_tie_mismatch": false
+}

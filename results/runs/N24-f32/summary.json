@@ -1,0 +1,13 @@
+{
+  "label": "N24-f32",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 338.1862230852131,
+  "prefill_tok_s": 1633.0944549936394,
+  "ttft_ms": 39.189404999999994,
+  "peak_mb": 530.38671875,
+  "matches_reference": true,
+  "near_tie_mismatch": false,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}

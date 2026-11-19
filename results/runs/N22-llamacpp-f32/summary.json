@@ -1,0 +1,13 @@
+{
+  "label": "N22-llamacpp-f32",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 303.0866051096817,
+  "prefill_tok_s": 899.3152374901141,
+  "ttft_ms": 71.149965,
+  "peak_mb": 542.94921875,
+  "matches_reference": false,
+  "near_tie_mismatch": false,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}

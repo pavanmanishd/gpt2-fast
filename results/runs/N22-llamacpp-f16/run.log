@@ -1,0 +1,2 @@
+summary written to results/runs/N22-llamacpp-f16/summary.json
+{"date":"<date>","milestone":"N22-llamacpp-f16","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":390.955,"prefill_tok_s":840.225,"ttft_ms":75.684,"peak_mb":308.738,"matches_reference":false,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}

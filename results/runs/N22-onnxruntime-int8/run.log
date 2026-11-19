@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N22-onnxruntime-int8","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":463.335,"prefill_tok_s":4419.231,"ttft_ms":14.466,"peak_mb":365.609,"matches_reference":false,"token_match_rate":0.021875,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N22-onnxruntime-int8/summary.json

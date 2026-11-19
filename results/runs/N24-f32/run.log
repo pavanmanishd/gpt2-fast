@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N24-f32","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":338.186,"prefill_tok_s":1633.094,"ttft_ms":39.189,"peak_mb":530.387,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N24-f32/summary.json

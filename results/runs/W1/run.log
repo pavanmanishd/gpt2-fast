@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"W1","title":"<title>","commit":"<commit>","model":"gpt2","target":"wasm","decode_tok_s":24.871,"prefill_tok_s":22.131,"ttft_ms":2870.772,"peak_mb":null,"matches_reference":false,"token_match_rate":0.464063,"sessions":2,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/W1/summary.json

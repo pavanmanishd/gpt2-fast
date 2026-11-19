@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N22-ctranslate2-int8","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":163.234,"prefill_tok_s":2490.458,"ttft_ms":25.698,"peak_mb":562.582,"matches_reference":false,"token_match_rate":0.014063,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N22-ctranslate2-int8/summary.json

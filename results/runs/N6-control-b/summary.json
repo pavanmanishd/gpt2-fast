@@ -1,0 +1,12 @@
+{
+  "label": "N6-control-b",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 120.9727088607416,
+  "prefill_tok_s": 942.616677976103,
+  "ttft_ms": 59.283642,
+  "peak_mb": 560.05078125,
+  "matches_reference": true,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}

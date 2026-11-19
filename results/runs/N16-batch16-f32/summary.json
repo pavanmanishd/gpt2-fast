@@ -1,0 +1,15 @@
+{
+  "label": "N16-batch16-f32",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 58.99651698221198,
+  "prefill_tok_s": 1639.5776954257794,
+  "ttft_ms": 915.479641,
+  "peak_mb": 739.96875,
+  "matches_reference": true,
+  "near_tie_mismatch": false,
+  "token_match_rate": 1.0,
+  "sessions": 5,
+  "batch": 16,
+  "batch_tok_s": 943.9442717153916
+}

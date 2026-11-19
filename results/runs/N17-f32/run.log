@@ -1,0 +1,2 @@
+summary written to results/runs/N17-f32/summary.json
+{"date":"<date>","milestone":"N17-f32","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":328.989,"prefill_tok_s":1411.571,"ttft_ms":45.277,"peak_mb":553.758,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}

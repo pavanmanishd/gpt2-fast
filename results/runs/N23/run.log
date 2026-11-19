@@ -1,0 +1,4 @@
+Unable to find image 'gpt2-fast-bench:3a7841d' locally
+docker: Error response from daemon: pull access denied for gpt2-fast-bench, repository does not exist or may require 'docker login'
+
+Run 'docker run --help' for more information

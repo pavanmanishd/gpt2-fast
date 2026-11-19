@@ -1,0 +1,13 @@
+{
+  "label": "N22-ctranslate2-int8",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 163.23422347238957,
+  "prefill_tok_s": 2490.4583342234773,
+  "ttft_ms": 25.698081,
+  "peak_mb": 562.58203125,
+  "matches_reference": false,
+  "near_tie_mismatch": false,
+  "token_match_rate": 0.0140625,
+  "sessions": 5
+}

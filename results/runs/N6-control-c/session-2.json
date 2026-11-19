@@ -1,7 +1,7 @@
 {
   "label": "N6-control-c",
   "model": "gpt2",
-  "commit": "89c4e69",
+  "commit": "a8547c0",
   "started_at": "2026-11-11T09:27:44Z",
   "host": {
     "nproc": 4,

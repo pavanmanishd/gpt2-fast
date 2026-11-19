@@ -1,0 +1,62 @@
+{
+  "label": "N24",
+  "model": "gpt2",
+  "commit": "684e7a8",
+  "started_at": "2026-11-13T07:54:45Z",
+  "target": "cpu-linux",
+  "host": {
+    "nproc": 4,
+    "cpu": "unknown",
+    "memory_limit": "8589934592",
+    "kernel": "7.2.9-orbstack-00391-g2b298d05fbd4"
+  },
+  "worker_cmd": [
+    "worker",
+    "--model-dir",
+    "models/gpt2",
+    "--weights",
+    "int8",
+    "--activations",
+    "int8",
+    "--weight-group",
+    "row",
+    "--activation-group",
+    "128"
+  ],
+  "load_ms": 1617.7993229999995,
+  "peak_mb": 149.73828125,
+  "warmup": 0,
+  "runs": 1,
+  "prompts": [
+    {
+      "id": "p064",
+      "n_prompt": 64,
+      "logit_max_abs_diff": 1.196441650390625,
+      "matched_tokens": 36,
+      "total_tokens": 128,
+      "first_mismatch": 35,
+      "near_tie": false,
+      "runs": [
+        {
+          "ttft_ms": 18.717899,
+          "prefill_tok_s": 3419.187164114947,
+          "decode_tok_s": 278.69095452922494,
+          "total_ms": 474.419808,
+          "matches": false
+        }
+      ],
+      "medians": {
+        "decode_tok_s": 278.69095452922494,
+        "prefill_tok_s": 3419.187164114947,
+        "ttft_ms": 18.717899
+      }
+    }
+  ],
+  "session_medians": {
+    "decode_tok_s": 278.69095452922494,
+    "prefill_tok_s": 3419.187164114947,
+    "ttft_ms": 18.717899
+  },
+  "matches_reference": false,
+  "near_tie_mismatch": false
+}

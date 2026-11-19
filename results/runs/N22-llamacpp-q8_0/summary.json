@@ -1,0 +1,13 @@
+{
+  "label": "N22-llamacpp-q8_0",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 676.2517741159116,
+  "prefill_tok_s": 4222.462437098349,
+  "ttft_ms": 14.760604,
+  "peak_mb": 281.39453125,
+  "matches_reference": false,
+  "near_tie_mismatch": false,
+  "token_match_rate": 0.284375,
+  "sessions": 5
+}

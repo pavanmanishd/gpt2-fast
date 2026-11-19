@@ -1,0 +1,13 @@
+{
+  "label": "W3-webkit",
+  "model": "gpt2",
+  "target": "wasm-threads",
+  "decode_tok_s": 281.1227200283335,
+  "prefill_tok_s": 625.4886630179734,
+  "ttft_ms": 100.03999999999904,
+  "peak_mb": null,
+  "matches_reference": false,
+  "near_tie_mismatch": false,
+  "token_match_rate": 0.4640625,
+  "sessions": 3
+}

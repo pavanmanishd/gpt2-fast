@@ -1,0 +1,89 @@
+{
+  "label": "N16-batch16-f32",
+  "model": "gpt2",
+  "commit": "b414ae8",
+  "started_at": "2026-11-12T06:32:38Z",
+  "target": "cpu-linux",
+  "host": {
+    "nproc": 4,
+    "cpu": "unknown",
+    "memory_limit": "8589934592",
+    "kernel": "7.2.9-orbstack-00391-g2b298d05fbd4"
+  },
+  "worker_cmd": [
+    "worker",
+    "--model-dir",
+    "models/gpt2"
+  ],
+  "load_ms": 755.0871500000001,
+  "peak_mb": 739.921875,
+  "warmup": 1,
+  "runs": 5,
+  "prompts": [
+    {
+      "id": "batch16",
+      "n_prompt": 1501,
+      "logit_max_abs_diff": 0.0003662109375,
+      "matched_tokens": 12288,
+      "total_tokens": 12288,
+      "first_mismatch": null,
+      "near_tie": false,
+      "runs": [
+        {
+          "ttft_ms": 914.312674,
+          "prefill_tok_s": 1641.6703417588192,
+          "decode_tok_s": 59.869745110316174,
+          "total_ms": 3035.584441,
+          "matches": true,
+          "batch_tok_s": 957.9159217650588
+        },
+        {
+          "ttft_ms": 911.021996,
+          "prefill_tok_s": 1647.6001749577956,
+          "decode_tok_s": 56.160876224361104,
+          "total_ms": 3172.382725,
+          "matches": true,
+          "batch_tok_s": 898.5740195897777
+        },
+        {
+          "ttft_ms": 975.948085,
+          "prefill_tok_s": 1537.9916442993995,
+          "decode_tok_s": 60.48076046005156,
+          "total_ms": 3075.7894069999998,
+          "matches": true,
+          "batch_tok_s": 967.692167360825
+        },
+        {
+          "ttft_ms": 928.475345,
+          "prefill_tok_s": 1616.6288185067533,
+          "decode_tok_s": 58.99651698221198,
+          "total_ms": 3081.144799,
+          "matches": true,
+          "batch_tok_s": 943.9442717153917
+        },
+        {
+          "ttft_ms": 920.377068,
+          "prefill_tok_s": 1630.8533232598968,
+          "decode_tok_s": 58.900038105959375,
+          "total_ms": 3076.5726170000003,
+          "matches": true,
+          "batch_tok_s": 942.40060969535
+        }
+      ],
+      "medians": {
+        "decode_tok_s": 58.99651698221198,
+        "prefill_tok_s": 1630.8533232598968,
+        "ttft_ms": 920.377068
+      }
+    }
+  ],
+  "session_medians": {
+    "decode_tok_s": 58.99651698221198,
+    "prefill_tok_s": 1630.8533232598968,
+    "ttft_ms": 920.377068
+  },
+  "matches_reference": true,
+  "near_tie_mismatch": false,
+  "batch": 16,
+  "batch_tok_s": 943.9442717153917
+}

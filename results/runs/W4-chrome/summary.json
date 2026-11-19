@@ -1,0 +1,13 @@
+{
+  "label": "W4-chrome",
+  "model": "gpt2",
+  "target": "webgpu",
+  "decode_tok_s": 562.320123916729,
+  "prefill_tok_s": 2194.7873824848743,
+  "ttft_ms": 28.519999980926514,
+  "peak_mb": null,
+  "matches_reference": false,
+  "near_tie_mismatch": false,
+  "token_match_rate": 0.4640625,
+  "sessions": 5
+}

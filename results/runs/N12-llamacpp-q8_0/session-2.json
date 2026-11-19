@@ -1,7 +1,7 @@
 {
   "label": "N12-llamacpp-q8_0",
   "model": "gpt2",
-  "commit": "6de594c",
+  "commit": "b061788",
   "started_at": "2026-11-11T12:40:09Z",
   "host": {
     "nproc": 4,

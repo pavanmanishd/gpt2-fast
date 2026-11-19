@@ -1,0 +1,8 @@
+{
+  "weights": "f16",
+  "activations": "f32",
+  "tokens": 1005,
+  "perplexity": 76.82502699773828,
+  "reference_perplexity": 76.84307872137444,
+  "delta": -0.018051723636162365
+}

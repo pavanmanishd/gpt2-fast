@@ -1,0 +1,13 @@
+{
+  "label": "W3-f32",
+  "model": "gpt2",
+  "target": "wasm-threads",
+  "decode_tok_s": 262.3560398601636,
+  "prefill_tok_s": 988.2643599524348,
+  "ttft_ms": 61.57499998807907,
+  "peak_mb": null,
+  "matches_reference": true,
+  "near_tie_mismatch": false,
+  "token_match_rate": 1.0,
+  "sessions": 5
+}

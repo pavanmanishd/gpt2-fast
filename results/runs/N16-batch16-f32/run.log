@@ -1,0 +1,2 @@
+summary written to results/runs/N16-batch16-f32/summary.json
+{"date":"<date>","milestone":"N16-batch16-f32","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":58.997,"prefill_tok_s":1639.578,"ttft_ms":915.48,"peak_mb":739.969,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>","batch":16,"batch_tok_s":943.944}

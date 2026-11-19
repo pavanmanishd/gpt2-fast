@@ -1,0 +1,2 @@
+{"date":"<date>","milestone":"N22-llamacpp-q8_0","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":676.252,"prefill_tok_s":4222.462,"ttft_ms":14.761,"peak_mb":281.395,"matches_reference":false,"token_match_rate":0.284375,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}
+summary written to results/runs/N22-llamacpp-q8_0/summary.json

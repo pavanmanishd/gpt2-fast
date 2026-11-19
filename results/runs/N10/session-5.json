@@ -1,7 +1,7 @@
 {
   "label": "N10",
   "model": "gpt2",
-  "commit": "b874bc9",
+  "commit": "26aad5a",
   "started_at": "2026-11-11T09:40:00Z",
   "host": {
     "nproc": 4,

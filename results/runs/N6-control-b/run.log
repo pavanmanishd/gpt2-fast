@@ -1,0 +1,2 @@
+summary written to results/runs/N6-control-b/summary.json
+{"date":"<date>","milestone":"N6-control-b","title":"<title>","commit":"<commit>","model":"gpt2","target":"cpu-linux","decode_tok_s":120.973,"prefill_tok_s":942.617,"ttft_ms":59.284,"peak_mb":560.051,"matches_reference":true,"token_match_rate":1.0,"sessions":5,"host":"<host>","journal":"<journal>","flamegraph":"<flamegraph>","headline":"<headline>"}

@@ -1,7 +1,7 @@
 {
   "label": "N11-gpt2-medium-f32",
   "model": "gpt2-medium",
-  "commit": "6de594c",
+  "commit": "b061788",
   "started_at": "2026-11-11T12:57:55Z",
   "host": {
     "nproc": 4,

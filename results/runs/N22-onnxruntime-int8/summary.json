@@ -1,0 +1,13 @@
+{
+  "label": "N22-onnxruntime-int8",
+  "model": "gpt2",
+  "target": "cpu-linux",
+  "decode_tok_s": 463.3354132228974,
+  "prefill_tok_s": 4419.231196015897,
+  "ttft_ms": 14.46624,
+  "peak_mb": 365.609375,
+  "matches_reference": false,
+  "near_tie_mismatch": false,
+  "token_match_rate": 0.021875,
+  "sessions": 5
+}

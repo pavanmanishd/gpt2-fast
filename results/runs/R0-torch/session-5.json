@@ -1,7 +1,7 @@
 {
   "label": "R0-torch",
   "model": "gpt2",
-  "commit": "b3158fa",
+  "commit": "7927868",
   "started_at": "2026-11-09T19:51:58Z",
   "host": {
     "nproc": 4,

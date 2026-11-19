@@ -1,7 +1,7 @@
 {
   "label": "N9-llamacpp-f32",
   "model": "gpt2",
-  "commit": "7fd55af",
+  "commit": "6407fca",
   "started_at": "2026-11-10T01:53:58Z",
   "host": {
     "nproc": 4,
