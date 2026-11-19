@@ -2,6 +2,10 @@
 name = "gpt2_engine"
 version = "0.1.0"
 edition = "2021"
+description = "GPT-2 inference from scratch: f32, f16 and int8 weights, no ML or linear-algebra dependencies"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pavanmanishd/gpt2-fast"
+publish = false
 
 [dependencies]
 serde_json = "=1.0.133"

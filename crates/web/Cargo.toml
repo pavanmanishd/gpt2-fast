@@ -2,6 +2,10 @@
 name = "gpt2_web"
 version = "0.1.0"
 edition = "2021"
+description = "WebAssembly bindings that run the gpt2-fast engine in the browser"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pavanmanishd/gpt2-fast"
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

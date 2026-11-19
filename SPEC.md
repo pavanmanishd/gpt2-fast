@@ -22,7 +22,7 @@ Every step is a public post: what changed, why, the before and after numbers, an
 
 ## Benchmark protocol
 
-- **Environment:** a Linux container (`bench/Dockerfile`), limited to 4 cores and 8 GB, the same way the content-farm language series runs. CPU only. The host machine is reported in every result.
+- **Environment:** a Linux container (`bench/Dockerfile`), limited to 4 cores and 8 GB. CPU only. The host machine is reported in every result.
 - **Prompts:** `bench/prompts.json`, five fixed prompts of 16 to 256 tokens.
 - **Run:** for each prompt, generate 128 tokens greedily. Warm up once, then time 5 runs.
 - **Metrics:**
@@ -78,7 +78,7 @@ docs/journal/      one note per milestone: what changed, what failed, why it got
 models/            downloaded weights (git-ignored)
 ```
 
-## Results contract (read by the content-farm job)
+## Results contract
 
 Every measured milestone appends one JSON object per line to `results/log.jsonl`:
 
